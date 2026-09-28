@@ -439,7 +439,14 @@ impl S3AttestationStore {
     async fn read_object(&self, key: &str) -> io::Result<Option<(Vec<u8>, Option<String>)>> {
         let output = match self.client.get_object().bucket(&self.bucket).key(key).send().await {
             Ok(output) => output,
-            Err(error) if error.to_string().contains("NoSuchKey") => return Ok(None),
+            Err(error)
+                if error.as_service_error().is_some_and(|error| error.is_no_such_key())
+                    || error
+                        .raw_response()
+                        .is_some_and(|response| response.status().as_u16() == 404) =>
+            {
+                return Ok(None);
+            }
             Err(error) => return Err(io::Error::other(error.to_string())),
         };
         if output.content_length().is_some_and(|length| length as usize > MAX_ATTESTATION_BYTES) {
@@ -792,11 +799,7 @@ impl AttestationStore for S3AttestationStore {
         if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Ok(None);
         }
-        match self.read_key(&format!("{}{id}.json", self.prefix)).await {
-            Ok(attestation) => Ok(attestation),
-            Err(error) if error.to_string().contains("NoSuchKey") => Ok(None),
-            Err(error) => Err(error),
-        }
+        self.read_key(&format!("{}{id}.json", self.prefix)).await
     }
 
     async fn prune_expired(&self, older_than: chrono::DateTime<Utc>) -> io::Result<()> {
