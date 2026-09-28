@@ -1,0 +1,33 @@
+{% extends "layout.html" %}
+{% block title %}QED | {{ title }}{% endblock %}
+{% block meta_description %}QED issuer contracts and currently listed pools for tokenized {{ ticker }} across every supported chain.{% endblock %}
+{% block og_title %}QED | {{ title }}{% endblock %}
+{% block og_description %}The issuer registry contracts and current pool contract verdicts for tokenized {{ ticker }}.{% endblock %}
+{% block twitter_title %}QED | {{ title }}{% endblock %}
+{% block twitter_description %}The issuer registry contracts and current pool contract verdicts for tokenized {{ ticker }}.{% endblock %}
+{% block canonical_url %}{{ public_url }}/tokens/{{ ticker }}{% endblock %}
+{% block canonical_link %}{{ public_url }}/tokens/{{ ticker }}{% endblock %}
+{% block content %}
+<script type="application/ld+json">{{ json_ld|safe }}</script>
+<section class="page-intro directory-intro">
+  <p class="eyebrow">Token registry</p>
+  <h1 class="page-title">{{ ticker }} tokenized.</h1>
+  <p>These are the issuer contracts QED compares on every supported chain. A ticker alone is not evidence of a contract match.</p>
+</section>
+<section class="directory-section" aria-labelledby="contracts-title">
+  <div class="section-heading"><div><p class="eyebrow">Issuer contracts</p><h2 id="contracts-title">{{ ticker }} on every chain</h2></div></div>
+  {% if contracts.len() == 0 %}<p class="muted">No issuer contract is currently in the registry.</p>{% else %}
+  <div class="directory-table-wrap"><table class="directory-table stack-table"><thead><tr><th scope="col">Issuer</th><th scope="col">Chain</th><th scope="col">Contract</th><th scope="col">Source</th></tr></thead><tbody>
+  {% for contract in contracts %}<tr><td data-label="Issuer"><strong>{{ contract.issuer }}</strong><br><small>{{ contract.ticker }} · {{ contract.decimals }} decimals</small></td><td data-label="Chain">{{ contract.chain }}</td><td data-label="Contract"><code>{{ contract.contract }}</code><span class="directory-cell-actions" data-label="Actions"><button class="copy-button" type="button" data-copy="{{ contract.contract }}">Copy</button><a href="{{ contract.explorer_url }}" target="_blank" rel="noopener noreferrer">Explorer ↗</a></span></td><td data-label="Source"><a href="{{ contract.source_url }}" target="_blank" rel="noopener noreferrer">Registry source ↗</a></td></tr>{% endfor %}
+  </tbody></table></div>
+  {% endif %}
+</section>
+<section class="directory-section" aria-labelledby="pools-title">
+  <div class="section-heading"><div><p class="eyebrow">Current listings</p><h2 id="pools-title">Pools QED can see now</h2></div></div>
+  <p class="directory-note">A stock-paired pool is only listed here when a venue reports the ticker. Its verdict says whether the observed quote contract matches the issuer registry.</p>
+  {% if pools.len() == 0 %}<p class="muted">No current leaderboard pool is tagged {{ ticker }}.</p>{% else %}
+  <div class="directory-pools">{% for pool in pools %}<article class="directory-pool {{ pool.verdict_class }}"><div><strong>{{ pool.pair }}</strong><span>{{ pool.chain }} · {{ pool.dex }}</span></div><span class="directory-verdict">{{ pool.verdict }}</span><div class="directory-actions"><a href="{{ pool.detail_url }}">Pool page ↗</a>{% if pool.trade_url.len() > 0 %}<span class="trade-link-item"><a href="{{ pool.trade_url }}" target="_blank" rel="noopener noreferrer">Trade ↗</a></span>{% endif %}</div></article>{% endfor %}</div>
+  <p class="contract-match-footnote">contract match only, not proof of backing or custody, price, or endorsement</p>
+  {% endif %}
+</section>
+{% endblock %}

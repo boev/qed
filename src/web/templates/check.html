@@ -1,0 +1,30 @@
+{% extends "layout.html" %}
+{% block title %}QED | Check a pool{% endblock %}
+{% block meta_description %}QED compares a Solana or EVM pool or token address, or a supported Uniswap v4 pool ID, with the issuer registry.{% endblock %}
+{% block og_title %}QED | Check a pool{% endblock %}
+{% block og_description %}QED compares stock-paired pool quote contracts with issuer registries.{% endblock %}
+{% block twitter_title %}QED | Check a pool{% endblock %}
+{% block twitter_description %}QED compares stock-paired pool quote contracts with issuer registries.{% endblock %}
+{% block canonical_url %}{{ public_url }}/check{% endblock %}
+{% block canonical_link %}{{ public_url }}/check{% endblock %}
+{% block content %}
+<section class="page-intro">
+  <p class="eyebrow">Check</p>
+  <h1 class="page-title">Check a pool or token contract.</h1>
+  <p>Paste a Solana or EVM address, or a supported Uniswap v4 pool ID, and QED will re-check its quote contract against the issuer registry.</p>
+</section>
+<section class="lookup" aria-labelledby="lookup-title">
+  <h2 id="lookup-title">Token, pool, or supported Uniswap v4 pool ID</h2>
+  <form id="lookup-form" hx-post="/check" hx-target="#result" hx-swap="innerHTML" hx-indicator="#checking">
+    <label for="address">Solana or EVM address / supported Uniswap v4 pool ID</label>
+    <div class="input-row">
+      <input id="address" name="address" type="text" inputmode="text" autocomplete="off" spellcheck="false" placeholder="Paste a pool, token, or supported pool ID" required>
+      <button class="button primary-button" type="submit">
+        Check <span aria-hidden="true">→</span>
+      </button>
+    </div>
+    <p id="checking" class="checking htmx-indicator" aria-live="polite">Reading the chain…</p>
+  </form>
+</section>
+<section id="result" class="result-region" aria-live="polite" aria-atomic="true"></section>
+{% endblock %}

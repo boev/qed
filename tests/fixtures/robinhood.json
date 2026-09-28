@@ -1,0 +1,13 @@
+{
+  "assets": [
+    {
+      "tokenSymbol": "NVDA",
+      "tokenName": "NVIDIA • Robinhood Token",
+      "tokenDecimals": 18,
+      "status": "ASSET_STATUS_ACTIVE",
+      "deployments": [
+        {"contractAddress": "0xAbCd000000000000000000000000000000000004", "chainId": 4663}
+      ]
+    }
+  ]
+}

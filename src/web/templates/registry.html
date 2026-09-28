@@ -1,0 +1,26 @@
+{% extends "layout.html" %}
+{% block title %}QED | Issuer registry{% endblock %}
+{% block meta_description %}QED issuer registry contracts used to compare stock-paired pool quote contracts.{% endblock %}
+{% block og_title %}QED | Issuer registry{% endblock %}
+{% block og_description %}The issuer contracts QED compares against when checking a pool.{% endblock %}
+{% block twitter_title %}QED | Issuer registry{% endblock %}
+{% block twitter_description %}The issuer contracts QED compares against when checking a pool.{% endblock %}
+{% block canonical_url %}{{ public_url }}/registry{% endblock %}
+{% block canonical_link %}{{ public_url }}/registry{% endblock %}
+{% block content %}
+<section class="page-intro registry-intro">
+  <p class="eyebrow">Registry</p>
+  <h1 class="page-title">Issuer registry</h1>
+  <p>These are the contracts QED compares against. Filter, inspect, and verify the source.</p>
+</section>
+<section class="registry-panel" aria-labelledby="registry-title">
+  <div class="section-heading">
+    <h2 id="registry-title">Registry entries</h2>
+    <span class="count-badge">{{ registry_count }} entries</span>
+  </div>
+  <p class="registry-status-line" title="{{ registry_status_tooltip }}">{{ registry_status_line }}</p>
+  <div id="registry-table" hx-get="/registry/table" hx-trigger="load" hx-swap="innerHTML" hx-push-url="false">
+    <p class="muted">Loading registry…</p>
+  </div>
+</section>
+{% endblock %}

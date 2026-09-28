@@ -1,0 +1,32 @@
+{% extends "layout.html" %}
+{% block title %}QED | {{ chain }} contracts and pools{% endblock %}
+{% block meta_description %}QED issuer registry contracts, pool counts, and explorer links for stock-paired pools on {{ chain }}.{% endblock %}
+{% block og_title %}QED | {{ chain }} contracts and pools{% endblock %}
+{% block og_description %}Issuer contracts and currently listed stock-paired pools on {{ chain }}.{% endblock %}
+{% block twitter_title %}QED | {{ chain }} contracts and pools{% endblock %}
+{% block twitter_description %}Issuer contracts and currently listed stock-paired pools on {{ chain }}.{% endblock %}
+{% block canonical_url %}{{ public_url }}/chains/{{ chain_slug }}{% endblock %}
+{% block canonical_link %}{{ public_url }}/chains/{{ chain_slug }}{% endblock %}
+{% block content %}
+<script type="application/ld+json">{{ json_ld|safe }}</script>
+<section class="page-intro directory-intro">
+  <p class="eyebrow">Chain directory</p>
+  <h1 class="page-title">{{ chain }}.</h1>
+  <p>QED compares quoted token contracts with issuer registry records. Explore {{ contract_count }} registered contract{% if contract_count != 1 %}s{% endif %} and the pools currently listed on this chain.</p>
+</section>
+<section class="directory-section" aria-labelledby="chain-contracts-title">
+  <div class="section-heading"><div><p class="eyebrow">Registry</p><h2 id="chain-contracts-title">Issuer contracts on {{ chain }}</h2></div></div>
+  {% if contracts.len() == 0 %}<p class="muted">No issuer registry data for this chain yet.</p>{% else %}
+  <div class="directory-table-wrap"><table class="directory-table stack-table"><thead><tr><th scope="col">Ticker</th><th scope="col">Issuer</th><th scope="col">Contract</th><th scope="col">Explorer</th></tr></thead><tbody>
+  {% for contract in contracts %}<tr><td data-label="Ticker"><a href="/tokens/{{ contract.ticker }}"><strong>{{ contract.ticker }}</strong></a></td><td data-label="Issuer">{{ contract.issuer }}</td><td data-label="Contract"><code>{{ contract.contract }}</code><span class="directory-cell-actions" data-label="Actions"><button class="copy-button" type="button" data-copy="{{ contract.contract }}">Copy</button></span></td><td data-label="Explorer"><a href="{{ contract.explorer_url }}" target="_blank" rel="noopener noreferrer">Open explorer ↗</a></td></tr>{% endfor %}
+  </tbody></table></div>
+  {% endif %}
+</section>
+<section class="directory-section" aria-labelledby="chain-pools-title">
+  <div class="section-heading"><div><p class="eyebrow">Market listings</p><h2 id="chain-pools-title">Pools on {{ chain }}</h2></div></div>
+  {% if pools.len() == 0 %}<p class="muted">No current leaderboard pools are listed on this chain.</p>{% else %}
+  <div class="directory-pools">{% for pool in pools %}<article class="directory-pool {{ pool.verdict_class }}"><div><strong>{{ pool.pair }}</strong><span>{{ pool.dex }}</span></div><span class="directory-verdict">{{ pool.verdict }}</span><div class="directory-actions"><a href="{{ pool.detail_url }}">Pool page ↗</a>{% if pool.trade_url.len() > 0 %}<span class="trade-link-item"><a href="{{ pool.trade_url }}" target="_blank" rel="noopener noreferrer">Trade venue ↗</a></span>{% endif %}</div></article>{% endfor %}</div>
+  <p class="contract-match-footnote">contract match only, not proof of backing or custody, price, or endorsement</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,24 @@
+{% extends "layout.html" %}
+{% block title %}QED | Check stock-token holdings{% endblock %}
+{% block meta_description %}Check stock-token holdings against issuer contracts and known stock-paired pools with QED.{% endblock %}
+{% block history %}false{% endblock %}
+{% block content %}
+<section class="page-intro wallet-intro" hx-history="false">
+  <p class="eyebrow">QED</p>
+  <h1 class="page-title">Check stock-token holdings</h1>
+  <p>QED only looks for issuer contracts and known stock-paired pools. It does not identify every asset in a wallet.</p>
+</section>
+<section class="wallet-lookup" aria-labelledby="wallet-heading" hx-history="false">
+  <h2 id="wallet-heading">Paste your address, any of the five chains</h2>
+  <form method="post" action="/wallet" class="wallet-form">
+    <label for="wallet-address">Wallet address</label>
+    <div class="wallet-form-row">
+      <input id="wallet-address" name="address" type="text" autocomplete="off" spellcheck="false" placeholder="0x… or Solana address" required>
+      <button class="button primary-button" type="submit">Check holdings</button>
+    </div>
+  </form>
+  <div class="wallet-picker" data-wallet-picker hidden aria-label="Wallet choices"></div>
+  <p class="wallet-empty" data-wallet-empty hidden>No wallet detected. Paste your address.</p>
+  <p class="wallet-safety">Connecting only reads your address. QED never asks for a signature or a transaction.</p>
+</section>
+{% endblock %}

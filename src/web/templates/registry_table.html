@@ -1,0 +1,49 @@
+<form class="registry-filter" hx-get="/registry/table" hx-target="#registry-table" hx-swap="innerHTML">
+  <label for="registry-query">Filter entries</label>
+  <div class="input-row">
+    <input id="registry-query" name="q" type="search" value="{{ query }}" placeholder="Ticker, issuer, chain, or contract" autocomplete="off">
+    <button class="button secondary-button" type="submit">Filter</button>
+  </div>
+</form>
+{% if entries.len() > 0 %}
+<div class="table-wrap">
+  <table class="registry-table stack-table">
+    <thead>
+      <tr>
+        <th scope="col">Issuer</th>
+        <th scope="col">Ticker</th>
+        <th scope="col">Chain</th>
+        <th scope="col">Contract</th>
+        <th scope="col">Source</th>
+        <th scope="col">Last checked</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for entry in entries %}
+      <tr>
+        <td data-label="Issuer">{{ entry.issuer }}</td>
+        <td data-label="Ticker"><strong>{{ entry.ticker }}</strong></td>
+        <td data-label="Chain">{{ entry.chain }}</td>
+        <td data-label="Contract"><code>{{ entry.contract }}</code></td>
+        <td data-label="Source"><a href="{{ entry.source_url }}">{{ entry.source }}</a></td>
+        <td data-label="Last checked"><time data-relative-time datetime="{{ entry.last_checked }}">{{ entry.last_checked }}</time></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+<p class="registry-page-status">Showing {{ first_entry }}-{{ last_entry }} of {{ total_entries }} entries</p>
+{% else %}
+<p class="muted">No matching entries.</p>
+{% endif %}
+{% if has_previous || has_next %}
+<nav class="registry-pagination" aria-label="Registry pages">
+  {% if has_previous %}
+  <a href="/registry/table?q={{ query }}&amp;page={{ previous_page }}" hx-get="/registry/table?q={{ query }}&amp;page={{ previous_page }}" hx-target="#registry-table" hx-swap="innerHTML">Previous</a>
+  {% endif %}
+  <span>Page {{ page }} of {{ page_count }}</span>
+  {% if has_next %}
+  <a href="/registry/table?q={{ query }}&amp;page={{ next_page }}" hx-get="/registry/table?q={{ query }}&amp;page={{ next_page }}" hx-target="#registry-table" hx-swap="innerHTML">Next</a>
+  {% endif %}
+</nav>
+{% endif %}

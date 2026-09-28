@@ -1,0 +1,302 @@
+{
+  "id": "fc6147d4cd42374b72246cc6340d23e26f5c411e63f613322a18413c3da243bb",
+  "version": 1,
+  "chain": "Solana",
+  "subject": "5DnhFALRYpbTjLViVSEaqGsUoHw5DY8XLyyF3qaMkgqT",
+  "verdict": {
+    "Verified": {
+      "issuer": "Backed xStocks",
+      "ticker": "NVDA"
+    }
+  },
+  "issuer": "Backed xStocks",
+  "ticker": "NVDA",
+  "pool": {
+    "chain": "Solana",
+    "pool": "5DnhFALRYpbTjLViVSEaqGsUoHw5DY8XLyyF3qaMkgqT",
+    "dex": "pumpfun",
+    "base": {
+      "address": "G7eYmAVcHHsr5zn2y2gMvW8xSUT8xyJyiu6gH7dGpump",
+      "symbol": "DATACENTER",
+      "decimals": 6,
+      "balance": "1000000000000000"
+    },
+    "quote": {
+      "address": "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh",
+      "symbol": "NVDAx",
+      "decimals": 8,
+      "balance": "29"
+    }
+  },
+  "quote_share_of_supply": 9.026565796444842e-13,
+  "registry_entry": {
+    "issuer": "Backed xStocks",
+    "ticker": "NVDA",
+    "name": "NVIDIA",
+    "chain": "Solana",
+    "contract": "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh",
+    "decimals": null,
+    "source": "xstocks-api",
+    "source_url": "https://api.xstocks.fi/api/v2/public/assets",
+    "last_checked": "2026-09-24T20:09:31Z"
+  },
+  "registry_hash": "a8502a7b973a8d0cea944addb68e150e4d88759c4d118ae7aa9477f55bd2316c",
+  "reads": [
+    {
+      "method": "getSlot",
+      "params": [
+        {
+          "commitment": "confirmed"
+        }
+      ],
+      "result_hash": "474535fead6df5b593963c91c01ad0a3498f8b6f33a8142ad76d0059497c6157",
+      "block": null,
+      "slot": 450134933
+    },
+    {
+      "method": "getAccountInfo",
+      "params": [
+        "5DnhFALRYpbTjLViVSEaqGsUoHw5DY8XLyyF3qaMkgqT",
+        {
+          "commitment": "confirmed",
+          "encoding": "base64"
+        }
+      ],
+      "result_hash": "ad741c64a1043a9055b96f4244cd50a19263503fef67aca98de8474d2e871956",
+      "raw_result": {
+        "context": {
+          "apiVersion": "4.3.0",
+          "slot": 450134934
+        },
+        "value": {
+          "data": [
+            "F7f4N2DYrGAAENhH488DALU/OnEAAAAAAHjF+1HRAgAdAAAAAAAAAACAxqR+jQMAAFFE7+C/GuzcZzH+f27vrW/ExddJjM2Qag35dvXXKxb1AAAH6KUOFA/aV5H0VmqVf9OuP4c+ajRm/8E9eRGd+pq1CkMAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+            "base64"
+          ],
+          "executable": false,
+          "lamports": 1417320,
+          "owner": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+          "rentEpoch": 18446744073709551615,
+          "space": 151
+        }
+      },
+      "block": null,
+      "slot": null
+    },
+    {
+      "method": "getProgramAccounts",
+      "params": [
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        {
+          "commitment": "confirmed",
+          "encoding": "base64",
+          "filters": [
+            {
+              "memcmp": {
+                "bytes": "5DnhFALRYpbTjLViVSEaqGsUoHw5DY8XLyyF3qaMkgqT",
+                "offset": 32
+              }
+            }
+          ]
+        }
+      ],
+      "result_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "block": null,
+      "slot": null
+    },
+    {
+      "method": "getProgramAccounts",
+      "params": [
+        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+        {
+          "commitment": "confirmed",
+          "encoding": "base64",
+          "filters": [
+            {
+              "memcmp": {
+                "bytes": "5DnhFALRYpbTjLViVSEaqGsUoHw5DY8XLyyF3qaMkgqT",
+                "offset": 32
+              }
+            }
+          ]
+        }
+      ],
+      "result_hash": "0c483aa8e1781b8f31b75c24fc1c760390be9329c8aad7b581edbd4574bd5fd7",
+      "block": null,
+      "slot": null
+    },
+    {
+      "method": "getTokenAccountBalance",
+      "params": [
+        "8Kzm6vxRkvovp37QP3E45TqoGApAREionNJxZXsJpiQ5",
+        {
+          "commitment": "confirmed"
+        }
+      ],
+      "result_hash": "0d8dc41693b1ddbc67427982128c1f401d2ed5b3d270ff716631b5a8df6cdad4",
+      "block": null,
+      "slot": null
+    },
+    {
+      "method": "getTokenAccountBalance",
+      "params": [
+        "ANisBHYTcBVszUtk3Vmi5b3es9P8MQxVSWoa4T5Jzx7d",
+        {
+          "commitment": "confirmed"
+        }
+      ],
+      "result_hash": "3d0e5ed722ac4d1c349545be11b2bf225f2796a7e0c42a0aa88f5da5e8fc2d42",
+      "block": null,
+      "slot": null
+    },
+    {
+      "method": "getMultipleAccounts",
+      "params": [
+        [
+          "G7eYmAVcHHsr5zn2y2gMvW8xSUT8xyJyiu6gH7dGpump",
+          "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh"
+        ],
+        {
+          "commitment": "confirmed",
+          "encoding": "base64"
+        }
+      ],
+      "result_hash": "ab70b7b981a555b83bf91fdbbdc0850a66c433bc6934801a7cd4e1e51f2beec8",
+      "block": null,
+      "slot": null
+    },
+    {
+      "method": "getTokenSupply",
+      "params": [
+        "G7eYmAVcHHsr5zn2y2gMvW8xSUT8xyJyiu6gH7dGpump",
+        {
+          "commitment": "confirmed"
+        }
+      ],
+      "result_hash": "f610648729776b028a0849a2b7149c7cca47a19a4b5a81aaf45f969ea73cc129",
+      "block": null,
+      "slot": null
+    },
+    {
+      "method": "getAccountInfo",
+      "params": [
+        "G7eYmAVcHHsr5zn2y2gMvW8xSUT8xyJyiu6gH7dGpump",
+        {
+          "commitment": "confirmed",
+          "encoding": "base64"
+        }
+      ],
+      "result_hash": "0ea419efafc91ad7e7f3947102991cc76eccc0b2e23257dc5a7e795c3fe7322c",
+      "raw_result": {
+        "context": {
+          "apiVersion": "4.3.0",
+          "slot": 450134940
+        },
+        "value": {
+          "data": [
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIDGpH6NAwAGAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARIAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOCTPnS/g7aMIYzTwg5jFDVvTXGejq7rQqyoI4ukYR+/EwCIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4JM+dL+DtowhjNPCDmMUNW9NcZ6OrutCrKgji6RhH78KAAAARGF0YWNlbnRlcgoAAABEQVRBQ0VOVEVSJAAAAGh0dHBzOi8vbS5yYXBpZGxhdW5jaC5pby9tL0drY1ZJdjh3NgAAAAA=",
+            "base64"
+          ],
+          "executable": false,
+          "lamports": 2550160,
+          "owner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+          "rentEpoch": 18446744073709551615,
+          "space": 374
+        }
+      },
+      "block": null,
+      "slot": null
+    },
+    {
+      "method": "getProgramAccounts",
+      "params": [
+        "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
+        {
+          "commitment": "confirmed",
+          "encoding": "base64",
+          "filters": [
+            {
+              "memcmp": {
+                "bytes": "G7eYmAVcHHsr5zn2y2gMvW8xSUT8xyJyiu6gH7dGpump",
+                "offset": 33
+              }
+            }
+          ]
+        }
+      ],
+      "result_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "block": null,
+      "slot": null
+    },
+    {
+      "method": "getTokenSupply",
+      "params": [
+        "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh",
+        {
+          "commitment": "confirmed"
+        }
+      ],
+      "result_hash": "376e08f5e52a5614f81ac7d119328df064ad6d3a3cb9df7aeb77b5a1cd361570",
+      "block": null,
+      "slot": null
+    },
+    {
+      "method": "getAccountInfo",
+      "params": [
+        "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh",
+        {
+          "commitment": "confirmed",
+          "encoding": "base64"
+        }
+      ],
+      "result_hash": "8c4552b5f52aa6635ef47400e775a0900682307daab76ba6f83a5a64990b1b67",
+      "raw_result": {
+        "context": {
+          "apiVersion": "4.3.0",
+          "slot": 450134959
+        },
+        "value": {
+          "data": [
+            "AQAAAGVqQkIv6okUBqQZ0dHeCPQqhHlBtaGulevOYZrDFyk0AqSrPTgdAAAIAQEAAAD/3+wbzSzTg5PITaoIyRzA041nf/jQq3tdAz8A9zLMMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARIAQABD+fHuLje4B+pFy3TmAJcivsAJKWAm5ORVi0NeJKXpxgfopQ4UD9pXkfRWapV/064/hz5qNGb/wT15EZ36mrUKDAAgAEP58e4uN7gH6kXLdOYAlyK+wAkpYCbk5FWLQ14kpenGBgABAAEZADgABm9ZIlHMR3R4JaWa0UIupDVz9SjaXe4q94ErMU+ZReM/9BuswgPwPwj6oWoAAAAAqf6J1fcG8D8aACEA/9/sG80s04OTyE2qCMkcwNONZ3/40Kt7XQM/APcyzDAABABBAEP58e4uN7gH6kXLdOYAlyK+wAkpYCbk5FWLQ14kpenGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADgBAAEP58e4uN7gH6kXLdOYAlyK+wAkpYCbk5FWLQ14kpenGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATAKYAQ/nx7i43uAfqRct05gCXIr7ACSlgJuTkVYtDXiSl6cYH6KUOFA/aV5H0VmqVf9OuP4c+ajRm/8E9eRGd+pq1Cg0AAABOVklESUEgeFN0b2NrBQAAAE5WREF4RAAAAGh0dHBzOi8veHN0b2Nrcy1tZXRhZGF0YS5iYWNrZWQuZmkvdG9rZW5zL1NvbGFuYS9OVkRBeC9tZXRhZGF0YS5qc29uAAAAAA==",
+            "base64"
+          ],
+          "executable": false,
+          "lamports": 617943468,
+          "owner": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+          "rentEpoch": 18446744073709551615,
+          "space": 679
+        }
+      },
+      "block": null,
+      "slot": null
+    },
+    {
+      "method": "getProgramAccounts",
+      "params": [
+        "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
+        {
+          "commitment": "confirmed",
+          "encoding": "base64",
+          "filters": [
+            {
+              "memcmp": {
+                "bytes": "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh",
+                "offset": 33
+              }
+            }
+          ]
+        }
+      ],
+      "result_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "block": null,
+      "slot": null
+    }
+  ],
+  "block": null,
+  "slot": 450134933,
+  "checked_at": "2026-09-24T20:19:58Z",
+  "expires_at": "2026-09-25T20:19:58Z",
+  "signer": "93JfrkBDb7FwAXVDj4f5TH77RXswStL16yUAhyxPCwpu",
+  "signature": "T0+ssII3OIb93noVHvrq1WJj09cW6IbQ4DLzQ3r0aR9dAYWOnuwbk4EdaZSX1xHVohPrpFdCkQC8VhmKZlISBQ==",
+  "dev": true
+}

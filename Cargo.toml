@@ -1,0 +1,50 @@
+[package]
+name = "qed"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+description = "QED checks whether a pool uses the stock-token contract published by its issuer; it does not prove backing or custody"
+
+[features]
+default = ["s3"]
+s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
+
+[dependencies]
+alloy = { version = "=1.8.3", default-features = false, features = ["contract", "providers", "provider-http", "reqwest-rustls-tls", "rpc-types", "sol-types"] }
+alloy-json-rpc = "=1.8.3"
+alloy-transport = "=1.8.3"
+alloy-transport-http = { version = "=1.8.3", features = ["reqwest"] }
+anyhow = "=1.0.104"
+askama = "=0.14.0"
+async-trait = "=0.1.92"
+axum = "=0.8.9"
+aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio"], optional = true }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls", "rt-tokio"], optional = true }
+bs58 = "=0.5.1"
+base64 = "=0.22.1"
+bytes = "=1.12.1"
+chrono = { version = "=0.4.45", features = ["clock", "serde"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+clap = { version = "=4.6.7", features = ["derive", "env"] }
+moka = { version = "=0.12.16", features = ["future"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+rand = "0.8"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "0.10"
+thiserror = "=2.0.20"
+tokio = { version = "=1.53.1", features = ["full"] }
+tower-http = { version = "=0.6.11", features = ["compression-gzip", "fs", "set-header", "trace"] }
+tower = "=0.5.2"
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
+
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

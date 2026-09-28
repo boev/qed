@@ -1,0 +1,18 @@
+{
+  "chain": "Base",
+  "rpc_url": "https://mainnet.base.org",
+  "pool": "0x88A43bbDF9D098eEC7bCEDa4E2494615DfD9bb9c",
+  "tokens": {
+    "base_weth": "0x4200000000000000000000000000000000000006",
+    "quote_usdc": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+  },
+  "pool_responses": [
+    {"jsonrpc":"2.0","result":"0x0000000000000000000000004200000000000000000000000000000000000006","id":1},
+    {"jsonrpc":"2.0","result":"0x000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda02913","id":2},
+    {"jsonrpc":"2.0","result":"0x00000000000000000000000000000000000000000000000ceef746521dd93f1500000000000000000000000000000000000000000000000000000099fac6ea01000000000000000000000000000000000000000000000000000000006ab1a039","id":3}
+  ],
+  "code_responses": [
+    {"jsonrpc":"2.0","result":"0x","id":5}
+  ],
+  "notes": "This is a plain Base Uniswap v2 WETH/USDC pool. The non-empty eth_getCode response is retained in the recording log because it is large; offline tests use the recorded non-empty/empty distinction without a network call."
+}

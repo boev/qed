@@ -1,0 +1,103 @@
+# Runtime architecture
+
+QED is one Rust process. It serves the website and API, refreshes public pool data, performs direct chain reads, and signs point-in-time attestations. It is read-only with respect to supported chains and never submits transactions.
+
+## Process and background work
+
+```mermaid
+flowchart TB
+    U[Browser or API client] --> H[QED HTTP server]
+
+    subgraph Q["One QED Rust process"]
+        H --> M[In-memory registry, leaderboard, featured pools]
+        H --> C[Direct pool checker]
+        H --> W[Wallet scanner]
+        H --> S[Ed25519 attestation signer]
+
+        R[Registry refresh] -->|publish atomically| M
+        R -->|sleep 1 hour| R
+
+        D[Shared pool discovery] -->|publish leaderboard and featured pools| M
+        D -->|sleep 1 hour| D
+
+        P[Price refresh] -->|update current rows| M
+        P -->|sleep 5 minutes| P
+
+        X[Attestation expiry] -->|remove older than 30 days| X
+        X -->|sleep 24 hours| X
+    end
+
+    R --> ISS[Issuer registries]
+    D --> DEX[DexScreener]
+    P --> DEX
+
+    C --> RPC[Solana and EVM RPC providers]
+    W --> RPC
+    D --> RPC
+
+    S --> OBJ[Attestation store and bounded index]
+```
+
+Ordinary page and API reads use prepared in-memory snapshots. They do not trigger pool discovery or blockchain reads unless the route explicitly performs a check, wallet scan, re-check, or verification operation.
+
+The shared discovery pass fetches candidate pairs once and derives both the leaderboard and featured-pool candidates from that response. Results common to both lists reuse the same on-chain check result. A failed refresh preserves the previous valid snapshot.
+
+| Work | Normal cadence | Failure behavior |
+| --- | --- | --- |
+| Issuer registry refresh | 1 hour | Retain the last accepted source data and record the source failure. |
+| Shared pool discovery | 1 hour | Retain the previous leaderboard and featured pools. Retry after 30 seconds when the initial refresh attempt is blocked. |
+| Current-pool prices | 5 minutes | Preserve previous price points; retry a blocked cycle after 1 minute. |
+| Attestation expiry | 24 hours | Keep serving and retry on the next run. |
+
+## One user check
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant Q as QED
+    participant C as 30-second cache
+    participant R as Chain RPC
+    participant S as Signer
+    participant O as Attestation store
+
+    U->>Q: Pool, token, or v4 pool ID
+    Q->>Q: Validate input and enforce 60 requests/minute
+    Q->>C: Look for canonical cached result
+
+    alt Cache hit
+        C-->>Q: Existing signed result
+    else Cache miss
+        Q->>R: Detect chain and read block/slot
+        Q->>R: Read pool structure and balances
+        Q->>R: Read token metadata and bytecode
+        Q->>Q: Compare addresses with issuer registry
+        Q->>S: Sign point-in-time attestation
+        S->>O: Store attestation and update bounded index
+        Q->>C: Cache result for 30 seconds
+    end
+
+    Q-->>U: Verdict, evidence, signature, exact-record URL
+```
+
+Concurrent checks for the same canonical subject share one in-flight execution. A completed result remains cached for 30 seconds. Background leaderboard validation has a separate 30-minute cache.
+
+## Request boundaries
+
+QED bounds work before contacting external services:
+
+- protected routes allow 60 requests per client per 60 seconds;
+- at most 32 expensive checks run concurrently;
+- one wallet scan runs at a time;
+- four registry API serializations run concurrently;
+- EVM providers are limited to 8 requests per second per chain;
+- Solana is limited to 4 requests per second;
+- DexScreener requests share a 240-per-minute process budget and a 120-second endpoint backoff after a `429`;
+- upstream HTTP requests have a 30-second timeout.
+
+The wallet path scans supported chains concurrently under one 20-second request deadline. An incomplete scan is returned as an error instead of a silently partial portfolio.
+
+## State and persistence
+
+Memory contains rebuildable caches and the currently published registry, leaderboard, featured pools, prices, and recent attestation index. Durable attestation storage is selected by configuration. On startup QED restores available snapshots, verifies persisted attestations before indexing them, and quarantines invalid records.
+
+A signed attestation proves the integrity and signer attribution of one point-in-time record. It does not prove custody, reserves, solvency, safety, price, endorsement, or correctness of an issuer registry.

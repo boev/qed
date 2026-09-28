@@ -1,0 +1,30 @@
+{% extends "layout.html" %}
+{% block title %}QED | Contract-to-registry result{% endblock %}
+{% block meta_description %}QED compares a pool or token contract with an issuer registry and reports a point-in-time result.{% endblock %}
+{% block og_title %}QED | Contract-to-registry result{% endblock %}
+{% block og_description %}QED compares a pool's quote contract with an issuer registry and reports a point-in-time result.{% endblock %}
+{% block twitter_title %}QED | Contract-to-registry result{% endblock %}
+{% block twitter_description %}QED compares a pool's quote contract with an issuer registry and reports a point-in-time result.{% endblock %}
+{% block canonical_url %}{{ public_url }}{{ canonical_path }}{% endblock %}
+{% block canonical_link %}{{ public_url }}{{ canonical_path }}{% endblock %}
+{% block content %}
+<section class="page-intro">
+  <p class="eyebrow">Check</p>
+  <h1 class="page-title">Check a pool or token contract.</h1>
+  <p>Paste a pool or token address and QED will compare its quote contract against the issuer registry.</p>
+  <p class="muted">This is a point-in-time contract-to-registry check. A signed record can expire or change when registry data changes; re-check before relying on it. Trade links open external venues and are not QED endorsements.</p>
+  <p class="muted">Source code: <a href="https://github.com/boev/qed" target="_blank" rel="noopener noreferrer">github.com/boev/qed</a></p>
+</section>
+<section class="lookup" aria-labelledby="lookup-title">
+  <h2 id="lookup-title">Token or pool address</h2>
+  <form id="lookup-form" hx-post="/check" hx-target="#result" hx-swap="innerHTML" hx-indicator="#checking">
+    <label for="address">Solana or EVM address / supported pool ID</label>
+    <div class="input-row">
+      <input id="address" name="address" type="text" inputmode="text" autocomplete="off" spellcheck="false" placeholder="Paste a pool, token, or supported pool ID" required>
+      <button class="button primary-button" type="submit">Check <span aria-hidden="true">→</span></button>
+    </div>
+    <p id="checking" class="checking htmx-indicator" aria-live="polite">Reading the chain…</p>
+  </form>
+</section>
+<section id="result" class="result-region" aria-live="polite" aria-atomic="true">{{ result|safe }}</section>
+{% endblock %}

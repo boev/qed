@@ -1,0 +1,48 @@
+{% extends "layout.html" %}
+{% block title %}QED | Stock-token holdings{% endblock %}
+{% block meta_description %}QED holdings results for issuer contracts and known stock-paired pools.{% endblock %}
+{% block history %}false{% endblock %}
+{% block content %}
+<section class="page-intro wallet-intro" hx-history="false">
+  <p class="eyebrow">QED</p>
+  <h1 class="page-title">Check stock-token holdings</h1>
+  <p>QED only looks for issuer contracts and known stock-paired pools. The address is submitted in the request body and is not stored.</p>
+</section>
+<section class="wallet-results" aria-labelledby="wallet-results-heading" hx-history="false">
+  <div class="section-heading">
+    <h2 id="wallet-results-heading">Results</h2>
+    <code class="wallet-address">{{ address }}</code>
+    <button class="copy-button" type="button" data-copy="/wallet">Share QED</button>
+  </div>
+  {% if holdings.is_empty() %}
+  <p class="empty-state">No non-zero known token balances were found on the five supported chains.</p>
+  {% else %}
+  <div class="table-wrap">
+    <table class="wallet-table stack-table">
+      <thead>
+        <tr><th scope="col">Token</th><th scope="col">Amount</th><th scope="col">Verdict</th><th scope="col">Chain</th><th scope="col">Links</th></tr>
+      </thead>
+      <tbody>
+      {% for holding in holdings %}
+        <tr>
+          <th scope="row" data-label="Token">{{ holding.symbol }}</th>
+          <td data-label="Amount">{{ holding.amount }}</td>
+          <td data-label="Verdict">
+            <span class="verdict-label {{ holding.verdict_class }}">{{ holding.verdict }}</span>
+            {% match holding.reason %}{% when Some with (reason) %}<small class="wallet-reason">{{ reason }}</small>{% when None %}{% endmatch %}
+          </td>
+          <td data-label="Chain">{{ holding.chain }}</td>
+          <td data-label="Links" class="wallet-links">
+            {% match holding.pool_url %}{% when Some with (url) %}<a href="{{ url }}">Pool</a>{% when None %}{% endmatch %}
+            {% for link in holding.trade_links %}<span class="trade-link-item"><a href="{{ link.url }}" target="_blank" rel="noopener noreferrer">{{ link.label }} ↗</a></span>{% endfor %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="contract-match-footnote">contract match only, not proof of backing or custody, price, or endorsement</p>
+  {% endif %}
+  <p class="wallet-safety">Connecting only reads your address. QED never asks for a signature or a transaction.</p>
+</section>
+{% endblock %}

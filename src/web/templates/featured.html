@@ -1,0 +1,79 @@
+{% if pools.len() == 0 %}
+<div class="featured-empty">
+  <span class="seal-mark is-unknown">
+    <svg class="seal-icon" aria-hidden="true">
+      <use href="/static/icons.svg#qed-seal-unknown"></use>
+    </svg>
+  </span>
+  <p>No featured pools are available right now.</p>
+</div>
+{% else %}
+{% for pool in pools %}
+<article class="pool-card {{ pool.verdict_class }}">
+  <div class="pool-card-topline">
+    <div class="chain-label">
+      <span class="chain-glyph">
+        <svg aria-hidden="true">
+          <use href="/static/icons.svg#{{ pool.chain_icon }}"></use>
+        </svg>
+      </span>
+      <span>{{ pool.chain }}</span>
+    </div>
+    <span class="dex-label">{{ pool.dex }}</span>
+  </div>
+  <div class="pool-pair">
+    <strong>{{ pool.base_symbol }}</strong>
+    <span>/</span>
+    <strong>{{ pool.quote_symbol }}</strong>
+  </div>
+  {% if pool.curated %}
+  <span class="curated-tag">Curated</span>
+  {% endif %}
+  <div class="pool-verdict {{ pool.verdict_class }}">
+    <span class="seal-mini">
+      <svg class="seal-icon" aria-hidden="true">
+        <use href="/static/icons.svg#{{ pool.verdict_icon }}"></use>
+      </svg>
+    </span>
+    <span>{{ pool.verdict_label }}</span>
+    {% if pool.issuer_ticker.len() > 0 %}
+    <small>{{ pool.issuer_ticker }}</small>
+    {% endif %}
+  </div>
+  <dl class="pool-stats">
+    <div>
+      <dt>Quote balance</dt>
+      <dd>{{ pool.quote_balance }}</dd>
+    </div>
+    <div>
+      <dt>Share of supply <strong>{{ pool.share_label }}</strong></dt>
+      <dd>
+        <span class="share-track">
+          <progress class="share-progress" max="100" value="{{ pool.share_value }}">{{ pool.share_label }}</progress>
+        </span>
+      </dd>
+    </div>
+    {% if pool.has_liquidity %}
+    <div>
+      <dt>Liquidity</dt>
+      <dd>{{ pool.liquidity }}</dd>
+    </div>
+    {% endif %}
+    {% if pool.has_volume %}
+    <div>
+      <dt>24h volume</dt>
+      <dd>{{ pool.volume }}</dd>
+    </div>
+    {% endif %}
+  </dl>
+  <div class="pool-card-footer">
+      <time data-relative-time datetime="{{ pool.updated_at }}">{{ pool.updated_at }}</time>
+    <form hx-post="/check" hx-target="#result" hx-swap="innerHTML">
+      <input type="hidden" name="address" value="{{ pool.pool }}">
+      <button class="check-pool" type="submit">Check <span aria-hidden="true">↗</span></button>
+    </form>
+  </div>
+</article>
+{% endfor %}
+<p class="contract-match-footnote">contract match only, not proof of backing or custody, price, or endorsement</p>
+{% endif %}

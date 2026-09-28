@@ -1,0 +1,197 @@
+<div id="certificate-result">
+  {% if certificate.notice.len() > 0 %}
+  <p class="recheck-notice">{{ certificate.notice }}</p>
+  {% endif %}
+  {% if !certificate.is_live %}
+  <p class="certificate-note">QED record {{ certificate.id_short }} from <time data-relative-time datetime="{{ certificate.checked_at }}">{{ certificate.checked_at }}</time>. <a href="{{ certificate.live_url }}">View the live pool page</a>.</p>
+  {% endif %}
+  <article class="certificate-card {{ certificate.verdict_class }}">
+    <header class="certificate-head">
+      <div class="seal-large {{ certificate.verdict_class }}">
+        <svg class="seal-icon" aria-hidden="true">
+          <use href="/static/icons.svg#{{ certificate.seal_icon }}"></use>
+        </svg>
+      </div>
+      <div class="certificate-heading">
+        <p class="eyebrow">{{ certificate.verdict_label }}</p>
+        <h1 class="page-title">{{ certificate.pair }}</h1>
+        <p>{{ certificate.sentence }}</p>
+        {% if certificate.verdict_class == "is-verified" %}<small class="contract-match-note">contract match only, not proof of backing or custody, reserves, price, or endorsement</small>{% endif %}
+        <p class="certificate-status {{ certificate.signature_status_class }}">
+          <span class="status-dot" aria-hidden="true"></span>
+          {{ certificate.signature_status_label }}
+        </p>
+      </div>
+    </header>
+    <div class="certificate-pair">
+      <span class="chain-chip">
+        <span class="chain-glyph">
+          <svg aria-hidden="true">
+            <use href="/static/icons.svg#{{ certificate.chain_icon }}"></use>
+          </svg>
+        </span>
+        {{ certificate.chain }}
+      </span>
+      <span class="dex-chip">{{ certificate.dex }}</span>
+    </div>
+    <dl class="certificate-summary">
+      <div>
+        <dt>Subject</dt>
+        <dd>{{ certificate.pair }} · {{ certificate.chain }}</dd>
+      </div>
+      <div class="pool-address-field">
+        <dt>Pool address</dt>
+        <dd>
+          <code class="pool-address-large">{{ certificate.pool_address }}</code>
+          <button class="copy-button" type="button" data-copy="{{ certificate.pool_address }}">Copy</button>
+        </dd>
+      </div>
+      <div>
+        <dt>Issuer match</dt>
+        <dd>{{ certificate.issuer_match }}{% if certificate.ticker.len() > 0 %} · <a href="/tokens/{{ certificate.ticker }}">View {{ certificate.ticker }} contracts</a>{% endif %}</dd>
+      </div>
+      <div>
+        <dt>Checked</dt>
+        <dd>
+          <time data-relative-time datetime="{{ certificate.checked_at }}">{{ certificate.checked_at }}</time>
+          <span aria-hidden="true"> · </span>
+          <time data-local-time datetime="{{ certificate.checked_at }}">{{ certificate.checked_at }}</time>
+        </dd>
+      </div>
+      <div>
+        <dt>Valid until</dt>
+        <dd>
+          <time data-relative-time datetime="{{ certificate.expires_at }}">{{ certificate.expires_at }}</time>
+          <span aria-hidden="true"> · </span>
+          <time data-local-time datetime="{{ certificate.expires_at }}">{{ certificate.expires_at }}</time>
+        </dd>
+      </div>
+      <div>
+        <dt>Serial</dt>
+        <dd>
+          <code>{{ certificate.serial }}</code>
+          <button class="copy-button" type="button" data-copy="{{ certificate.serial }}">Copy</button>
+        </dd>
+      </div>
+      <div>
+        <dt>Signed by</dt>
+        <dd>QED (key id <code>{{ certificate.signer_key_id }}</code>)</dd>
+      </div>
+    </dl>
+    <p class="address-compare-note">Compare this address with the one you were given before you trade.</p>
+    <div class="backing-bar" aria-label="Quote share of supply">
+      <progress class="share-progress" max="100" value="{{ certificate.share_value }}">{{ certificate.share_label }}</progress>
+    </div>
+    <div class="result-meta">
+      <span>{{ certificate.share_label }}</span>
+      <span>Checked <time data-relative-time datetime="{{ certificate.checked_at }}">{{ certificate.checked_at }}</time></span>
+    </div>
+    <nav class="detail-links" aria-label="Trade links">
+      {% for link in certificate.trade_links %}
+      <span class="trade-link-item"><a class="button secondary-button" href="{{ link.url }}" target="_blank" rel="noreferrer">{{ link.label }} ↗</a></span>
+      {% endfor %}
+      {% if certificate.is_live %}
+      <a class="button secondary-button" href="/v/{{ certificate.id }}">Record</a>
+      {% endif %}
+    </nav>
+    <p class="anti-phishing">Only trust an address you pasted here or opened from this page.</p>
+    <div class="certificate-actions">
+      <button class="button secondary-button" type="button" data-nerd-toggle aria-expanded="false">Nerd mode</button>
+      <form hx-post="/v/{{ certificate.id }}/recheck{% if certificate.is_live %}?live=true{% endif %}" hx-target="#certificate-result" hx-swap="outerHTML">
+        <button class="button primary-button" type="submit">Re-check now</button>
+      </form>
+    </div>
+    <details class="verify-details">
+      <summary>How to verify this yourself</summary>
+      <p>QED signs a canonical JSON payload. Fetch the public key from <a href="{{ certificate.public_key_url }}">{{ certificate.public_key_url }}</a>, then check the signature against this payload.</p>
+      <dl class="verify-fields">
+        <div>
+          <dt>Canonical JSON</dt>
+          <dd><pre><code>{{ certificate.canonical_json }}</code></pre></dd>
+        </div>
+        <div>
+          <dt>Signature</dt>
+          <dd><code>{{ certificate.signature }}</code></dd>
+        </div>
+        <div>
+          <dt>API call</dt>
+          <dd><code>GET {{ certificate.attestation_api_url }}</code></dd>
+        </div>
+      </dl>
+      <ol>
+        <li>Fetch the public key and attestation JSON, then verify the signature with the published key.</li>
+        <li>Canonicalize the payload with sorted object keys and no whitespace, then verify its SHA-256 attestation id.</li>
+        <li>Run the API call above and compare the returned payload, serial, signer, and signature with this certificate.</li>
+      </ol>
+    </details>
+    <div class="nerd-panel" hidden>
+      <dl class="certificate-facts">
+        <div>
+          <dt>Attestation id</dt>
+          <dd>
+            <code>{{ certificate.id }}</code>
+            <button class="copy-button" type="button" data-copy="{{ certificate.id }}">Copy</button>
+          </dd>
+        </div>
+        <div>
+          <dt>Subject</dt>
+          <dd><code>{{ certificate.subject }}</code></dd>
+        </div>
+        <div>
+          <dt>Checked at</dt>
+          <dd><time data-relative-time datetime="{{ certificate.checked_at }}">{{ certificate.checked_at }}</time></dd>
+        </div>
+        <div>
+          <dt>Expires at</dt>
+          <dd><time data-relative-time datetime="{{ certificate.expires_at }}">{{ certificate.expires_at }}</time></dd>
+        </div>
+        <div>
+          <dt>Signer</dt>
+          <dd><code>{{ certificate.signer }}</code></dd>
+        </div>
+        <div>
+          <dt>Registry hash</dt>
+          <dd><code>{{ certificate.registry_hash }}</code></dd>
+        </div>
+        <div>
+          <dt>Signature</dt>
+          <dd><code>{{ certificate.signature }}</code></dd>
+        </div>
+        <div>
+          <dt>Block / slot</dt>
+          <dd>{{ certificate.block_label }} / {{ certificate.slot_label }}</dd>
+        </div>
+      </dl>
+      {% if certificate.reads.len() > 0 %}
+      <h2>Every read</h2>
+      <div class="read-list">
+        {% for read in certificate.reads %}
+        <details>
+          <summary>{{ read.method }} · {{ read.result_hash_short }}</summary>
+          <dl>
+            <div>
+              <dt>Parameters</dt>
+              <dd><code>{{ read.params }}</code></dd>
+            </div>
+            <div>
+              <dt>Result hash</dt>
+              <dd><code>{{ read.result_hash }}</code></dd>
+            </div>
+            {% if read.raw_result.len() > 0 %}
+            <div>
+              <dt>Raw result</dt>
+              <dd><code>{{ read.raw_result }}</code></dd>
+            </div>
+            {% endif %}
+            <div>
+              <dt>Block / slot</dt>
+              <dd>{{ read.block_label }} / {{ read.slot_label }}</dd>
+            </div>
+          </dl>
+        </details>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+  </article>
+</div>

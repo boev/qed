@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <symbol id="qed-seal" viewBox="0 0 24 24">
+      <path fill="currentColor" fill-rule="evenodd" d="M12 3a9 9 0 1 0 0 18 9 9 0 1 0 0-18Zm0 3a6 6 0 1 1 0 12 6 6 0 1 1 0-12Z"/>
+      <path d="m15 15 5 5" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+      <path d="m7.5 11.5 3 3 6-6" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+    <symbol id="qed-seal-verified" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="9" fill="#14F195"/>
+      <path d="M7 12.5 10.5 16 17.5 8.5" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+    <symbol id="qed-seal-broken" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="9" fill="#FF5C5C"/>
+      <path d="m8 8 8 8m0-8-8 8" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/>
+    </symbol>
+    <symbol id="qed-seal-unknown" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="9" fill="none" stroke="#8d8d94" stroke-width="3"/>
+      <circle cx="12" cy="12" r="2" fill="#8d8d94"/>
+    </symbol>
+    <symbol id="solana" viewBox="0 0 24 24"><path d="M5 5.2h13.3l-2.7 2.6H2.3L5 5.2Zm1.7 5.5H20l-2.7 2.6H4L6.7 10.7ZM5 16.2h13.3L21 18.8H2.3L5 16.2Z"/></symbol>
+    <symbol id="robinhood" viewBox="0 0 24 24"><path d="M7.4 3.5h6.1c3.4 0 5.5 1.8 5.5 4.6 0 2-1 3.5-2.8 4.2l3.7 8.2h-4.1l-3.1-7.3H11v7.3H7.4V3.5Zm3.6 3v3.7h2.2c1.3 0 2.1-.7 2.1-1.9 0-1.1-.8-1.8-2.1-1.8H11Z"/></symbol>
+    <symbol id="base" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 12h14M12 5a8.5 8.5 0 0 1 0 14" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
+    <symbol id="ethereum" viewBox="0 0 24 24"><path d="m12 2.8 6.1 9.5-6.1 3.5-6.1-3.5L12 2.8Zm0 14.4 6.1-3.5-6.1 7.5-6.1-7.5 6.1 3.5Z"/></symbol>
+    <symbol id="bnb" viewBox="0 0 24 24"><path d="m12 2.5 3 3-3 3-3-3 3-3Zm-5 5 3 3-3 3-3-3 3-3Zm10 0 3 3-3 3-3-3 3-3Zm-5 5 3 3-3 3-3-3 3-3Zm0-5 3 3-3 3-3-3 3-3Z"/></symbol>
+    <symbol id="pumpswap" viewBox="0 0 24 24"><path d="M5 3h8.2c3.7 0 5.8 2 5.8 5.1 0 3.2-2.1 5.1-5.8 5.1H9v7.8H5V3Zm4 3.2v3.8h3.7c1.5 0 2.3-.7 2.3-1.9s-.8-1.9-2.3-1.9H9Z"/><path d="M17.7 15.2 21 19l-3 2.2-3.7-4.1 3.4-1.9Z"/></symbol>
+    <symbol id="raydium" viewBox="0 0 24 24"><path d="M4 18.5 8.8 6h3.1l-4.7 12.5H4Zm6.3 0L15 6h3.1l-4.7 12.5h-3.1Zm5.5 0L20.6 6H23l-4.3 12.5h-2.9Z"/></symbol>
+    <symbol id="uniswap" viewBox="0 0 24 24"><path d="M7.3 4.1c1.1 1 1.6 2.1 1.8 3.2.3 1.6 1.4 2.5 3.2 2.5 1.4 0 2.4-.5 3-1.4.6-.9.7-2 .3-3.1-.3-.8-1.1-1.3-1.9-1.1-.8.2-1.3.9-1.1 1.7.2.7.9 1.2 1.6 1.1-.5.7-1.2 1-2 .8-1.2-.3-1.3-1.5-1.6-2.4-.4-1.3-1.3-2.4-2.3-3.2L7.3 4.1Zm3 5.6c-2.4 0-4.1 1.5-4.1 3.6 0 2.6 2.4 3.8 5.2 3.8 1.8 0 3.4-.5 4.5-1.4l2.1 4.4h2.3l-2.8-6.1c-.7-1.5-1.9-2.3-3.7-2.3-.7 0-1.4.1-2 .3-.4-1.4-1-2.3-1.5-2.3Zm1.1 4.4c.7 0 1.5-.1 2.2-.3l.8 1.7c-.8.4-1.8.6-2.8.6-1.2 0-2.4-.5-2.4-1.2 0-.5.8-.8 2.2-.8Z"/></symbol>
+    <symbol id="pancakeswap" viewBox="0 0 24 24"><path d="M12 4c-4.8 0-8 2.1-8 5.1 0 2.3 1.8 3.8 4.6 4.5l-.9 3.8h2.6l.8-3.3c.3 0 .6.1.9.1l-.7 3.2h2.6l.8-3.3c3.3-.5 5.3-2.2 5.3-4.8C20 6.1 16.8 4 12 4Zm-3.4 6.7c-.9 0-1.5-.5-1.5-1.2 0-1 1.8-1.8 4.4-1.8s4.4.8 4.4 1.8c0 .7-.6 1.2-1.5 1.2H8.6Z"/></symbol>
+    <symbol id="verified" viewBox="0 0 24 24"><path d="M12 2.5 14 4l2.5-.1 1 2.3 2.1 1.2-.5 2.4 1 2.2-1.7 1.8.1 2.5-2.4.8-1.4 2.1-2.3-.7-2.3.7-1.4-2.1-2.4-.8.1-2.5-1.7-1.8 1-2.2-.5-2.4 2.1-1.2 1-2.3L10 4l2-1.5Zm-1.3 13.1 6.1-6.1-1.6-1.6-4.5 4.5-2-2-1.6 1.6 3.6 3.6Z"/></symbol>
+    <symbol id="mismatch" viewBox="0 0 24 24"><path d="M12 2.5 22 20H2L12 2.5Zm0 5.1L6.1 17h11.8L12 7.6Zm-1 3.1h2v3.7h-2v-3.7Zm0 4.8h2v1.8h-2v-1.8Z"/></symbol>
+    <symbol id="unknown" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9.5 9.3c.2-1.6 1.2-2.5 2.8-2.5 1.7 0 2.8 1 2.8 2.4 0 1.3-.8 2-1.8 2.7-.9.6-1.3 1.2-1.3 2.3M12 17.5v.1" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+    <symbol id="sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+    <symbol id="moon" viewBox="0 0 24 24"><path d="M20 15.7A8.5 8.5 0 0 1 8.3 4a8.5 8.5 0 1 0 11.7 11.7Z"/></symbol>
+    <symbol id="copy" viewBox="0 0 24 24"><path d="M8 8V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-3v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2h3Zm-3 2v9h7v-9H5Zm6-4v2h3a2 2 0 0 1 2 2v3h3V6h-8Z"/></symbol>
+  </defs>
+</svg>

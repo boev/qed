@@ -1,0 +1,19 @@
+{
+  "nodes": [
+    {
+      "name": "NVIDIA xStock",
+      "symbol": "NVDAx",
+      "deployments": [
+        {
+          "address": "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh",
+          "network": "Solana",
+          "decimals": 8
+        }
+      ]
+    }
+  ],
+  "page": {
+    "currentPage": 1,
+    "hasNextPage": false
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "data": [
+    {
+      "symbol": "OUSG",
+      "name": "Ondo Short-Term US Government Bond Fund",
+      "deployments": [
+        {"address": "0xAbCd000000000000000000000000000000000002", "network": "Ethereum", "decimals": 18},
+        {"address": "0xAbCd000000000000000000000000000000000003", "chainId": 56, "decimals": 18}
+      ]
+    }
+  ]
+}

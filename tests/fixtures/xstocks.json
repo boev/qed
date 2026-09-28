@@ -1,0 +1,13 @@
+{
+  "nodes": [
+    {
+      "name": "NVIDIA xStock",
+      "symbol": "NVDAx",
+      "underlyingSymbol": "NVDA",
+      "deployments": [
+        {"address": "So11111111111111111111111111111111111111112", "network": "Solana", "decimals": 8},
+        {"address": "0xAbCd000000000000000000000000000000000001", "network": "Ethereum", "decimals": 18}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{% extends "layout.html" %}
+{% block title %}QED | Contract-first verification guide{% endblock %}
+{% block meta_description %}A practical contract-first method for comparing a stock-token address with the contract published by its issuer, followed by QED's signed comparison.{% endblock %}
+{% block og_title %}QED | Contract-first verification guide{% endblock %}
+{% block og_description %}A manual contract-first method and QED's automated re-checkable workflow.{% endblock %}
+{% block canonical_url %}{{ public_url }}/guide/verify-a-stock-token{% endblock %}
+{% block canonical_link %}{{ public_url }}/guide/verify-a-stock-token{% endblock %}
+{% block content %}
+<section class="page-intro directory-intro"><p class="eyebrow">Guide</p><h1 class="page-title">Check a stock-token contract.</h1><p>Start with the contract, not the ticker. The goal is to compare the address you were given with the contract published by the issuer and the chain's observed state. This comparison does not prove backing or custody.</p></section>
+<section class="guide-content">
+  <article class="guide-step"><p class="eyebrow">01</p><h2>Find the exact contract</h2><p>Use the issuer's official registry or documentation. Record the chain, contract address, decimals, and the time you checked it. Do not copy an address from a social post or an unlabeled search result.</p></article>
+  <article class="guide-step"><p class="eyebrow">02</p><h2>Open the chain explorer</h2><p>Compare the exact address on the relevant chain explorer. Check that the token metadata, supply, and holder activity are consistent with the issuer's published information. Similar tickers on another chain are different assets.</p></article>
+  <article class="guide-step"><p class="eyebrow">03</p><h2>Inspect the pool</h2><p>For a pool, identify both token contracts, the pool address, and the venue. Confirm which side is the claimed stock-linked token. Liquidity, price, and volume describe the venue; they do not prove an issuer contract match, backing, custody, or endorsement.</p></article>
+  <article class="guide-step"><p class="eyebrow">04</p><h2>Re-check with QED</h2><p>Paste the pool or token address into <a href="/check">QED</a>. QED reads the configured chain RPC, compares the observed contract with the issuer's published contract in the registry, and labels uncertainty instead of treating a failed read as a match.</p></article>
+  <article class="guide-step"><p class="eyebrow">05</p><h2>Keep the record</h2><p>When QED can produce a certificate, use its public record and API JSON. Verify the Ed25519 signature with the published key, compare the registry hash and timestamps, and remember that the record has an expiry. A verified contract match does not prove backing, custody, price, liquidity, or solvency.</p></article>
+</section>
+<section class="guide-callout"><h2>What QED automates</h2><p>QED makes the contract comparison reproducible: it records the reads, canonicalizes the payload, signs the result, and exposes the evidence for independent re-checking. It does not replace the issuer's legal disclosures, a chain explorer, or your own risk assessment.</p><a class="button primary-button" href="/check">Check a pool <span aria-hidden="true">→</span></a></section>
+{% endblock %}

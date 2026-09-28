@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">Qed</title>
+  <rect width="64" height="64" rx="14" fill="#17171a"/>
+  <path fill="#9945FF" fill-rule="evenodd" d="M32 8a24 24 0 1 0 0 48 24 24 0 1 0 0-48Zm0 9a15 15 0 1 1 0 30 15 15 0 1 1 0-30Z"/>
+  <path d="m40 42 11 11" fill="none" stroke="#9945FF" stroke-width="7" stroke-linecap="round"/>
+  <path d="m21 32 8 8 15-18" fill="none" stroke="#9945FF" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

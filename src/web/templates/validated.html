@@ -1,0 +1,82 @@
+{% extends "layout.html" %}
+{% block title %}QED | Current contract matches{% endblock %}
+{% block meta_description %}Browse stock-paired pools with an unexpired QED contract-match record.{% endblock %}
+{% block og_title %}QED | Current contract matches{% endblock %}
+{% block og_description %}Current stock-paired pools with an unexpired QED contract-match record.{% endblock %}
+{% block twitter_title %}QED | Current contract matches{% endblock %}
+{% block twitter_description %}Current stock-paired pools with an unexpired QED contract-match record.{% endblock %}
+{% block canonical_url %}{{ public_url }}/validated{% endblock %}
+{% block canonical_link %}{{ public_url }}/validated{% endblock %}
+{% block content %}
+<section class="page-intro">
+  <p class="eyebrow">Public directory</p>
+  <h1 class="page-title">Current contract matches.</h1>
+  <p>Pools appear here only while their QED contract-match record is unexpired. A match does not prove backing or custody, reserves, price, safety, solvency, or endorsement; re-check before relying on it.</p>
+  <p class="muted">Source code: <a href="https://github.com/boev/qed" target="_blank" rel="noopener noreferrer">github.com/boev/qed</a></p>
+  {% if rebuilding %}
+  <p class="muted directory-status">Rebuilding the directory… Showing previously recorded rows until fresh records arrive; confirm each record before relying on it.</p>
+  {% endif %}
+</section>
+<section class="validated-grid" aria-label="Current contract matches">
+  {% if cards.len() == 0 %}
+    <p class="muted">No current contract matches.</p>
+  {% endif %}
+  {% for card in cards %}
+  <article class="pool-card {{ card.verdict_class }}">
+    <a class="pool-card-link" href="{{ card.detail_url }}">
+    <div class="pool-card-topline">
+      <div class="chain-label">
+        <span class="chain-glyph">
+          <svg aria-hidden="true">
+            <use href="/static/icons.svg#{{ card.chain_icon }}"></use>
+          </svg>
+        </span>
+        <span>{{ card.chain }}</span>
+      </div>
+      {% if card.dex.len() > 0 %}
+      <span class="dex-label">{{ card.dex }}</span>
+      {% endif %}
+    </div>
+    <div class="pool-pair">
+      <strong>{{ card.base_symbol }}</strong>
+      <span>/</span>
+      <strong>{{ card.quote_symbol }}</strong>
+    </div>
+    <div class="pool-verdict {{ card.verdict_class }}">
+      <span class="seal-mini">
+        <svg class="seal-icon" aria-hidden="true">
+          <use href="/static/icons.svg#{{ card.verdict_icon }}"></use>
+        </svg>
+      </span>
+      <span>{{ card.verdict_label }}</span>
+      {% if card.issuer_ticker.len() > 0 %}
+      <small>{{ card.issuer_ticker }}</small>
+      {% endif %}
+    </div>
+    <small class="contract-match-note">Contract match only, not proof of backing or custody, reserves, price, safety, solvency, or endorsement. Re-check when the record expires.</small>
+    <dl class="pool-stats">
+      <div>
+        <dt>Quote balance</dt>
+        <dd>{{ card.quote_balance }}</dd>
+      </div>
+      <div>
+        <dt>Share of supply <strong>{{ card.share_label }}</strong></dt>
+        <dd>
+          <span class="share-track">
+            <progress class="share-progress" max="100" value="{{ card.share_value }}">{{ card.share_label }}</progress>
+          </span>
+        </dd>
+      </div>
+    </dl>
+    <div class="pool-card-footer">
+      <time data-relative-time datetime="{{ card.updated_at }}">Checked {{ card.updated_at }}</time>
+      <span aria-hidden="true">View pool ↗</span>
+      </div>
+    </a>
+    <p class="pool-link-copy">Plain-text link for your pool page: <code>{{ public_url }}{{ card.detail_url }}</code> <a href="{{ card.detail_url }}" data-copy="{{ public_url }}{{ card.detail_url }}">Checked on QED</a></p>
+  </article>
+  {% endfor %}
+<p class="contract-match-footnote">QED checks contract-to-registry matches only; it does not prove backing or custody. Trade links, where shown on the record, open external venues and are not QED endorsements.</p>
+<p class="validated-link-note">QED uses plain-text “Checked on QED” links rather than badges or embeds, keeping the destination inspectable and reducing badge-impersonation risk. Compare the exact pool and contract address you were given.</p>
+</section>
+{% endblock %}

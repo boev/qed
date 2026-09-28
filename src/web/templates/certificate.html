@@ -1,0 +1,21 @@
+{% extends "layout.html" %}
+{% block title %}{% if certificate.is_live %}QED | {{ certificate.pair }} on {{ certificate.chain }}{% else %}QED | Certificate {{ certificate.id_short }}{% endif %}{% endblock %}
+{% block meta_description %}{% if certificate.is_live %}QED contract comparison for {{ certificate.pair }} on {{ certificate.chain }}, including the observed pool, issuer match, signature, and expiry.{% else %}QED signed certificate {{ certificate.id_short }} with canonical payload and public verification details.{% endif %}{% endblock %}
+{% block og_title %}{% if certificate.is_live %}QED | {{ certificate.pair }} on {{ certificate.chain }}{% else %}QED | Certificate {{ certificate.id_short }}{% endif %}{% endblock %}
+{% block og_description %}{% if certificate.is_live %}Signed, re-checkable contract match verdict for {{ certificate.pair }} on {{ certificate.chain }}.{% else %}Signed QED certificate with canonical payload and public verification details.{% endif %}{% endblock %}
+{% block twitter_title %}{% if certificate.is_live %}QED | {{ certificate.pair }} on {{ certificate.chain }}{% else %}QED | Certificate {{ certificate.id_short }}{% endif %}{% endblock %}
+{% block twitter_description %}{% if certificate.is_live %}Signed, re-checkable contract match verdict for {{ certificate.pair }} on {{ certificate.chain }}.{% else %}Signed QED certificate with canonical payload and public verification details.{% endif %}{% endblock %}
+{% block canonical_url %}{{ public_url }}{{ certificate.live_url }}{% endblock %}
+{% block canonical_link %}{{ public_url }}{{ certificate.live_url }}{% endblock %}
+{% block content %}
+<script type="application/ld+json">{{ certificate.json_ld|safe }}</script>
+<section class="certificate-page page-intro" data-nerd-root>
+  <a class="back-link" href="/validated" hx-boost="true" hx-target="main" hx-select="main" hx-swap="innerHTML show:none">← Back to validated</a>
+  {% if certificate.is_live %}
+  <p class="eyebrow">Live pool contract match</p>
+  {% else %}
+  <p class="eyebrow">QED certificate</p>
+  {% endif %}
+  {% include "certificate_result.html" %}
+</section>
+{% endblock %}

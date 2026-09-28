@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}QED | Re-check the contract match{% endblock %}</title>
+  <meta name="description" content="{% block meta_description %}QED checks whether a pool uses the stock-token contract published by its issuer.{% endblock %}">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="QED">
+  <meta property="og:title" content="{% block og_title %}QED | Re-check the contract match{% endblock %}">
+  <meta property="og:description" content="{% block og_description %}QED compares pool contracts with issuer-published stock-token contracts.{% endblock %}">
+  <meta property="og:url" content="{% block canonical_url %}{{ public_url }}{% endblock %}">
+  <meta property="og:image" content="{% block og_image %}{{ public_url }}/static/og.png{% endblock %}">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{% block twitter_title %}QED | Re-check the contract match{% endblock %}">
+  <meta name="twitter:description" content="{% block twitter_description %}QED compares pool contracts with issuer-published stock-token contracts.{% endblock %}">
+  <meta name="twitter:image" content="{% block twitter_image %}{{ public_url }}/static/og.png{% endblock %}">
+  <link rel="canonical" href="{% block canonical_link %}{{ public_url }}{% endblock %}">
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_version }}">
+  <script src="/static/htmx.min.js?v={{ asset_version }}" defer></script>
+  <script src="/static/vue.global.prod.js?v={{ asset_version }}" defer></script>
+  <script src="/static/app.js?v={{ asset_version }}" defer></script>
+  <script src="/static/wallet.js?v={{ asset_version }}" defer></script>
+  <script src="/static/leaderboard.js?v={{ asset_version }}" defer></script>
+</head>
+<body hx-boost="true" hx-push-url="true" hx-swap="innerHTML show:none" hx-history="{% block history %}true{% endblock %}">
+  <header class="site-header page-shell">
+    <a class="site-brand" href="/" aria-label="QED home">
+      <img src="/static/logo.svg?v={{ asset_version }}" alt="QED" width="68" height="30">
+    </a>
+    <nav class="site-nav" aria-label="Main navigation">
+      <a href="/" hx-boost="true" hx-target="main" hx-select="main" hx-swap="innerHTML show:none">Home</a>
+      <a href="/check" hx-boost="true" hx-target="main" hx-select="main" hx-swap="innerHTML show:none">Check</a>
+      <a href="/registry" hx-boost="true" hx-target="main" hx-select="main" hx-swap="innerHTML show:none">Registry</a>
+      <a href="/validated" hx-boost="true" hx-target="main" hx-select="main" hx-swap="innerHTML show:none">Validated</a>
+    </nav>
+    <div class="header-actions">
+      <a class="wallet-nav" href="/wallet" hx-boost="true" hx-target="main" hx-select="main" hx-swap="innerHTML show:none">My Wallet</a>
+      <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Switch colour theme" title="Switch colour theme">
+        <svg class="theme-sun" aria-hidden="true">
+          <use href="/static/icons.svg?v={{ asset_version }}#sun"></use>
+        </svg>
+        <svg class="theme-moon" aria-hidden="true">
+          <use href="/static/icons.svg?v={{ asset_version }}#moon"></use>
+        </svg>
+      </button>
+    </div>
+  </header>
+  <main class="page-shell page-content">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="site-footer page-shell">
+    <nav aria-label="Legal and project links">
+      <a href="/tokens/NVDA">Token directory</a>
+      <a href="/chains/solana">Chain directory</a>
+      <a href="/glossary">Glossary</a>
+      <a href="/guide/verify-a-stock-token">Verification guide</a>
+      <a href="/imprint">Imprint</a>
+      <a href="/privacy">Privacy</a>
+      <a href="/terms">Terms</a>
+    </nav>
+    <a class="repository-link" href="https://github.com/boev/qed" target="_blank" rel="noopener noreferrer" aria-label="QED source code on GitHub">
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path fill="currentColor" d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.26c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.74.08-.74 1.2.08 1.83 1.24 1.83 1.24 1.07 1.83 2.8 1.3 3.49 1 .11-.78.42-1.3.76-1.6-2.67-.3-5.47-1.34-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.17 0 0 1.01-.32 3.3 1.23a11.45 11.45 0 0 1 6 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.65.24 2.87.12 3.17.77.84 1.24 1.91 1.24 3.22 0 4.6-2.8 5.62-5.48 5.92.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.83.58A12 12 0 0 0 12 .5"/>
+      </svg>
+    </a>
+  </footer>
+</body>
+</html>

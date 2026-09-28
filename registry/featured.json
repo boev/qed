@@ -1,0 +1,44 @@
+[
+  {
+    "chain": "RobinhoodChain",
+    "dex": "uniswap-v2",
+    "pool": "0xeE6F200063a53Fe9450578d99c0F8eAD4952c97a",
+    "note": "Robinhood Chain NVDA/USDG v2 pool. DexScreener did not index this address when the Phase C fixture was recorded, so it remains curated.",
+    "source_url": "https://dexscreener.com/robinhood/0xee6f200063a53fe9450578d99c0f8ead4952c97a"
+  },
+  {
+    "chain": "RobinhoodChain",
+    "dex": "uniswap-v3",
+    "pool": "0x40ea3e3A6aB2A95F35fD26BCD227AE1F0D5A58Cc",
+    "note": "Long.xyz Artificial Inu (AI) paired with Robinhood NVDA; DexScreener identifies this as a Robinhood Chain Uniswap v3 pool.",
+    "source_url": "https://dexscreener.com/robinhood/0x40ea3e3a6ab2a95f35fd26bcd227ae1f0d5a58cc"
+  },
+  {
+    "chain": "RobinhoodChain",
+    "dex": "uniswap-v4",
+    "pool": "0x48cff3c087c11b88bab76488f0d17b3e0c3dab113334e8b7a3d1205f1b31d923",
+    "note": "FAMI/JINQIAN spoof pool reported on 2026-09-02. Coverage: https://www.theblock.co/news/markets/2026-09-02-memecoin-shenanigans-nasdaq-microcap-mushroom-seller-farmmi-413374 and https://thedefiant.io/news/tokens/money-mushroom-moved-a-nasdaq-penny-stock-but-its-tokenized-stock-is-a-memecoin-too. DexScreener identifies the Robinhood Chain Uniswap v4 pool linked from the token search.",
+    "source_url": "https://dexscreener.com/robinhood/0x48cff3c087c11b88bab76488f0d17b3e0c3dab113334e8b7a3d1205f1b31d923"
+  },
+  {
+    "chain": "Solana",
+    "dex": "pumpfun",
+    "pool": "9rtAQeu6HioxrjWuAUorbX6ACgSN4TzM384gh7tESKYL",
+    "note": "Pump.fun custom pair with NVDAx as the quote token (NokiaBrick/NVDAx).",
+    "source_url": "https://dexscreener.com/solana/9rtaqeu6hioxrjwuauorbx6acgsn4tzm384gh7teskyl"
+  },
+  {
+    "chain": "Solana",
+    "dex": "pumpfun",
+    "pool": "3Xum2Tpw715LAJuCQBscwb8LS5h1xE4yrU7BGbxcrMhh",
+    "note": "Pump.fun custom pair with NVDAx as the quote token (Super Inu/NVDAx).",
+    "source_url": "https://dexscreener.com/solana/3xum2tpw715lajucqbscwb8ls5h1xe4yru7bgbxcrmhh"
+  },
+  {
+    "chain": "Solana",
+    "dex": "pumpfun",
+    "pool": "5DnhFALRYpbTjLViVSEaqGsUoHw5DY8XLyyF3qaMkgqT",
+    "note": "Pump.fun custom pair with NVDAx as the quote token (Datacenter/NVDAx).",
+    "source_url": "https://dexscreener.com/solana/5dnhfalrypbtjlvivseaqgsuohw5dy8xlyyf3qamkgqt"
+  }
+]
