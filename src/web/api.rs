@@ -294,6 +294,7 @@ mod tests {
             attest_store: std::sync::Arc::new(crate::attest::FileAttestationStore::new(
                 std::path::PathBuf::from("target/test-api-attestations"),
             )),
+            board_store: std::sync::Arc::new(crate::discovery::DurableBoardStore::default()),
             registry_hash: std::sync::Arc::new(std::sync::RwLock::new(String::new())),
             registry_api_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             public_url: std::sync::Arc::new("http://localhost:3000".to_owned()),

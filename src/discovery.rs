@@ -3,6 +3,210 @@ use crate::check::{self, CheckResult, Verdict};
 use crate::pool::PoolInfo;
 use crate::registry::{self, Registry};
 use crate::state::AppState;
+#[cfg(feature = "s3")]
+use aws_sdk_s3::primitives::ByteStream;
+#[cfg(feature = "s3")]
+use aws_sdk_s3::Client as S3Client;
+#[cfg(feature = "s3")]
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+const DURABLE_BOARD_PREFIX: &str = "discovery/";
+#[cfg(feature = "s3")]
+const MAX_DURABLE_BOARD_BYTES: usize = 2 * 1024 * 1024;
+
+#[cfg(feature = "s3")]
+async fn read_bounded_body<R>(
+    reader: R,
+    content_length: Option<i64>,
+) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let expected_length = content_length.and_then(|length| usize::try_from(length).ok());
+    if expected_length.is_some_and(|length| length > MAX_DURABLE_BOARD_BYTES) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "durable board object exceeds the size limit",
+        ));
+    }
+    let capacity = expected_length.unwrap_or_default().min(MAX_DURABLE_BOARD_BYTES);
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut reader = reader.take((MAX_DURABLE_BOARD_BYTES + 1) as u64);
+    reader.read_to_end(&mut bytes).await?;
+    if bytes.len() > MAX_DURABLE_BOARD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "durable board object exceeds the size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[derive(Clone, Default)]
+pub struct DurableBoardStore {
+    #[cfg(feature = "s3")]
+    client: Option<S3Client>,
+    #[cfg(feature = "s3")]
+    bucket: Option<String>,
+}
+
+impl DurableBoardStore {
+    pub async fn new(bucket: Option<String>) -> Self {
+        #[cfg(feature = "s3")]
+        {
+            let Some(bucket) = bucket.filter(|bucket| !bucket.is_empty()) else {
+                return Self::default();
+            };
+            let config = aws_config::defaults(aws_config::BehaviorVersion::latest()).load().await;
+            return Self {
+                client: Some(S3Client::new(&config)),
+                bucket: Some(bucket),
+            };
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            let _ = bucket;
+            Self::default()
+        }
+    }
+
+    #[cfg(feature = "s3")]
+    async fn read<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
+        let (Some(client), Some(bucket)) = (&self.client, &self.bucket) else {
+            return None;
+        };
+        let output = match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(output) => output,
+            Err(error)
+                if error.as_service_error().is_some_and(|error| error.is_no_such_key())
+                    || error
+                        .raw_response()
+                        .is_some_and(|response| response.status().as_u16() == 404) =>
+            {
+                return None;
+            }
+            Err(error) => {
+                warn!(key, error = %error, "reading durable board failed");
+                return None;
+            }
+        };
+        let content_length = output.content_length();
+        let bytes = match read_bounded_body(output.body.into_async_read(), content_length).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(key, error = %error, "reading durable board body failed");
+                return None;
+            }
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                warn!(key, error = %error, "durable board is unreadable");
+                None
+            }
+        }
+    }
+
+    #[cfg(not(feature = "s3"))]
+    async fn read<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
+        let _ = key;
+        None
+    }
+
+    #[cfg(feature = "s3")]
+    async fn write<T: Serialize>(&self, key: &str, value: &T) {
+        let (Some(client), Some(bucket)) = (&self.client, &self.bucket) else {
+            return;
+        };
+        let bytes = match serde_json::to_vec(value) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(key, error = %error, "serializing durable board failed");
+                return;
+            }
+        };
+        if bytes.len() > MAX_DURABLE_BOARD_BYTES {
+            warn!(key, "refusing to persist an oversized durable board");
+            return;
+        }
+        if let Err(error) = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .content_type("application/json")
+            .body(ByteStream::from(bytes))
+            .send()
+            .await
+        {
+            warn!(key, error = %error, "persisting durable board failed");
+        }
+    }
+
+    #[cfg(not(feature = "s3"))]
+    async fn write<T: Serialize>(&self, key: &str, value: &T) {
+        let _ = (key, value);
+    }
+
+    pub async fn load_leaderboard(&self) -> Option<Leaderboard> {
+        self.read(&format!("{DURABLE_BOARD_PREFIX}{LEADERBOARD_CACHE_FILE}"))
+            .await
+            .filter(|board: &Leaderboard| {
+                !board.entries.is_empty() && board.entries.len() <= MAX_LEADERBOARD_CANDIDATES
+            })
+    }
+
+    pub async fn persist_leaderboard(&self, board: &Leaderboard) {
+        if !safe_board_replacement(0, board.entries.len())
+            || board.entries.len() > MAX_LEADERBOARD_CANDIDATES
+        {
+            return;
+        }
+        if let Some(previous) = self.load_leaderboard().await
+            && !safe_board_replacement(previous.entries.len(), board.entries.len())
+        {
+            warn!(
+                previous = previous.entries.len(),
+                next = board.entries.len(),
+                "refusing to replace durable leaderboard with a much smaller board"
+            );
+            return;
+        }
+        self.write(
+            &format!("{DURABLE_BOARD_PREFIX}{LEADERBOARD_CACHE_FILE}"),
+            board,
+        )
+        .await;
+    }
+
+    pub async fn load_featured(&self) -> Option<FeaturedSnapshot> {
+        self.read(&format!("{DURABLE_BOARD_PREFIX}{FEATURED_CACHE_FILE}"))
+            .await
+            .filter(|snapshot: &FeaturedSnapshot| {
+                !snapshot.pools.is_empty() && snapshot.pools.len() <= MAX_FEATURED_POOLS
+            })
+    }
+
+    pub async fn persist_featured(&self, snapshot: &FeaturedSnapshot) {
+        if !safe_board_replacement(0, snapshot.pools.len())
+            || snapshot.pools.len() > MAX_FEATURED_POOLS
+        {
+            return;
+        }
+        if let Some(previous) = self.load_featured().await
+            && !safe_board_replacement(previous.pools.len(), snapshot.pools.len())
+        {
+            warn!(
+                previous = previous.pools.len(),
+                next = snapshot.pools.len(),
+                "refusing to replace durable featured board with a much smaller board"
+            );
+            return;
+        }
+        self.write(&format!("{DURABLE_BOARD_PREFIX}{FEATURED_CACHE_FILE}"), snapshot)
+            .await;
+    }
+}
+
 use chrono::{SecondsFormat, Utc};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
@@ -493,6 +697,8 @@ pub enum DiscoveryError {
     EndpointBackoff(DexEndpoint),
     #[error("DexScreener request budget is exhausted for {0}")]
     BudgetExhausted(DexEndpoint),
+    #[error("DexScreener discovery failed for {failed}/{attempted} chain requests")]
+    ChainRequestsFailed { attempted: usize, failed: usize },
     #[error("DexScreener request failed")]
     Http(#[from] reqwest::Error),
     #[error("DexScreener response body failed limits: {0}")]
@@ -994,6 +1200,10 @@ fn featured_from_check(candidate: DiscoveryCandidate, result: CheckResult) -> Fe
     }
 }
 
+fn should_retry_empty_discovery(attempted: usize, failed: usize, candidates: usize) -> bool {
+    candidates == 0 && attempted > 0 && failed > 0
+}
+
 async fn discover_registry(
     state: &AppState,
     registry: &Registry,
@@ -1001,6 +1211,9 @@ async fn discover_registry(
     let client = DexScreenerClient::new(state.http.clone());
     let mut featured = Vec::new();
     let mut leaderboard = Vec::new();
+    let mut attempted = 0;
+    let mut succeeded = 0;
+    let mut failed = 0;
     for chain in [Chain::Solana, Chain::RobinhoodChain, Chain::Base, Chain::Ethereum, Chain::Bnb] {
         let mut addresses = Vec::new();
         for entry in
@@ -1017,8 +1230,10 @@ async fn discover_registry(
             info!(chain = %chain, candidates = 0usize, "shared pool discovery");
             continue;
         }
+        attempted += 1;
         match client.tokens(chain, &addresses).await {
             Ok(pairs) => {
+                succeeded += 1;
                 let mut chain_featured = pairs
                     .iter()
                     .filter_map(|pair| candidate_from_pair(pair, registry))
@@ -1037,8 +1252,16 @@ async fn discover_registry(
                 leaderboard.append(&mut chain_leaderboard);
             }
             Err(error) if is_dex_blocked(&error) => return Err(error),
-            Err(error) => warn!(%chain, error = %error, "DexScreener discovery failed"),
+            Err(error) => {
+                failed += 1;
+                warn!(%chain, error = %error, "DexScreener discovery failed");
+            }
         }
+    }
+    let candidates = featured.len() + leaderboard.len();
+    if should_retry_empty_discovery(attempted, failed, candidates) {
+        warn!(attempted, succeeded, failed, "all discovered pools were unavailable");
+        return Err(DiscoveryError::ChainRequestsFailed { attempted, failed });
     }
     Ok(DiscoveryBatch {
         featured,
@@ -1161,6 +1384,7 @@ async fn refresh_featured(
         empty_successful: false,
     };
     save_featured(data_dir, &snapshot);
+    state.board_store.persist_featured(&snapshot).await;
     *state.featured.write().await = snapshot.pools;
     *state.featured_status.write().await = FeaturedStatus {
         updated_at,
@@ -1314,6 +1538,7 @@ async fn publish_leaderboard(
     };
     if persist {
         save_leaderboard(data_dir, &leaderboard);
+        state.board_store.persist_leaderboard(&leaderboard).await;
     }
     *state.leaderboard.write().await = leaderboard;
 }
@@ -1369,6 +1594,10 @@ async fn refresh_leaderboard(
     shared_checks
 }
 
+fn startup_discovery_waits_for_registry(first_refresh: bool, registry: &Registry) -> bool {
+    first_refresh && registry::active_count(registry) == 0
+}
+
 pub async fn refresh_discovery(state: &AppState, data_dir: &Path, first_refresh: bool) -> bool {
     {
         let mut board = state.leaderboard.write().await;
@@ -1382,6 +1611,22 @@ pub async fn refresh_discovery(state: &AppState, data_dir: &Path, first_refresh:
     }
     let retry_delay = if first_refresh { 30 } else { DISCOVERY_REFRESH_SECS };
     let registry = state.registry.read().await.clone();
+    if startup_discovery_waits_for_registry(first_refresh, &registry) {
+        defer_leaderboard_refresh(
+            state,
+            data_dir,
+            "waiting for a refreshed registry before first discovery",
+            retry_delay,
+        )
+        .await;
+        defer_featured_refresh(
+            state,
+            "waiting for a refreshed registry before first discovery",
+            retry_delay,
+        )
+        .await;
+        return true;
+    }
     let batch = match discover_registry(state, &registry).await {
         Ok(batch) => batch,
         Err(error) if is_dex_blocked(&error) => {
@@ -1574,6 +1819,39 @@ mod tests {
             removed_at: None,
             stale_since: None,
         }
+    }
+
+    #[test]
+    fn first_discovery_retries_until_registry_has_active_entries() {
+        let mut registry = vec![entry(Chain::Base, "0xabc", "STOCK")];
+        registry[0].stale_since = Some("2026-09-27T00:00:00Z".to_owned());
+        assert!(startup_discovery_waits_for_registry(true, &registry));
+        assert!(!startup_discovery_waits_for_registry(false, &registry));
+
+        registry[0].stale_since = None;
+        assert!(!startup_discovery_waits_for_registry(true, &registry));
+    }
+
+    #[test]
+    fn failed_empty_discovery_retries_but_successful_empty_does_not() {
+        assert!(should_retry_empty_discovery(5, 5, 0));
+        assert!(should_retry_empty_discovery(5, 1, 0));
+        assert!(!should_retry_empty_discovery(5, 0, 0));
+        assert!(!should_retry_empty_discovery(0, 0, 0));
+    }
+
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    async fn durable_board_body_rejects_oversized_stream_even_with_small_length() {
+        let bytes = vec![0_u8; MAX_DURABLE_BOARD_BYTES + 1];
+        let error = read_bounded_body(std::io::Cursor::new(bytes.clone()), None)
+            .await
+            .expect_err("body must be capped");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let error = read_bounded_body(std::io::Cursor::new(bytes), Some(1))
+            .await
+            .expect_err("body must be capped");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

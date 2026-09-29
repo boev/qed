@@ -173,15 +173,20 @@ async fn main() -> Result<()> {
         None => Arc::new(attest::FileAttestationStore::new(attestations_dir)),
     };
     let loaded_attestations = std::collections::HashMap::new();
-    let cached_leaderboard =
-        discovery::load_leaderboard(&config.data_dir).map(|mut leaderboard| {
-            leaderboard.next_refresh_at =
-                discovery::timestamp_after(discovery::DISCOVERY_REFRESH_SECS);
-            leaderboard.restored = true;
-            leaderboard.refreshing = true;
-            leaderboard.empty_successful = false;
-            leaderboard
-        });
+    let board_store =
+        Arc::new(discovery::DurableBoardStore::new(config.attest_bucket.clone()).await);
+    let cached_leaderboard = match discovery::load_leaderboard(&config.data_dir) {
+        Some(leaderboard) => Some(leaderboard),
+        None => board_store.load_leaderboard().await,
+    }
+    .map(|mut leaderboard| {
+        leaderboard.next_refresh_at =
+            discovery::timestamp_after(discovery::DISCOVERY_REFRESH_SECS);
+        leaderboard.restored = true;
+        leaderboard.refreshing = true;
+        leaderboard.empty_successful = false;
+        leaderboard
+    });
     if let Some(leaderboard) = &cached_leaderboard {
         info!(
             entries = leaderboard.entries.len(),
@@ -189,7 +194,10 @@ async fn main() -> Result<()> {
             "restored leaderboard from the last run"
         );
     }
-    let cached_featured = discovery::load_featured_snapshot(&config.data_dir);
+    let cached_featured = match discovery::load_featured_snapshot(&config.data_dir) {
+        Some(snapshot) => Some(snapshot),
+        None => board_store.load_featured().await,
+    };
     let featured_status = cached_featured
         .as_ref()
         .map(|snapshot| discovery::FeaturedStatus {
@@ -222,6 +230,7 @@ async fn main() -> Result<()> {
         attestations: Arc::new(StdRwLock::new(loaded_attestations)),
         signing_key: Arc::new(signing_key),
         dev_signer,
+        board_store,
         attest_store,
         registry_hash: registry_hash_state.clone(),
         registry_api_cache: Arc::new(RwLock::new(None)),

@@ -1,7 +1,7 @@
 use crate::attest::{Attestation, AttestationStore};
 use crate::check::CheckResult;
 use crate::discovery::{
-    FeaturedPool, FeaturedStatus, Leaderboard, PriceSnapshot, RegistrySnapshot,
+    DurableBoardStore, FeaturedPool, FeaturedStatus, Leaderboard, PriceSnapshot, RegistrySnapshot,
 };
 use crate::pool::PoolReader;
 use crate::registry::Registry;
@@ -114,6 +114,7 @@ pub struct AppState {
     pub signing_key: Arc<SigningKey>,
     pub dev_signer: bool,
     pub attest_store: Arc<dyn AttestationStore>,
+    pub board_store: Arc<DurableBoardStore>,
     pub registry_hash: Arc<StdRwLock<String>>,
     pub registry_api_cache: Arc<RwLock<Option<RegistryApiCache>>>,
     pub public_url: Arc<String>,
