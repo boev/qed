@@ -6,14 +6,199 @@ use crate::discovery::{
 use crate::pool::PoolReader;
 use crate::registry::Registry;
 use bytes::Bytes;
+use chrono::{SecondsFormat, Utc};
 use ed25519_dalek::SigningKey;
 use moka::future::Cache;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock as StdRwLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+
+pub struct AdminAuth {
+    configured: bool,
+    username: Box<[u8]>,
+    password: Box<[u8]>,
+}
+
+const MAX_ADMIN_CREDENTIAL_BYTES: usize = 256;
+
+impl AdminAuth {
+    pub fn new(username: Option<&str>, password: Option<&str>) -> Self {
+        let (Some(username), Some(password)) =
+            (username.filter(|value| !value.is_empty()), password.filter(|value| !value.is_empty()))
+        else {
+            return Self {
+                configured: false,
+                username: Box::new([]),
+                password: Box::new([]),
+            };
+        };
+        if username.len() > MAX_ADMIN_CREDENTIAL_BYTES
+            || password.len() > MAX_ADMIN_CREDENTIAL_BYTES
+            || username.as_bytes().contains(&b':')
+        {
+            return Self {
+                configured: false,
+                username: Box::new([]),
+                password: Box::new([]),
+            };
+        }
+        Self {
+            configured: true,
+            username: username.as_bytes().to_vec().into_boxed_slice(),
+            password: password.as_bytes().to_vec().into_boxed_slice(),
+        }
+    }
+
+    pub(crate) fn matches(&self, username: &[u8], password: &[u8]) -> bool {
+        let username_matches = constant_time_eq(&self.username, username);
+        let password_matches = constant_time_eq(&self.password, password);
+        self.configured && username_matches && password_matches
+    }
+}
+
+fn constant_time_eq(expected: &[u8], candidate: &[u8]) -> bool {
+    let mut difference = expected.len() ^ candidate.len();
+    for index in 0..MAX_ADMIN_CREDENTIAL_BYTES {
+        difference |= usize::from(
+            expected.get(index).copied().unwrap_or_default()
+                ^ candidate.get(index).copied().unwrap_or_default(),
+        );
+    }
+    difference == 0
+}
+pub struct UsageStats {
+    started_at: String,
+    started: Instant,
+    total_requests: AtomicU64,
+    html_page_views: AtomicU64,
+    api_requests: AtomicU64,
+    checks: AtomicU64,
+    wallet_requests: AtomicU64,
+    admin_requests: AtomicU64,
+    health_requests: AtomicU64,
+    static_asset_requests: AtomicU64,
+    responses_2xx: AtomicU64,
+    responses_3xx: AtomicU64,
+    responses_4xx: AtomicU64,
+    responses_5xx: AtomicU64,
+}
+#[derive(Debug, Serialize)]
+pub struct UsageSnapshot {
+    pub scope: &'static str,
+    pub started_at: String,
+    pub uptime_seconds: u64,
+    pub total_requests: u64,
+    pub html_page_views: u64,
+    pub api_requests: u64,
+    pub checks: u64,
+    pub wallet_requests: u64,
+    pub admin_requests: u64,
+    pub health_requests: u64,
+    pub static_asset_requests: u64,
+    pub responses: UsageResponseCounts,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UsageResponseCounts {
+    #[serde(rename = "2xx")]
+    pub class_2xx: u64,
+    #[serde(rename = "3xx")]
+    pub class_3xx: u64,
+    #[serde(rename = "4xx")]
+    pub class_4xx: u64,
+    #[serde(rename = "5xx")]
+    pub class_5xx: u64,
+}
+
+impl UsageStats {
+    pub fn new() -> Self {
+        Self {
+            started_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            started: Instant::now(),
+            total_requests: AtomicU64::new(0),
+            html_page_views: AtomicU64::new(0),
+            api_requests: AtomicU64::new(0),
+            checks: AtomicU64::new(0),
+            wallet_requests: AtomicU64::new(0),
+            admin_requests: AtomicU64::new(0),
+            health_requests: AtomicU64::new(0),
+            static_asset_requests: AtomicU64::new(0),
+            responses_2xx: AtomicU64::new(0),
+            responses_3xx: AtomicU64::new(0),
+            responses_4xx: AtomicU64::new(0),
+            responses_5xx: AtomicU64::new(0),
+        }
+    }
+    pub(crate) fn record_request(
+        &self,
+        api: bool,
+        check: bool,
+        wallet: bool,
+        admin: bool,
+        health: bool,
+        static_asset: bool,
+    ) {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+        if api {
+            self.api_requests.fetch_add(1, Ordering::Relaxed);
+        }
+        if check {
+            self.checks.fetch_add(1, Ordering::Relaxed);
+        }
+        if wallet {
+            self.wallet_requests.fetch_add(1, Ordering::Relaxed);
+        }
+        if admin {
+            self.admin_requests.fetch_add(1, Ordering::Relaxed);
+        }
+        if health {
+            self.health_requests.fetch_add(1, Ordering::Relaxed);
+        }
+        if static_asset {
+            self.static_asset_requests.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_html_page_view(&self) {
+        self.html_page_views.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_response(&self, status: u16) {
+        match status / 100 {
+            2 => self.responses_2xx.fetch_add(1, Ordering::Relaxed),
+            3 => self.responses_3xx.fetch_add(1, Ordering::Relaxed),
+            4 => self.responses_4xx.fetch_add(1, Ordering::Relaxed),
+            5 => self.responses_5xx.fetch_add(1, Ordering::Relaxed),
+            _ => 0,
+        };
+    }
+
+    pub(crate) fn snapshot(&self) -> UsageSnapshot {
+        UsageSnapshot {
+            scope: "instance",
+            started_at: self.started_at.clone(),
+            uptime_seconds: self.started.elapsed().as_secs(),
+            total_requests: self.total_requests.load(Ordering::Relaxed),
+            html_page_views: self.html_page_views.load(Ordering::Relaxed),
+            api_requests: self.api_requests.load(Ordering::Relaxed),
+            checks: self.checks.load(Ordering::Relaxed),
+            wallet_requests: self.wallet_requests.load(Ordering::Relaxed),
+            admin_requests: self.admin_requests.load(Ordering::Relaxed),
+            health_requests: self.health_requests.load(Ordering::Relaxed),
+            static_asset_requests: self.static_asset_requests.load(Ordering::Relaxed),
+            responses: UsageResponseCounts {
+                class_2xx: self.responses_2xx.load(Ordering::Relaxed),
+                class_3xx: self.responses_3xx.load(Ordering::Relaxed),
+                class_4xx: self.responses_4xx.load(Ordering::Relaxed),
+                class_5xx: self.responses_5xx.load(Ordering::Relaxed),
+            },
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct RpcRateLimiter {
@@ -118,6 +303,8 @@ pub struct AppState {
     pub registry_hash: Arc<StdRwLock<String>>,
     pub registry_api_cache: Arc<RwLock<Option<RegistryApiCache>>>,
     pub public_url: Arc<String>,
+    pub admin_auth: Arc<AdminAuth>,
+    pub usage_stats: Arc<UsageStats>,
     pub rate_limiter: Arc<RateLimiter>,
     pub expensive_concurrency: Arc<tokio::sync::Semaphore>,
     pub wallet_concurrency: Arc<tokio::sync::Semaphore>,
@@ -235,5 +422,55 @@ mod tests {
         let requests = limiter.requests.lock().unwrap();
         assert!(!requests.contains_key(&expired));
         assert!(requests.contains_key(&fresh));
+    }
+    #[test]
+    fn admin_auth_rejects_missing_or_wrong_credentials_and_accepts_exact_pair() {
+        let unavailable = AdminAuth::new(None, Some("ignored"));
+        assert!(!unavailable.matches(b"admin", b"ignored"));
+
+        let auth = AdminAuth::new(Some("admin"), Some("replacement-only"));
+        assert!(auth.matches(b"admin", b"replacement-only"));
+        assert!(!auth.matches(b"admin", b"wrong"));
+        assert!(!auth.matches(b"other", b"replacement-only"));
+        assert!(!AdminAuth::new(Some("ad:min"), Some("replacement-only"))
+            .matches(b"ad:min", b"replacement-only"));
+        assert!(!AdminAuth::new(Some(&"x".repeat(257)), Some("replacement-only"))
+            .matches(&vec![b'x'; 257], b"replacement-only"));
+    }
+
+    #[test]
+    fn usage_stats_are_bounded_and_reset_with_a_new_instance() {
+        let stats = UsageStats::new();
+        stats.record_request(true, true, false, false, false, false);
+        stats.record_request(true, false, true, false, false, false);
+        stats.record_request(false, false, false, true, false, false);
+        stats.record_request(false, false, false, false, true, false);
+        stats.record_request(false, false, false, false, false, true);
+        stats.record_html_page_view();
+        stats.record_response(200);
+        stats.record_response(302);
+        stats.record_response(404);
+        stats.record_response(503);
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.total_requests, 5);
+        assert_eq!(snapshot.scope, "instance");
+        assert_eq!(snapshot.html_page_views, 1);
+        assert_eq!(snapshot.api_requests, 2);
+        assert_eq!(snapshot.checks, 1);
+        assert_eq!(snapshot.wallet_requests, 1);
+        assert_eq!(snapshot.health_requests, 1);
+        assert_eq!(snapshot.static_asset_requests, 1);
+        assert_eq!(snapshot.admin_requests, 1);
+        assert_eq!(snapshot.responses.class_2xx, 1);
+        assert_eq!(snapshot.responses.class_3xx, 1);
+        assert_eq!(snapshot.responses.class_4xx, 1);
+        assert_eq!(snapshot.responses.class_5xx, 1);
+        assert!(!snapshot.started_at.is_empty());
+
+        let reset = UsageStats::new().snapshot();
+        assert_eq!(reset.total_requests, 0);
+        assert_eq!(reset.html_page_views, 0);
+        assert_eq!(reset.admin_requests, 0);
     }
 }

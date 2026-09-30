@@ -26,6 +26,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub public_url: String,
     pub attest_bucket: Option<String>,
+    pub admin_username: Option<String>,
+    pub admin_password: Option<String>,
 }
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -76,6 +78,8 @@ impl Config {
                 .trim_end_matches('/')
                 .to_owned(),
             attest_bucket: env::var("QED_ATTEST_BUCKET").ok().filter(|value| !value.is_empty()),
+            admin_username: optional_secret("QED_ADMIN_USERNAME"),
+            admin_password: optional_secret("QED_ADMIN_PASSWORD"),
         })
     }
 }
@@ -96,6 +100,9 @@ fn require_private_rpc(
 
 fn value(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_owned())
+}
+fn optional_secret(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 fn rps(name: &'static str, default: u32) -> Result<u32, ConfigError> {

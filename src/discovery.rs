@@ -207,7 +207,7 @@ impl DurableBoardStore {
     }
 }
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -228,7 +228,7 @@ pub const MIN_LIQUIDITY_USD: f64 = 1_000.0;
 pub const MAX_FEATURED_POOLS: usize = 12;
 pub const MAX_LEADERBOARD_CANDIDATES: usize = 300;
 pub const LEADERBOARD_PAGE_SIZE: usize = 50;
-pub const DISCOVERY_REFRESH_SECS: u64 = 60 * 60;
+pub const DISCOVERY_REFRESH_SECS: u64 = 6 * 60 * 60;
 pub const PRICE_REFRESH_SECS: u64 = 5 * 60;
 pub const PRICE_RETRY_SECS: u64 = 60;
 pub const REGISTRY_REFRESH_SECS: u64 = 60 * 60;
@@ -432,6 +432,40 @@ fn now_rfc3339() -> String {
 pub fn timestamp_after(seconds: u64) -> String {
     (Utc::now() + chrono::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX)))
         .to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// Return the bounded delay before a restored non-empty board reaches its
+/// six-hour discovery age. Invalid, empty, stale, and future boards need an
+/// immediate discovery instead.
+pub fn restored_discovery_delay(
+    updated_at: &str,
+    has_content: bool,
+    now: DateTime<Utc>,
+) -> Option<Duration> {
+    if !has_content {
+        return None;
+    }
+    let checked_at = DateTime::parse_from_rfc3339(updated_at).ok()?.with_timezone(&Utc);
+    let age = now.signed_duration_since(checked_at);
+    let window =
+        chrono::Duration::seconds(i64::try_from(DISCOVERY_REFRESH_SECS).unwrap_or(i64::MAX));
+    if age < chrono::Duration::zero() || age >= window {
+        return None;
+    }
+    (window - age)
+        .to_std()
+        .ok()
+        .map(|delay| delay.min(Duration::from_secs(DISCOVERY_REFRESH_SECS)))
+}
+
+/// A complete restored board needs both persisted views. Run when the first
+/// one reaches its six-hour age so neither view exceeds the verification
+/// interval.
+pub fn first_discovery_delay(
+    leaderboard: Option<Duration>,
+    featured: Option<Duration>,
+) -> Option<Duration> {
+    leaderboard.zip(featured).map(|(leaderboard, featured)| leaderboard.min(featured))
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FeaturedPool {
@@ -1830,6 +1864,41 @@ mod tests {
 
         registry[0].stale_since = None;
         assert!(!startup_discovery_waits_for_registry(true, &registry));
+    }
+
+    #[test]
+    fn restored_discovery_delay_accepts_only_fresh_non_empty_boards() {
+        let now = DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z")
+            .expect("fixed timestamp parses")
+            .with_timezone(&Utc);
+        assert_eq!(
+            restored_discovery_delay("2026-09-30T09:00:00Z", true, now),
+            Some(Duration::from_secs(3 * 60 * 60))
+        );
+        assert_eq!(
+            restored_discovery_delay("2026-09-30T06:00:01Z", true, now),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(restored_discovery_delay("2026-09-30T05:59:59Z", true, now), None);
+        assert_eq!(restored_discovery_delay("2026-09-30T12:00:01Z", true, now), None);
+        assert_eq!(restored_discovery_delay("not-a-timestamp", true, now), None);
+        assert_eq!(restored_discovery_delay("2026-09-30T06:00:01Z", false, now), None);
+    }
+
+    #[test]
+    fn first_discovery_delay_uses_earliest_due_board() {
+        let now = DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z")
+            .expect("fixed timestamp parses")
+            .with_timezone(&Utc);
+        let older = restored_discovery_delay("2026-09-30T07:00:00Z", true, now);
+        let newer = restored_discovery_delay("2026-09-30T11:00:00Z", true, now);
+
+        assert_eq!(
+            first_discovery_delay(older, newer),
+            Some(Duration::from_secs(60 * 60))
+        );
+        assert_eq!(first_discovery_delay(older, None), None);
+        assert_eq!(first_discovery_delay(None, newer), None);
     }
 
     #[test]

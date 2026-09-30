@@ -20,6 +20,14 @@ use std::sync::Arc;
 pub(crate) async fn healthz() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
+
+pub(crate) async fn admin_stats(State(state): State<AppState>) -> Response {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(state.usage_stats.snapshot()),
+    )
+        .into_response()
+}
 pub(crate) async fn api_registry(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let registry_hash = state.registry_hash.read().map(|hash| hash.clone()).unwrap_or_default();
     let registry_hash = format!("{registry_hash}:{}", current_registry_version());
@@ -262,9 +270,12 @@ pub(crate) async fn verify_attestation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use ed25519_dalek::SigningKey;
     use std::collections::HashMap;
-
+    use tower::ServiceExt;
     fn test_state(dev_signer: bool) -> AppState {
         AppState {
             registry: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -298,6 +309,11 @@ mod tests {
             registry_hash: std::sync::Arc::new(std::sync::RwLock::new(String::new())),
             registry_api_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             public_url: std::sync::Arc::new("http://localhost:3000".to_owned()),
+            admin_auth: std::sync::Arc::new(crate::state::AdminAuth::new(
+                Some("test-admin"),
+                Some("test-password"),
+            )),
+            usage_stats: std::sync::Arc::new(crate::state::UsageStats::new()),
             rate_limiter: std::sync::Arc::new(crate::state::RateLimiter::default()),
             expensive_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(32)),
             wallet_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -327,6 +343,103 @@ mod tests {
             attestation_id: None,
             checked_at: None,
         }
+    }
+    #[tokio::test]
+    async fn admin_stats_reports_instance_schema_and_counters() {
+        let state = test_state(false);
+        state.usage_stats.record_request(true, true, false, false, false, false);
+        state.usage_stats.record_html_page_view();
+        state.usage_stats.record_response(200);
+
+        let response = admin_stats(State(state)).await;
+        assert_eq!(response.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+        let body = to_bytes(response.into_body(), 4096).await.expect("stats body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("stats serialize");
+        assert_eq!(value["scope"], "instance");
+        assert!(value["started_at"].as_str().is_some_and(|value| !value.is_empty()));
+        assert!(value["uptime_seconds"].is_u64());
+        assert_eq!(value["total_requests"], 1);
+        assert_eq!(value["html_page_views"], 1);
+        assert_eq!(value["api_requests"], 1);
+        assert_eq!(value["checks"], 1);
+        assert_eq!(value["health_requests"], 0);
+        assert_eq!(value["static_asset_requests"], 0);
+        assert_eq!(value["responses"]["2xx"], 1);
+    }
+    #[tokio::test]
+    async fn admin_route_rejects_without_auth_and_accepts_basic_auth() {
+        let state = test_state(false);
+        let app = crate::web::router(state.clone());
+
+        let rejected = app
+            .clone()
+            .oneshot(Request::get("/admin/stats").body(Body::empty()).unwrap())
+            .await
+            .expect("unauthorized response");
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(rejected.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+        let rejected_body = to_bytes(rejected.into_body(), 1024).await.expect("body");
+        assert_eq!(rejected_body.as_ref(), b"Unauthorized\n");
+        let after_rejection = state.usage_stats.snapshot();
+        assert_eq!(after_rejection.total_requests, 1);
+        assert_eq!(after_rejection.admin_requests, 1);
+        assert_eq!(after_rejection.responses.class_4xx, 1);
+
+        let encoded = STANDARD.encode(b"test-admin:test-password");
+        let accepted = app
+            .oneshot(
+                Request::get("/admin/stats")
+                    .header("authorization", format!("Basic {encoded}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("authorized response");
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(accepted.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+        let body = to_bytes(accepted.into_body(), 4096).await.expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("stats JSON");
+        assert_eq!(value["scope"], "instance");
+        assert_eq!(value["admin_requests"], 2);
+        assert_eq!(state.usage_stats.snapshot().responses.class_2xx, 1);
+        assert_eq!(state.usage_stats.snapshot().html_page_views, 0);
+        let mut unavailable_state = test_state(false);
+        unavailable_state.admin_auth =
+            std::sync::Arc::new(crate::state::AdminAuth::new(None, Some("ignored")));
+        let unavailable = crate::web::router(unavailable_state)
+            .oneshot(
+                Request::get("/admin/stats")
+                    .header("authorization", format!("Basic {encoded}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("fail-closed response");
+        assert_eq!(unavailable.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(unavailable.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+
+        let public_status = crate::web::router(test_state(false))
+            .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
+            .await
+            .expect("public status response");
+        assert_eq!(public_status.status(), StatusCode::OK);
+    }
+    #[tokio::test]
+    async fn admin_auth_attempts_are_rate_limited_before_authentication() {
+        let app = crate::web::router(test_state(false));
+        for _ in 0..60 {
+            let response = app
+                .clone()
+                .oneshot(Request::get("/admin/stats").body(Body::empty()).unwrap())
+                .await
+                .expect("auth response");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = app
+            .oneshot(Request::get("/admin/stats").body(Body::empty()).unwrap())
+            .await
+            .expect("rate-limited response");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]

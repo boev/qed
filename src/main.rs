@@ -114,6 +114,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let admin_auth = Arc::new(state::AdminAuth::new(
+        config.admin_username.as_deref(),
+        config.admin_password.as_deref(),
+    ));
+    let usage_stats = Arc::new(state::UsageStats::new());
     let rate_limiter =
         Arc::new(RateLimiter::with_rpc_rps(config.rpc_rps_solana, config.rpc_rps_evm));
     let rpc_buckets = rate_limiter.rpc_buckets();
@@ -178,15 +183,48 @@ async fn main() -> Result<()> {
     let cached_leaderboard = match discovery::load_leaderboard(&config.data_dir) {
         Some(leaderboard) => Some(leaderboard),
         None => board_store.load_leaderboard().await,
-    }
-    .map(|mut leaderboard| {
-        leaderboard.next_refresh_at =
-            discovery::timestamp_after(discovery::DISCOVERY_REFRESH_SECS);
+    };
+    let cached_featured = match discovery::load_featured_snapshot(&config.data_dir) {
+        Some(snapshot) => Some(snapshot),
+        None => board_store.load_featured().await,
+    };
+    let restore_now = Utc::now();
+    let leaderboard_restore_delay = cached_leaderboard.as_ref().and_then(|leaderboard| {
+        discovery::restored_discovery_delay(
+            &leaderboard.updated_at,
+            !leaderboard.entries.is_empty(),
+            restore_now,
+        )
+    });
+    let featured_restore_delay = cached_featured.as_ref().and_then(|snapshot| {
+        discovery::restored_discovery_delay(
+            &snapshot.updated_at,
+            !snapshot.pools.is_empty(),
+            restore_now,
+        )
+    });
+    let first_discovery_delay =
+        discovery::first_discovery_delay(leaderboard_restore_delay, featured_restore_delay);
+    let restored_next_refresh_at = first_discovery_delay
+        .map(|delay| discovery::timestamp_after(delay.as_secs()))
+        .unwrap_or_else(|| discovery::timestamp_after(0));
+    let cached_leaderboard = cached_leaderboard.map(|mut leaderboard| {
+        leaderboard.next_refresh_at = restored_next_refresh_at.clone();
         leaderboard.restored = true;
-        leaderboard.refreshing = true;
+        leaderboard.refreshing = false;
         leaderboard.empty_successful = false;
         leaderboard
     });
+    let featured_status = cached_featured
+        .as_ref()
+        .map(|snapshot| discovery::FeaturedStatus {
+            updated_at: snapshot.updated_at.clone(),
+            next_refresh_at: restored_next_refresh_at,
+            restored: true,
+            refreshing: false,
+            empty_successful: false,
+        })
+        .unwrap_or_default();
     if let Some(leaderboard) = &cached_leaderboard {
         info!(
             entries = leaderboard.entries.len(),
@@ -194,20 +232,6 @@ async fn main() -> Result<()> {
             "restored leaderboard from the last run"
         );
     }
-    let cached_featured = match discovery::load_featured_snapshot(&config.data_dir) {
-        Some(snapshot) => Some(snapshot),
-        None => board_store.load_featured().await,
-    };
-    let featured_status = cached_featured
-        .as_ref()
-        .map(|snapshot| discovery::FeaturedStatus {
-            updated_at: snapshot.updated_at.clone(),
-            next_refresh_at: discovery::timestamp_after(discovery::DISCOVERY_REFRESH_SECS),
-            restored: true,
-            refreshing: true,
-            empty_successful: false,
-        })
-        .unwrap_or_default();
     if let Some(featured) = &cached_featured {
         info!(pools = featured.pools.len(), "restored featured pools from the last run");
     }
@@ -235,6 +259,8 @@ async fn main() -> Result<()> {
         registry_hash: registry_hash_state.clone(),
         registry_api_cache: Arc::new(RwLock::new(None)),
         public_url: Arc::new(config.public_url.clone()),
+        admin_auth,
+        usage_stats,
         rate_limiter: Arc::clone(&rate_limiter),
         expensive_concurrency: Arc::new(tokio::sync::Semaphore::new(32)),
         wallet_concurrency: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -266,7 +292,8 @@ async fn main() -> Result<()> {
     let refresh_check_cache = check_cache.clone();
     let refresh_endpoints = registry_endpoints.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(discovery::REGISTRY_REFRESH_SECS));
         loop {
             interval.tick().await;
             refresh_registry(
@@ -285,6 +312,9 @@ async fn main() -> Result<()> {
     let discovery_state = state.clone();
     let discovery_dir = config.data_dir.clone();
     tokio::spawn(async move {
+        if let Some(delay) = first_discovery_delay {
+            tokio::time::sleep(delay).await;
+        }
         let mut first_refresh = true;
         loop {
             let retry_soon =

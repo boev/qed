@@ -1,13 +1,14 @@
-use crate::{chain::Chain, registry, state::AppState};
+use crate::{chain::Chain, registry, state::{AdminAuth, AppState}};
 use axum::{
     Router,
     extract::State,
-    http::{HeaderValue, Method, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use std::net::IpAddr;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use std::net::{IpAddr, SocketAddr};
 use tower_http::{compression::CompressionLayer, services::ServeDir};
 
 mod api;
@@ -16,10 +17,9 @@ mod legal;
 mod openapi;
 mod pages;
 mod views;
-
 pub(crate) use api::{
-    api_attestation, api_check, api_featured, api_leaderboard, api_prices, api_registry,
-    api_status, api_wallet, healthz, verify_attestation, well_known,
+    admin_stats, api_attestation, api_check, api_featured, api_leaderboard, api_prices,
+    api_registry, api_status, api_wallet, healthz, verify_attestation, well_known,
 };
 pub(crate) use discoverability::{api_docs, llms, llms_full, validated_feed};
 pub(crate) use legal::{imprint, privacy, terms};
@@ -78,6 +78,7 @@ pub fn router(state: AppState) -> Router {
         .route("/openapi.json", get(openapi::document))
         .route("/pools/featured", get(featured))
         .route("/healthz", get(healthz))
+        .route("/admin/stats", get(admin_stats))
         .route("/api/registry", get(api_registry))
         .route("/api/pools/featured", get(api_featured))
         .route("/api/leaderboard", get(api_leaderboard))
@@ -95,7 +96,82 @@ pub fn router(state: AppState) -> Router {
         .layer(CompressionLayer::new())
         .layer(middleware::from_fn(cache_static))
         .layer(middleware::from_fn(security_headers))
-        .layer(middleware::from_fn_with_state(state, rate_limit))
+        .layer(middleware::from_fn_with_state(state.clone(), admin_auth))
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
+        .layer(middleware::from_fn_with_state(state, usage_metrics))
+}
+async fn admin_auth(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if request.uri().path() == "/admin/stats"
+        && !valid_admin_authorization(request.headers(), &state.admin_auth)
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [
+                (header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"qed-admin\"")),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            ],
+            "Unauthorized\n",
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+fn valid_admin_authorization(headers: &HeaderMap, auth: &AdminAuth) -> bool {
+    let Some(value) = headers.get(header::AUTHORIZATION) else {
+        return false;
+    };
+    let encoded = value.as_bytes();
+    if encoded.len() < 6
+        || !encoded[..5].eq_ignore_ascii_case(b"Basic")
+        || encoded[5] != b' '
+    {
+        return false;
+    }
+    let Ok(decoded) = STANDARD.decode(&encoded[6..]) else {
+        return false;
+    };
+    let Some(separator) = decoded.iter().position(|byte| *byte == b':') else {
+        return false;
+    };
+    auth.matches(&decoded[..separator], &decoded[separator + 1..])
+}
+
+async fn usage_metrics(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    let method = request.method();
+    let is_admin = path == "/admin/stats";
+    let is_api = path == "/api" || path.starts_with("/api/");
+    let is_check = (method == Method::GET && path.starts_with("/api/check/"))
+        || (method == Method::POST && (path == "/check" || path == "/verify"))
+        || (method == Method::POST
+            && path.starts_with("/v/")
+            && path.ends_with("/recheck"));
+    let is_wallet = path == "/wallet" || path == "/api/wallet";
+    let is_health = path == "/healthz";
+    let is_static_asset = path == "/static" || path.starts_with("/static/");
+    state
+        .usage_stats
+        .record_request(is_api, is_check, is_wallet, is_admin, is_health, is_static_asset);
+
+    let response = next.run(request).await;
+    if response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|value| value.as_bytes().starts_with(b"text/html"))
+    {
+        state.usage_stats.record_html_page_view();
+    }
+    state.usage_stats.record_response(response.status().as_u16());
+    response
 }
 
 async fn rate_limit(
@@ -115,8 +191,10 @@ async fn rate_limit(
         || (request.method() == Method::POST
             && path.starts_with("/v/")
             && path.ends_with("/recheck"));
-    let is_read_limited =
-        path.starts_with("/api/attest/") || path == "/.well-known/qed.json" || is_registry_api;
+    let is_read_limited = path.starts_with("/api/attest/")
+        || path == "/.well-known/qed.json"
+        || path == "/admin/stats"
+        || is_registry_api;
     if is_wallet || is_expensive || is_read_limited {
         let ip = trusted_client_ip(&request);
         if !state.rate_limiter.allow(ip) {
@@ -158,12 +236,18 @@ async fn rate_limit(
 }
 
 fn trusted_client_ip(request: &axum::extract::Request) -> IpAddr {
-    request
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.rsplit(',').find_map(|part| part.trim().parse().ok()))
-        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+    let unspecified = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+    let Some(value) = request.headers().get("x-forwarded-for") else {
+        return unspecified;
+    };
+    let Ok(value) = value.to_str() else {
+        return unspecified;
+    };
+    let rightmost = value.rsplit(',').next().map(str::trim).unwrap_or_default();
+    rightmost
+        .parse::<IpAddr>()
+        .or_else(|_| rightmost.parse::<SocketAddr>().map(|address| address.ip()))
+        .unwrap_or(unspecified)
 }
 
 async fn security_headers(request: axum::extract::Request, next: Next) -> Response {
@@ -323,4 +407,74 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+
+    #[test]
+    fn basic_auth_rejects_missing_malformed_and_wrong_values() {
+        let auth = AdminAuth::new(Some("unit-admin"), Some("unit-password"));
+        let mut headers = HeaderMap::new();
+        assert!(!valid_admin_authorization(&headers, &auth));
+
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer token"));
+        assert!(!valid_admin_authorization(&headers, &auth));
+
+        let encoded = STANDARD.encode(b"unit-admin:wrong");
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {encoded}")).expect("header value"),
+        );
+        assert!(!valid_admin_authorization(&headers, &auth));
+    }
+
+    #[test]
+    fn basic_auth_accepts_exact_pair_without_exposing_credentials() {
+        let auth = AdminAuth::new(Some("unit-admin"), Some("unit-password"));
+        let encoded = STANDARD.encode(b"unit-admin:unit-password");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {encoded}")).expect("header value"),
+        );
+        assert!(valid_admin_authorization(&headers, &auth));
+
+        let unauthorized = (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"qed-admin\""))],
+            "Unauthorized\n",
+        )
+            .into_response();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(unauthorized.headers().get(header::WWW_AUTHENTICATE).unwrap(), "Basic realm=\"qed-admin\"");
+    }
+    #[test]
+    fn trusted_client_ip_uses_only_rightmost_forwarded_ip() {
+        let request = Request::builder()
+            .header("x-forwarded-for", "198.51.100.10, 203.0.113.5")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(trusted_client_ip(&request), "203.0.113.5".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn trusted_client_ip_accepts_rightmost_socket_address() {
+        let request = Request::builder()
+            .header("x-forwarded-for", "198.51.100.10, 203.0.113.5:4567")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(trusted_client_ip(&request), "203.0.113.5".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn trusted_client_ip_does_not_fall_back_to_an_attacker_supplied_left_value() {
+        let request = Request::builder()
+            .header("x-forwarded-for", "198.51.100.10, invalid")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(trusted_client_ip(&request), IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    }
 }
