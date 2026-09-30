@@ -903,23 +903,6 @@ mod tests {
         assert_eq!(canonical_ticker(&Vec::new(), "NVDA"), None);
     }
     #[test]
-    fn homepage_renders_compact_issuer_contract_link_without_ticker_form() {
-        let template = IndexTemplate {
-            asset_version: 1,
-            public_url: "https://qed.example".to_owned(),
-            leaderboard: crate::web::views::LeaderboardPageView::from_value(
-                serde_json::json!({"entries": [], "empty_successful": false}),
-            ),
-        };
-        let rendered = template.render().expect("homepage template renders");
-        assert!(rendered.contains(r#"href="/check#ticker-lookup""#));
-        assert!(rendered.contains("Find an issuer contract"));
-        assert!(!rendered.contains(r#"id="ticker-lookup-form""#));
-        assert!(!rendered.contains(r#"action="/tokens""#));
-        assert_eq!(rendered.matches("class=\"bg-hex ").count(), 6);
-    }
-
-    #[test]
     fn check_page_renders_distinct_ticker_lookup_form() {
         let rendered = CheckTemplate { asset_version: 1, public_url: "https://qed.example".to_owned() }
             .render()

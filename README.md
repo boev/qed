@@ -126,6 +126,13 @@ Leaderboard Market links open exact external pair pages. Pool-detail pages may a
 
 QED uses plain-text `Checked on QED` links to public records rather than badges or embeds. Plain-text destinations are inspectable and reduce badge-impersonation risk. Partners and visitors should compare the exact address in the QED record with the address they were given.
 
+The home page uses restrained ambient background motion: two slow, faint
+purple and green color washes replace decorative geometry and stay static
+when reduced motion is enabled. Its headline remains “QED checks whether a
+pool uses the stock-token contract published by its issuer.” and its
+explanation remains “A ticker is not a contract. Compare the pool with the
+issuer's published stock-token contract.”
+
 
 ## Architecture
 

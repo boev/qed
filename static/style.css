@@ -13,8 +13,8 @@
   --coral: #FF5C5C;
   --unknown: #8d8d94;
   --shadow: 0 16px 48px rgba(23,23,26,.08);
-  --bg-geometry-color: color-mix(in srgb, var(--purple) 15%, transparent);
-  --bg-geometry-opacity: .92;
+  --ambient-purple: color-mix(in srgb, var(--purple) 10%, transparent);
+  --ambient-green: color-mix(in srgb, var(--green) 5%, transparent);
   font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   line-height: 1.5;
 }
@@ -39,52 +39,41 @@ html.theme-switching main,
 html.theme-switching main * {
   transition: none !important;
 }
-.background-geometry {
+.ambient-background {
   position: fixed;
   z-index: 0;
   inset: 0;
   overflow: hidden;
-  opacity: var(--bg-geometry-opacity);
   pointer-events: none;
 }
-.background-geometry svg {
+.ambient-wash {
+  position: absolute;
   display: block;
-  width: 100%;
-  height: 100%;
+  width: min(82vw, 1120px);
+  height: min(78vh, 780px);
+  border-radius: 50%;
+  background: radial-gradient(ellipse, var(--wash-color) 0%, transparent 70%);
+  will-change: transform;
 }
-.bg-hex {
-  fill: none;
-  stroke: var(--bg-geometry-color);
-  stroke-width: 1.5;
-  vector-effect: non-scaling-stroke;
-  transform-box: fill-box;
-  transform-origin: center;
-  will-change: transform, opacity;
-  animation: qed-bg-hex-float 43s ease-in-out infinite;
+.ambient-wash-purple {
+  --wash-color: var(--ambient-purple);
+  top: -24%;
+  left: -29%;
+  animation: qed-ambient-drift-a 8.5s ease-in-out infinite alternate;
 }
-.bg-hex-1 {
-  animation-duration: 37s;
-  animation-delay: -11s;
+.ambient-wash-green {
+  --wash-color: var(--ambient-green);
+  right: -32%;
+  bottom: -30%;
+  animation: qed-ambient-drift-b 9.5s ease-in-out infinite alternate;
 }
-.bg-hex-2 {
-  animation-duration: 51s;
-  animation-delay: -29s;
+@keyframes qed-ambient-drift-a {
+  from { transform: translate3d(-2vw, 1vh, 0); }
+  to { transform: translate3d(9vw, 7vh, 0); }
 }
-.bg-hex-3 {
-  animation-duration: 47s;
-  animation-delay: -21s;
-}
-.bg-hex-4 {
-  animation-duration: 59s;
-  animation-delay: -43s;
-}
-.bg-hex-5 {
-  animation-duration: 41s;
-  animation-delay: -6s;
-}
-.bg-hex-6 {
-  animation-duration: 67s;
-  animation-delay: -36s;
+@keyframes qed-ambient-drift-b {
+  from { transform: translate3d(3vw, -2vh, 0); }
+  to { transform: translate3d(-8vw, -6vh, 0); }
 }
 a {
   color: var(--purple);
@@ -447,7 +436,7 @@ tr:last-child td {
   min-height: 36px;
   align-items: center;
   gap: 8px;
-  margin: 0 auto;
+  margin: 24px auto 0;
   padding: 0 12px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -1106,9 +1095,8 @@ html[data-theme="dark"] {
   --text: #f5f5f6;
   --muted: #b1b1b8;
   --subtle: #85858d;
-  --shadow: 0 18px 50px rgba(0,0,0,.34);
-  --bg-geometry-color: color-mix(in srgb, var(--purple) 20%, transparent);
-  --bg-geometry-opacity: .95;
+  --ambient-purple: color-mix(in srgb, var(--purple) 13%, transparent);
+  --ambient-green: color-mix(in srgb, var(--green) 6%, transparent);
 }
 html[data-theme="dark"] .theme-sun {
   display: none;
@@ -1122,16 +1110,6 @@ html[data-theme="dark"] .theme-moon {
 .site-footer {
   position: relative;
   z-index: 1;
-}
-@keyframes qed-bg-hex-float {
-  0%, 100% {
-    transform: translate3d(0, 0, 0) rotate(-4deg) scale(.96);
-    opacity: .62;
-  }
-  50% {
-    transform: translate3d(3px, -7px, 0) rotate(4deg) scale(1.03);
-    opacity: 1;
-  }
 }
 .loading-seal {
   width: 20px;
@@ -1302,25 +1280,27 @@ html[data-theme="dark"] .theme-moon {
   font-weight: 750;
 }
 @media (prefers-reduced-motion: reduce) {
-  .background-geometry .bg-hex {
+  .ambient-wash {
     animation: none;
     transform: none;
     will-change: auto;
-    opacity: .78;
   }
   .pool-card-link {
     transition: none;
   }
 }
 @media (max-width: 680px) {
-  .background-geometry {
-    opacity: .74;
+  .ambient-wash {
+    width: 118vw;
+    height: 72vh;
   }
-  .background-geometry .bg-hex {
-    stroke-width: 1.25;
+  .ambient-wash-purple {
+    top: -12%;
+    left: -52%;
   }
-  .background-geometry .bg-hex:nth-child(n + 5) {
-    display: none;
+  .ambient-wash-green {
+    right: -58%;
+    bottom: -18%;
   }
 }
 .certificate-card {

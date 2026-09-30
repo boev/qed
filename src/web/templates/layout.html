@@ -25,15 +25,9 @@
   <script src="/static/leaderboard.js?v={{ asset_version }}" defer></script>
 </head>
 <body hx-boost="true" hx-push-url="true" hx-swap="innerHTML show:none" hx-history="{% block history %}true{% endblock %}">
-  <div class="background-geometry" aria-hidden="true">
-    <svg viewBox="0 0 1200 800" preserveAspectRatio="none" focusable="false">
-      <polygon class="bg-hex bg-hex-1" points="120,130 180,95 240,130 240,200 180,235 120,200"></polygon>
-      <polygon class="bg-hex bg-hex-2" points="930,120 1010,74 1090,120 1090,212 1010,258 930,212"></polygon>
-      <polygon class="bg-hex bg-hex-3" points="270,590 330,555 390,590 390,660 330,695 270,660"></polygon>
-      <polygon class="bg-hex bg-hex-4" points="795,605 865,565 935,605 935,685 865,725 795,685"></polygon>
-      <polygon class="bg-hex bg-hex-5" points="510,285 550,262 590,285 590,331 550,354 510,331"></polygon>
-      <polygon class="bg-hex bg-hex-6" points="585,660 635,631 685,660 685,718 635,747 585,718"></polygon>
-    </svg>
+  <div class="ambient-background" aria-hidden="true">
+    <span class="ambient-wash ambient-wash-purple"></span>
+    <span class="ambient-wash ambient-wash-green"></span>
   </div>
   <header class="site-header page-shell">
     <a class="site-brand" href="/" aria-label="QED home">
