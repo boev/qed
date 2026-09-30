@@ -16,10 +16,34 @@
 </section>
 <section class="directory-section" aria-labelledby="contracts-title">
   <div class="section-heading"><div><p class="eyebrow">Issuer contracts</p><h2 id="contracts-title">{{ ticker }} on every chain</h2></div></div>
-  {% if contracts.len() == 0 %}<p class="muted">No issuer contract is currently in the registry.</p>{% else %}
-  <div class="directory-table-wrap"><table class="directory-table stack-table"><thead><tr><th scope="col">Issuer</th><th scope="col">Chain</th><th scope="col">Contract</th><th scope="col">Source</th></tr></thead><tbody>
-  {% for contract in contracts %}<tr><td data-label="Issuer"><strong>{{ contract.issuer }}</strong><br><small>{{ contract.ticker }} · {{ contract.decimals }} decimals</small></td><td data-label="Chain">{{ contract.chain }}</td><td data-label="Contract"><code>{{ contract.contract }}</code><span class="directory-cell-actions" data-label="Actions"><button class="copy-button" type="button" data-copy="{{ contract.contract }}">Copy</button><a href="{{ contract.explorer_url }}" target="_blank" rel="noopener noreferrer">Explorer ↗</a></span></td><td data-label="Source"><a href="{{ contract.source_url }}" target="_blank" rel="noopener noreferrer">Registry source ↗</a></td></tr>{% endfor %}
-  </tbody></table></div>
+  {% if contracts.len() == 0 %}
+  <p class="muted">No issuer contract is currently in the registry.</p>
+  {% else %}
+  <div class="contract-directory" role="list">
+    {% for contract in contracts %}
+    <article class="contract-card" role="listitem">
+      <div class="contract-card-heading">
+        <div>
+          <p class="contract-card-label">Issuer</p>
+          <strong class="contract-issuer-name">{{ contract.issuer }}</strong>
+        </div>
+        <div class="contract-chain">
+          <svg aria-hidden="true" focusable="false"><use href="/static/icons.svg#{{ contract.chain_icon }}"></use></svg>
+          <span>{{ contract.chain }}</span>
+        </div>
+      </div>
+      <div class="contract-address">
+        <span class="contract-card-label">Contract address</span>
+        <code>{{ contract.contract }}</code>
+        <button class="copy-button" type="button" data-copy="{{ contract.contract }}" aria-label="Copy {{ contract.chain }} contract address">Copy</button>
+      </div>
+      <div class="contract-actions" aria-label="{{ contract.chain }} contract links">
+        <a class="button secondary-button" href="{{ contract.explorer_url }}" target="_blank" rel="noopener noreferrer">Explorer <span aria-hidden="true">↗</span></a>
+        <a class="button secondary-button" href="{{ contract.source_url }}" target="_blank" rel="noopener noreferrer">Issuer source <span aria-hidden="true">↗</span></a>
+      </div>
+    </article>
+    {% endfor %}
+  </div>
   {% endif %}
 </section>
 <section class="directory-section" aria-labelledby="pools-title">

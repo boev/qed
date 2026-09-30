@@ -26,5 +26,16 @@
     <p id="checking" class="checking htmx-indicator" aria-live="polite">Reading the chain…</p>
   </form>
 </section>
+<section id="ticker-lookup" class="lookup lookup-secondary" aria-labelledby="ticker-lookup-title">
+  <h2 id="ticker-lookup-title">Find an issuer contract by ticker</h2>
+  <p class="lookup-note">Search the issuer registry to compare contracts across supported chains.</p>
+  <form id="ticker-lookup-form" method="get" action="/tokens">
+    <label for="ticker">Ticker</label>
+    <div class="input-row">
+      <input id="ticker" name="ticker" type="search" inputmode="text" autocomplete="off" spellcheck="false" placeholder="NVDA" required>
+      <button class="button secondary-button" type="submit">Find contract <span aria-hidden="true">→</span></button>
+    </div>
+  </form>
+</section>
 <section id="result" class="result-region" aria-live="polite" aria-atomic="true"></section>
 {% endblock %}

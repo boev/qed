@@ -518,8 +518,8 @@ pub(crate) struct DirectoryContractView {
     pub(crate) issuer: String,
     pub(crate) ticker: String,
     pub(crate) chain: String,
+    pub(crate) chain_icon: &'static str,
     pub(crate) contract: String,
-    pub(crate) decimals: String,
     pub(crate) explorer_url: String,
     pub(crate) source_url: String,
 }
@@ -1307,7 +1307,7 @@ pub(crate) fn chain_slug(chain: Chain) -> &'static str {
     }
 }
 
-fn chain_icon(chain: Chain) -> &'static str {
+pub(crate) fn chain_icon(chain: Chain) -> &'static str {
     match chain {
         Chain::Solana => "solana",
         Chain::RobinhoodChain => "robinhood",

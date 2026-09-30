@@ -13,8 +13,8 @@
   --coral: #FF5C5C;
   --unknown: #8d8d94;
   --shadow: 0 16px 48px rgba(23,23,26,.08);
-  --bg-geometry-color: color-mix(in srgb, var(--purple) 13%, transparent);
-  --bg-geometry-opacity: .95;
+  --bg-geometry-color: color-mix(in srgb, var(--purple) 15%, transparent);
+  --bg-geometry-opacity: .92;
   font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   line-height: 1.5;
 }
@@ -39,38 +39,52 @@ html.theme-switching main,
 html.theme-switching main * {
   transition: none !important;
 }
-body::before {
+.background-geometry {
   position: fixed;
   z-index: 0;
-  inset: -8px;
-  content: "";
-  background: url("/static/bg.svg") center / cover no-repeat;
+  inset: 0;
+  overflow: hidden;
   opacity: var(--bg-geometry-opacity);
   pointer-events: none;
+}
+.background-geometry svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.bg-hex {
+  fill: none;
+  stroke: var(--bg-geometry-color);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+  transform-box: fill-box;
+  transform-origin: center;
   will-change: transform, opacity;
-  animation: qed-bg-drift 73s ease-in-out -17s infinite;
+  animation: qed-bg-hex-float 43s ease-in-out infinite;
 }
-@supports (mask-image: url("/static/bg.svg")) or (-webkit-mask-image: url("/static/bg.svg")) {
-  body::before {
-    background: var(--bg-geometry-color);
-    -webkit-mask-image: url("/static/bg.svg");
-    -webkit-mask-position: center;
-    -webkit-mask-size: cover;
-    -webkit-mask-repeat: no-repeat;
-    mask-image: url("/static/bg.svg");
-    mask-position: center;
-    mask-size: cover;
-    mask-repeat: no-repeat;
-  }
+.bg-hex-1 {
+  animation-duration: 37s;
+  animation-delay: -11s;
 }
-@supports not (mask-image: url("/static/bg.svg")) and not (-webkit-mask-image: url("/static/bg.svg")) {
-  body::before {
-    opacity: .05;
-    animation: none;
-  }
-  html[data-theme="dark"] body::before {
-    opacity: .08;
-  }
+.bg-hex-2 {
+  animation-duration: 51s;
+  animation-delay: -29s;
+}
+.bg-hex-3 {
+  animation-duration: 47s;
+  animation-delay: -21s;
+}
+.bg-hex-4 {
+  animation-duration: 59s;
+  animation-delay: -43s;
+}
+.bg-hex-5 {
+  animation-duration: 41s;
+  animation-delay: -6s;
+}
+.bg-hex-6 {
+  animation-duration: 67s;
+  animation-delay: -36s;
 }
 a {
   color: var(--purple);
@@ -428,6 +442,40 @@ tr:last-child td {
 }
 
 /* hero */
+.home-lookup-link {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 8px;
+  margin: 0 auto;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: .74rem;
+  font-weight: 800;
+  text-decoration: none;
+}
+.home-lookup-link:hover,
+.home-lookup-link:focus-visible {
+  border-color: var(--purple);
+  color: var(--purple);
+  text-decoration: none;
+}
+.lookup-secondary {
+  max-width: 680px;
+  background: var(--surface-alt);
+  box-shadow: none;
+}
+.lookup-secondary h2 {
+  margin-bottom: 6px;
+}
+.lookup-note {
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: .8rem;
+}
 
 /* check */
 .lookup {
@@ -1059,8 +1107,8 @@ html[data-theme="dark"] {
   --muted: #b1b1b8;
   --subtle: #85858d;
   --shadow: 0 18px 50px rgba(0,0,0,.34);
-  --bg-geometry-color: color-mix(in srgb, var(--purple) 18%, transparent);
-  --bg-geometry-opacity: .9;
+  --bg-geometry-color: color-mix(in srgb, var(--purple) 20%, transparent);
+  --bg-geometry-opacity: .95;
 }
 html[data-theme="dark"] .theme-sun {
   display: none;
@@ -1075,18 +1123,14 @@ html[data-theme="dark"] .theme-moon {
   position: relative;
   z-index: 1;
 }
-@keyframes qed-bg-drift {
-  0% {
-    transform: translate3d(-3px, -2px, 0);
-    opacity: calc(var(--bg-geometry-opacity, .05) * .8);
+@keyframes qed-bg-hex-float {
+  0%, 100% {
+    transform: translate3d(0, 0, 0) rotate(-4deg) scale(.96);
+    opacity: .62;
   }
   50% {
-    transform: translate3d(2px, 3px, 0);
-    opacity: calc(var(--bg-geometry-opacity, .05) * 1.1);
-  }
-  100% {
-    transform: translate3d(-1px, 1px, 0);
-    opacity: calc(var(--bg-geometry-opacity, .05) * .8);
+    transform: translate3d(3px, -7px, 0) rotate(4deg) scale(1.03);
+    opacity: 1;
   }
 }
 .loading-seal {
@@ -1258,13 +1302,25 @@ html[data-theme="dark"] .theme-moon {
   font-weight: 750;
 }
 @media (prefers-reduced-motion: reduce) {
-  body::before {
+  .background-geometry .bg-hex {
     animation: none;
     transform: none;
     will-change: auto;
+    opacity: .78;
   }
   .pool-card-link {
     transition: none;
+  }
+}
+@media (max-width: 680px) {
+  .background-geometry {
+    opacity: .74;
+  }
+  .background-geometry .bg-hex {
+    stroke-width: 1.25;
+  }
+  .background-geometry .bg-hex:nth-child(n + 5) {
+    display: none;
   }
 }
 .certificate-card {
@@ -1275,6 +1331,84 @@ html[data-theme="dark"] .theme-moon {
 }
 .directory-section {
   margin: 22px 0 34px;
+}
+.contract-directory {
+  display: grid;
+  gap: 10px;
+}
+.contract-card {
+  display: grid;
+  gap: 15px;
+  min-width: 0;
+  padding: 17px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: 0 8px 24px rgba(23, 23, 26, .05);
+}
+.contract-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.contract-card-label {
+  margin: 0 0 4px;
+  color: var(--muted);
+  font-size: .64rem;
+  font-weight: 800;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.contract-issuer-name {
+  font-size: 1rem;
+}
+.contract-chain {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text);
+  font-size: .84rem;
+  font-weight: 850;
+  text-align: right;
+}
+.contract-chain svg {
+  width: 19px;
+  height: 19px;
+  flex: 0 0 19px;
+  color: var(--purple);
+  fill: currentColor;
+  stroke: currentColor;
+}
+.contract-address {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 11px 12px;
+  border-radius: 9px;
+  background: var(--surface-alt);
+}
+.contract-address .contract-card-label {
+  margin: 0;
+  white-space: nowrap;
+}
+.contract-address code {
+  min-width: 0;
+  color: var(--text);
+  font-size: .78rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.contract-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.contract-actions .button {
+  min-height: 40px;
+  font-size: .72rem;
 }
 .directory-note,
 .guide-content p,
@@ -1359,6 +1493,29 @@ html[data-theme="dark"] .theme-moon {
   gap: 10px;
   font-size: .74rem;
   font-weight: 800;
+}
+@media (max-width: 520px) {
+  .contract-card {
+    padding: 14px;
+  }
+  .contract-card-heading {
+    display: grid;
+    gap: 10px;
+  }
+  .contract-chain {
+    justify-self: start;
+    text-align: left;
+  }
+  .contract-address {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .contract-address .contract-card-label {
+    grid-column: 1 / -1;
+  }
+  .contract-address .copy-button {
+    grid-column: 2;
+    grid-row: 2;
+  }
 }
 .glossary-list,
 .guide-content {

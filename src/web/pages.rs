@@ -438,9 +438,7 @@ pub(crate) async fn token_page(
         .filter(|entry| entry.ticker.eq_ignore_ascii_case(&canonical_ticker))
         .map(contract_view)
         .collect();
-    contracts.sort_by(|left, right| {
-        left.chain.cmp(&right.chain).then_with(|| left.issuer.cmp(&right.issuer))
-    });
+    sort_directory_contracts(&mut contracts);
     let leaderboard = state.leaderboard.read().await;
     let mut pools: Vec<_> = leaderboard
         .entries
@@ -568,13 +566,33 @@ pub(crate) async fn guide_verify_page(
     )
 }
 
+fn directory_chain_rank(chain: &str) -> u8 {
+    match super::views::parse_chain(chain) {
+        Some(Chain::Solana) => 0,
+        Some(Chain::RobinhoodChain) => 1,
+        Some(Chain::Ethereum) => 2,
+        Some(Chain::Bnb) => 3,
+        _ => 4,
+    }
+}
+
+fn sort_directory_contracts(contracts: &mut [DirectoryContractView]) {
+    contracts.sort_by(|left, right| {
+        directory_chain_rank(&left.chain)
+            .cmp(&directory_chain_rank(&right.chain))
+            .then_with(|| left.chain.cmp(&right.chain))
+            .then_with(|| left.issuer.cmp(&right.issuer))
+            .then_with(|| left.contract.cmp(&right.contract))
+    });
+}
+
 fn contract_view(entry: &Entry) -> DirectoryContractView {
     DirectoryContractView {
         issuer: entry.issuer.clone(),
         ticker: entry.ticker.clone(),
         chain: entry.chain.to_string(),
+        chain_icon: super::views::chain_icon(entry.chain),
         contract: entry.contract.clone(),
-        decimals: entry.decimals.map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
         explorer_url: super::views::explorer_link(entry.chain, &entry.contract),
         source_url: entry.source_url.clone(),
     }
@@ -884,9 +902,8 @@ mod tests {
         assert_eq!(canonical_ticker(&vec![stale], "NVDA"), None);
         assert_eq!(canonical_ticker(&Vec::new(), "NVDA"), None);
     }
-
     #[test]
-    fn homepage_renders_issuer_contract_lookup_form() {
+    fn homepage_renders_compact_issuer_contract_link_without_ticker_form() {
         let template = IndexTemplate {
             asset_version: 1,
             public_url: "https://qed.example".to_owned(),
@@ -895,9 +912,75 @@ mod tests {
             ),
         };
         let rendered = template.render().expect("homepage template renders");
-        assert!(rendered.contains(r#"action="/tokens""#));
-        assert!(rendered.contains("Find issuer contracts"));
-        assert!(rendered.contains("View issuer contracts"));
+        assert!(rendered.contains(r#"href="/check#ticker-lookup""#));
+        assert!(rendered.contains("Find an issuer contract"));
+        assert!(!rendered.contains(r#"id="ticker-lookup-form""#));
+        assert!(!rendered.contains(r#"action="/tokens""#));
+        assert_eq!(rendered.matches("class=\"bg-hex ").count(), 6);
+    }
+
+    #[test]
+    fn check_page_renders_distinct_ticker_lookup_form() {
+        let rendered = CheckTemplate { asset_version: 1, public_url: "https://qed.example".to_owned() }
+            .render()
+            .expect("check template renders");
+        assert!(rendered.contains(r#"id="ticker-lookup""#));
+        assert!(rendered.contains(r#"method="get" action="/tokens""#));
+        assert!(rendered.contains(r#"name="ticker""#));
+        assert!(rendered.contains(r#"hx-post="/check""#));
+    }
+
+    #[test]
+    fn token_directory_contracts_have_intentional_chain_order() {
+        let view = |chain: &str, issuer: &str| DirectoryContractView {
+            issuer: issuer.to_owned(),
+            ticker: "NVDA".to_owned(),
+            chain: chain.to_owned(),
+            chain_icon: "ethereum",
+            contract: format!("0x{issuer}"),
+            explorer_url: "https://explorer.example".to_owned(),
+            source_url: "https://issuer.example".to_owned(),
+        };
+        let mut contracts = vec![
+            view("Base", "base"),
+            view("BNB Chain", "bnb"),
+            view("Ethereum", "eth"),
+            view("Robinhood Chain", "rh"),
+            view("Solana", "sol"),
+        ];
+        sort_directory_contracts(&mut contracts);
+        assert_eq!(
+            contracts.iter().map(|contract| contract.chain.as_str()).collect::<Vec<_>>(),
+            ["Solana", "Robinhood Chain", "Ethereum", "BNB Chain", "Base"],
+        );
+    }
+
+    #[test]
+    fn token_directory_contract_cards_render_icons_actions_and_no_decimals() {
+        let rendered = TokenTemplate {
+            asset_version: 1,
+            public_url: "https://qed.example".to_owned(),
+            ticker: "NVDA".to_owned(),
+            title: "NVDA tokenized".to_owned(),
+            contracts: vec![DirectoryContractView {
+                issuer: "Issuer".to_owned(),
+                ticker: "NVDA".to_owned(),
+                chain: "Solana".to_owned(),
+                chain_icon: "solana",
+                contract: "So11111111111111111111111111111111111111112".to_owned(),
+                explorer_url: "https://explorer.example/token".to_owned(),
+                source_url: "https://issuer.example/nvda".to_owned(),
+            }],
+            pools: Vec::new(),
+            json_ld: "{}".to_owned(),
+        }
+        .render()
+        .expect("token template renders");
+        assert!(rendered.contains(r#"class="contract-card""#));
+        assert!(rendered.contains(r#"#solana"#));
+        assert!(rendered.contains("Explorer"));
+        assert!(rendered.contains("Issuer source"));
+        assert!(!rendered.contains("decimals"));
     }
 
     #[test]
