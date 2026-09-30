@@ -86,7 +86,7 @@ The machine-readable entry points are `/llms.txt`, `/llms-full.txt`, `/openapi.j
 | GET, POST | `/check` | Check form and result fragment. |
 | GET | `/registry`, `/registry/table` | Registry directory and table fragment. |
 | GET, POST | `/wallet` | Wallet holdings form and read-only holdings result. |
-| GET | `/tokens/{ticker}`, `/chains/{chain_name}` | Token and chain directories. |
+| GET | `/tokens?ticker={ticker}`, `/tokens/{ticker}`, `/chains/{chain_name}` | Canonical ticker lookup plus token and chain directories. |
 | GET | `/glossary`, `/guide/verify-a-stock-token` | Glossary and contract verification guide. |
 | GET | `/llms.txt`, `/llms-full.txt` | Machine-readable product and API guides. |
 | GET | `/validated`, `/validated/{chain}/{subject}` | Current contract-match directory and pool summary; records are time-bounded and should be re-checked after expiry. |
@@ -107,19 +107,19 @@ The machine-readable entry points are `/llms.txt`, `/llms-full.txt`, `/openapi.j
 | GET | `/imprint`, `/privacy`, `/terms` | Legal pages. |
 | GET | `/robots.txt`, `/sitemap.xml` | Crawler metadata. |
 
-Trade links open external venues. They are provided for navigation only; QED does not assess custody, reserves, solvency, safety, price, liquidity, or endorsement. Compare the exact pool and contract address and re-check the record before using a trade link.
+Leaderboard Market links open exact external pair pages. Pool-detail pages may also offer venue-native actions. These links are provided for navigation only; QED does not assess custody, reserves, solvency, safety, price, liquidity, execution, or endorsement. Compare the exact pool and contract address and re-check the record before interacting.
 
-### Exact trade-link patterns
+### Exact external-link patterns
 
-| Venue | Exact pool or trade URL | Source |
+| Venue | Exact market or action URL | Source |
 | --- | --- | --- |
-| Uniswap | Pool `https://app.uniswap.org/explore/pools/{pool}`; swap `https://app.uniswap.org/swap?chain={robinhood\|base\|ethereum\|bnb}&inputCurrency={base}&outputCurrency={quote}` | [Uniswap app](https://app.uniswap.org/) |
+| Uniswap | Pool `https://app.uniswap.org/explore/pools/{chain}/{pool}`; swap `https://app.uniswap.org/swap?chain={robinhood\|base\|ethereum\|bnb}&inputCurrency={base}&outputCurrency={quote}` | [Uniswap app](https://app.uniswap.org/) |
 | pump.fun | `https://pump.fun/coin/{mint}` | [pump.fun](https://pump.fun/) |
 | Raydium | `https://raydium.io/swap/?inputMint={base}&outputMint={quote}` | [Raydium](https://raydium.io/) |
 | Orca | `https://www.orca.so/pools/{pool}` | [Orca](https://www.orca.so/) |
 | Meteora DLMM | `https://app.meteora.ag/dlmm/{pool}` | [Meteora](https://app.meteora.ag/) |
 | Long.xyz | No exact pool deep link published, so QED shows no Long.xyz homepage link. | — |
-| DexScreener | `https://dexscreener.com/{chain}/{pool}` | [DexScreener](https://dexscreener.com/) |
+| DexScreener | `https://dexscreener.com/{chain}/{pool}`, using DexScreener chain IDs such as `robinhood`, `bsc`, `ethereum`, `base`, and `solana` | [DexScreener](https://dexscreener.com/) |
 | Explorer | Solana `https://solscan.io/account/{pool}`; Robinhood `https://explorer.mainnet.chain.robinhood.com/address/{pool}`; Base `https://basescan.org/address/{pool}`; Ethereum `https://etherscan.io/address/{pool}`; BNB `https://bscscan.com/address/{pool}` | Chain explorer |
 
 ## Links and presentation
