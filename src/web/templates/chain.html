@@ -25,7 +25,7 @@
 <section class="directory-section" aria-labelledby="chain-pools-title">
   <div class="section-heading"><div><p class="eyebrow">Market listings</p><h2 id="chain-pools-title">Pools on {{ chain }}</h2></div></div>
   {% if pools.len() == 0 %}<p class="muted">No current leaderboard pools are listed on this chain.</p>{% else %}
-  <div class="directory-pools">{% for pool in pools %}<article class="directory-pool {{ pool.verdict_class }}"><div><strong>{{ pool.pair }}</strong><span>{{ pool.dex }}</span></div><span class="directory-verdict">{{ pool.verdict }}</span><div class="directory-actions"><a href="{{ pool.detail_url }}">Pool page ↗</a>{% if pool.trade_url.len() > 0 %}<span class="trade-link-item"><a href="{{ pool.trade_url }}" target="_blank" rel="noopener noreferrer">Trade venue ↗</a></span>{% endif %}</div></article>{% endfor %}</div>
+  <div class="directory-pools">{% for pool in pools %}<article class="directory-pool {{ pool.verdict_class }}"><div><strong>{{ pool.pair }}</strong><span>{{ pool.dex }}</span></div><span class="directory-verdict">{{ pool.verdict }}</span><div class="directory-actions"><a href="{{ pool.detail_url }}">Pool page ↗</a>{% if pool.trade_url.len() > 0 %}<span class="trade-link-item"><a href="{{ pool.trade_url }}" target="_blank" rel="noopener noreferrer">Market page ↗</a></span>{% endif %}</div></article>{% endfor %}</div>
   <p class="contract-match-footnote">contract match only, not proof of backing or custody, price, or endorsement</p>
   {% endif %}
 </section>

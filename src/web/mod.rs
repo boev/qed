@@ -25,7 +25,7 @@ pub(crate) use discoverability::{api_docs, llms, llms_full, validated_feed};
 pub(crate) use legal::{imprint, privacy, terms};
 pub(crate) use pages::{
     certificate, chain_page, check_form, check_page, featured, glossary_page, guide_verify_page,
-    index, recheck_certificate, registry_page, registry_table, token_page, validated,
+    index, recheck_certificate, registry_page, registry_table, token_lookup, token_page, validated,
     validated_detail, wallet_holdings_page, wallet_page,
 };
 
@@ -59,6 +59,7 @@ pub fn router(state: AppState) -> Router {
         .route("/check", get(check_page).post(check_form))
         .route("/registry", get(registry_page))
         .route("/registry/table", get(registry_table))
+        .route("/tokens", get(token_lookup))
         .route("/tokens/{ticker}", get(token_page))
         .route("/chains/{chain_name}", get(chain_page))
         .route("/wallet", get(wallet_page).post(wallet_holdings_page))

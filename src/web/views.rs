@@ -263,16 +263,16 @@ impl LeaderboardRowView {
         let pool = text(value, "pool");
         let chain_icon =
             if chain == "robinhoodchain" { "robinhood".to_owned() } else { chain.clone() };
-        let trade_url = {
-            let trade_url = text(value, "trade_url");
-            if trade_url.is_empty() {
-                discovery::chain_from_dex_id(&chain)
-                    .map(|chain| discovery::dex_pair_url(chain, &pool))
-                    .unwrap_or_default()
-            } else {
-                trade_url
-            }
-        };
+        let source_url = text(value, "trade_url");
+        let trade_url = discovery::chain_from_dex_id(&chain)
+            .map(|chain| {
+                discovery::canonical_market_url(
+                    chain,
+                    &pool,
+                    (!source_url.is_empty()).then_some(source_url.as_str()),
+                )
+            })
+            .unwrap_or_default();
         let detail_url = discovery::chain_from_dex_id(&chain)
             .map(|chain| format!("/validated/{}/{}", discovery::chain_slug(chain), pool))
             .unwrap_or_default();
@@ -742,6 +742,9 @@ fn allowed_external_url(url: &str) -> bool {
             parsed.host_str(),
             Some(
                 "dexscreener.com"
+                    | "www.dexscreener.com"
+                    | "geckoterminal.com"
+                    | "www.geckoterminal.com"
                     | "app.uniswap.org"
                     | "pancakeswap.finance"
                     | "pump.fun"
@@ -760,7 +763,8 @@ fn trade_links(pool: &PoolInfo, dexscreener_url: Option<String>) -> Vec<TradeLin
     let dex = pool.dex.to_ascii_lowercase();
     let base = &pool.base.address;
     let quote = &pool.quote.address;
-    let chain = chain_slug(pool.chain);
+    let market_url =
+        discovery::canonical_market_url(pool.chain, &pool.pool, dexscreener_url.as_deref());
     let mut links = Vec::new();
     if dex.contains("uniswap") {
         let chain_slug = match pool.chain {
@@ -773,7 +777,7 @@ fn trade_links(pool: &PoolInfo, dexscreener_url: Option<String>) -> Vec<TradeLin
         if !chain_slug.is_empty() {
             links.push(TradeLink {
                 label: "Uniswap pool".to_owned(),
-                url: format!("https://app.uniswap.org/explore/pools/{}", pool.pool),
+                url: format!("https://app.uniswap.org/explore/pools/{chain_slug}/{}", pool.pool),
             });
             links.push(TradeLink {
                 label: "Uniswap swap".to_owned(),
@@ -803,12 +807,7 @@ fn trade_links(pool: &PoolInfo, dexscreener_url: Option<String>) -> Vec<TradeLin
             url: format!("https://app.meteora.ag/dlmm/{}", pool.pool),
         });
     }
-    links.push(TradeLink {
-        label: "DexScreener".to_owned(),
-        url: dexscreener_url
-            .filter(|url| allowed_external_url(url))
-            .unwrap_or_else(|| format!("https://dexscreener.com/{chain}/{}", pool.pool)),
-    });
+    links.push(TradeLink { label: "DexScreener".to_owned(), url: market_url });
     links.push(TradeLink {
         label: "Explorer".to_owned(),
         url: explorer_link(pool.chain, &pool.pool),
@@ -1104,7 +1103,7 @@ impl CertificateView {
             pool_address: subject.clone(),
             trade_links: trade_links(
                 &attestation.pool,
-                Some(format!("https://dexscreener.com/{chain}/{subject}")),
+                Some(discovery::canonical_market_url(attestation.chain, &subject, None)),
             ),
             issuer_match,
             verdict_class,
@@ -1339,10 +1338,13 @@ fn prettify_dex(dex: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LeaderboardPageView, ValidatedCardView, allowed_external_url, html_safe_json};
+    use super::{
+        LeaderboardPageView, LeaderboardRowView, ValidatedCardView, allowed_external_url,
+        html_safe_json, trade_links,
+    };
     use crate::discovery::LeaderboardEntry;
+    use crate::pool::{PoolInfo, TokenSide};
     use serde_json::json;
-
     #[test]
     fn html_safe_json_escapes_script_breakout_characters() {
         let escaped = html_safe_json(r#"{"token":"</script><meta>&"}"#);
@@ -1359,6 +1361,46 @@ mod tests {
         assert!(allowed_external_url("https://dexscreener.com/base/0x1"));
         assert!(!allowed_external_url("http://dexscreener.com/base/0x1"));
         assert!(!allowed_external_url("https://evil.example/base/0x1"));
+    }
+
+    #[test]
+    fn stale_robinhood_market_url_is_repaired_to_dexscreener_slug() {
+        let row = LeaderboardRowView::from_value(&json!({
+            "chain": "robinhoodchain",
+            "pool": "0xd4EB21209C4D6093f80B5b84f5C45cc093EA14a3",
+            "trade_url": "https://dexscreener.com/robinhoodchain/0xd4EB21209C4D6093f80B5b84f5C45cc093EA14a3",
+        }));
+        assert_eq!(
+            row.trade_url,
+            "https://dexscreener.com/robinhood/0xd4EB21209C4D6093f80B5b84f5C45cc093EA14a3"
+        );
+    }
+    #[test]
+    fn uniswap_pool_link_includes_chain_segment() {
+        let links = trade_links(
+            &PoolInfo {
+                chain: crate::chain::Chain::Ethereum,
+                pool: "0xpool".to_owned(),
+                dex: "uniswap-v4".to_owned(),
+                base: TokenSide {
+                    address: "0xbase".to_owned(),
+                    symbol: Some("NVDAx".to_owned()),
+                    decimals: Some(18),
+                    balance: None,
+                },
+                quote: TokenSide {
+                    address: "0xquote".to_owned(),
+                    symbol: Some("USDC".to_owned()),
+                    decimals: Some(6),
+                    balance: None,
+                },
+            },
+            None,
+        );
+        assert!(links.iter().any(|link| {
+            link.label == "Uniswap pool"
+                && link.url == "https://app.uniswap.org/explore/pools/ethereum/0xpool"
+        }));
     }
     #[test]
     fn empty_first_board_shows_building_state() {

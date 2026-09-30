@@ -19,7 +19,7 @@ use askama::Template;
 use axum::{
     extract::{Form, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -45,6 +45,47 @@ pub(crate) async fn index(
         },
         false,
     )
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct TokenLookupQuery {
+    pub(crate) ticker: Option<String>,
+}
+
+fn canonical_ticker(registry: &registry::Registry, query: &str) -> Option<String> {
+    let query = query.trim();
+    if query.is_empty()
+        || query.len() > 32
+        || !query.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return None;
+    }
+    registry
+        .iter()
+        .filter(|entry| registry::matchable(entry))
+        .find(|entry| entry.ticker.eq_ignore_ascii_case(query))
+        .map(|entry| entry.ticker.clone())
+        .filter(|ticker| {
+            ticker.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        })
+}
+
+fn token_redirect(
+    registry: &registry::Registry,
+    ticker: Option<&str>,
+) -> Result<Redirect, StatusCode> {
+    let Some(ticker) = ticker.and_then(|ticker| canonical_ticker(registry, ticker)) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(Redirect::to(&format!("/tokens/{ticker}")))
+}
+
+pub(crate) async fn token_lookup(
+    State(state): State<AppState>,
+    Query(query): Query<TokenLookupQuery>,
+) -> Result<Redirect, StatusCode> {
+    let registry = state.registry.read().await;
+    token_redirect(&registry, query.ticker.as_deref())
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -115,6 +156,8 @@ async fn wallet_holdings_inner(
                 })
             });
         let Some(attestation) = attestation else { continue };
+        let trade_url =
+            crate::discovery::canonical_market_url(chain, &entry.pool, Some(&entry.trade_url));
         for token in [&attestation.pool.base, &attestation.pool.quote] {
             known_pools.push(KnownWalletPool {
                 chain,
@@ -122,7 +165,7 @@ async fn wallet_holdings_inner(
                 symbol: token.symbol.clone(),
                 pool: entry.pool.clone(),
                 pool_url: entry.detail_url.clone(),
-                trade_url: entry.trade_url.clone(),
+                trade_url: trade_url.clone(),
             });
         }
     }
@@ -261,7 +304,7 @@ async fn wallet_holding_view(
         .iter()
         .filter(|pool| !pool.trade_url.is_empty())
         .map(|pool| WalletTradeLinkView {
-            label: format!("Trade {}", pool.symbol.as_deref().unwrap_or("pool")),
+            label: format!("Market {}", pool.symbol.as_deref().unwrap_or("pool")),
             url: pool.trade_url.clone(),
         })
         .collect::<Vec<_>>();
@@ -385,16 +428,8 @@ pub(crate) async fn token_page(
     _headers: HeaderMap,
 ) -> Result<Html<String>, StatusCode> {
     let ticker_query = ticker.trim();
-    if ticker_query.is_empty() || ticker_query.len() > 32 {
-        return Err(StatusCode::NOT_FOUND);
-    }
     let registry = state.registry.read().await.clone();
-    let Some(canonical_ticker) = registry
-        .iter()
-        .filter(|entry| registry::matchable(entry))
-        .find(|entry| entry.ticker.eq_ignore_ascii_case(ticker_query))
-        .map(|entry| entry.ticker.clone())
-    else {
+    let Some(canonical_ticker) = canonical_ticker(&registry, ticker_query) else {
         return Err(StatusCode::NOT_FOUND);
     };
     let mut contracts: Vec<_> = registry
@@ -553,6 +588,11 @@ fn pool_view(entry: &crate::discovery::LeaderboardEntry) -> DirectoryPoolView {
         "nomatch" => ("No match".to_owned(), "is-mismatch".to_owned()),
         _ => ("Unknown".to_owned(), "is-unknown".to_owned()),
     };
+    let trade_url = super::views::parse_chain(&entry.chain)
+        .map(|chain| {
+            crate::discovery::canonical_market_url(chain, &entry.pool, Some(&entry.trade_url))
+        })
+        .unwrap_or_default();
     DirectoryPoolView {
         chain: entry.chain_label.clone(),
         dex: entry.dex.clone(),
@@ -560,7 +600,7 @@ fn pool_view(entry: &crate::discovery::LeaderboardEntry) -> DirectoryPoolView {
         verdict,
         verdict_class,
         detail_url: entry.detail_url.clone(),
-        trade_url: entry.trade_url.clone(),
+        trade_url,
     }
 }
 
@@ -792,7 +832,7 @@ mod tests {
                     chain: "Ethereum".to_owned(),
                     pool_url: Some("/validated/ethereum/pool".to_owned()),
                     trade_links: vec![WalletTradeLinkView {
-                        label: "Trade pool".to_owned(),
+                        label: "Market pool".to_owned(),
                         url: "https://dex.example/pool".to_owned(),
                     }],
                     reason: None,
@@ -815,6 +855,51 @@ mod tests {
         assert!(rendered.contains("Unknown"));
         assert!(rendered.contains("https://dex.example/pool"));
     }
+    #[test]
+    fn ticker_lookup_returns_canonical_active_issuer_ticker() {
+        let entry = registry::Entry {
+            issuer: "Backed".to_owned(),
+            ticker: "NVDA".to_owned(),
+            name: "Backed NVIDIA".to_owned(),
+            chain: Chain::Ethereum,
+            contract: "0xc845b2894dBddd03858fd2D643B4eF725fE0849d".to_owned(),
+            decimals: Some(18),
+            source: "xstocks".to_owned(),
+            source_url: "https://issuer.example/nvda".to_owned(),
+            last_checked: "2026-01-01T00:00:00Z".to_owned(),
+            removed_at: None,
+            stale_since: None,
+        };
+        assert_eq!(canonical_ticker(&vec![entry.clone()], " nvda "), Some("NVDA".to_owned()));
+        let response = token_redirect(&vec![entry.clone()], Some(" nvda ")).unwrap().into_response();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get("location").unwrap(), "/tokens/NVDA");
+        assert!(matches!(
+            token_redirect(&vec![entry.clone()], Some("unknown")),
+            Err(StatusCode::NOT_FOUND)
+        ));
+
+        let mut stale = entry;
+        stale.stale_since = Some("2026-01-02T00:00:00Z".to_owned());
+        assert_eq!(canonical_ticker(&vec![stale], "NVDA"), None);
+        assert_eq!(canonical_ticker(&Vec::new(), "NVDA"), None);
+    }
+
+    #[test]
+    fn homepage_renders_issuer_contract_lookup_form() {
+        let template = IndexTemplate {
+            asset_version: 1,
+            public_url: "https://qed.example".to_owned(),
+            leaderboard: crate::web::views::LeaderboardPageView::from_value(
+                serde_json::json!({"entries": [], "empty_successful": false}),
+            ),
+        };
+        let rendered = template.render().expect("homepage template renders");
+        assert!(rendered.contains(r#"action="/tokens""#));
+        assert!(rendered.contains("Find issuer contracts"));
+        assert!(rendered.contains("View issuer contracts"));
+    }
+
     #[test]
     fn recheck_live_query_accepts_boolean_and_numeric_values() {
         for value in ["true", "TRUE", "1"] {

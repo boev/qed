@@ -361,7 +361,7 @@ pub struct LeaderboardEntry {
     pub liquidity_usd: Option<f64>,
     pub txns_24h: Option<u64>,
     pub detail_url: String,
-    /// DexScreener's canonical pair URL.
+    /// Canonical external market page for this exact pair.
     pub trade_url: String,
     #[serde(default)]
     pub explorer_url: String,
@@ -961,14 +961,21 @@ pub fn explorer_url(chain: Chain, pool: &str) -> String {
 }
 
 pub fn dex_pair_url(chain: Chain, pool: &str) -> String {
-    format!("https://dexscreener.com/{}/{}", chain_slug(chain), pool)
+    let chain_id = dex_chain_id(chain).unwrap_or_default();
+    format!("https://dexscreener.com/{chain_id}/{pool}")
 }
 
-pub fn load_curated(path: impl AsRef<Path>) -> Result<Vec<CuratedPool>, DiscoveryError> {
-    let bytes = std::fs::read(path)?;
-    Ok(serde_json::from_slice(&bytes)?)
+fn gecko_network_id(chain: Chain) -> Option<&'static str> {
+    match chain {
+        Chain::Solana => Some("solana"),
+        Chain::RobinhoodChain => Some("robinhood"),
+        Chain::Base => Some("base"),
+        Chain::Ethereum => Some("eth"),
+        Chain::Bnb => Some("bsc"),
+    }
 }
-fn valid_chain_address(chain: Chain, address: &str) -> bool {
+
+fn valid_token_address(chain: Chain, address: &str) -> bool {
     match chain {
         Chain::Solana => bs58::decode(address).into_vec().is_ok_and(|bytes| bytes.len() == 32),
         Chain::RobinhoodChain | Chain::Base | Chain::Ethereum | Chain::Bnb => {
@@ -977,13 +984,82 @@ fn valid_chain_address(chain: Chain, address: &str) -> bool {
     }
 }
 
+fn valid_pair_address(chain: Chain, pair: &DexPair) -> bool {
+    valid_token_address(chain, &pair.pair_address)
+        || (chain != Chain::Solana
+            && pair.dex_id.eq_ignore_ascii_case("uniswap")
+            && Chain::is_v4_pool_id(&pair.pair_address)
+            && pair.labels.iter().any(|label| label.trim().eq_ignore_ascii_case("v4")))
+}
+fn same_pool_path(chain: Chain, path: &str, pool: &str) -> bool {
+    if chain == Chain::Solana { path == pool } else { path.eq_ignore_ascii_case(pool) }
+}
+
+fn trusted_market_url(url: &str, chain: Chain, pool: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else { return false };
+    let authority = url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split('/').next())
+        .unwrap_or_default();
+    let authority_host_port = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let has_explicit_userinfo = authority.contains('@');
+    let has_explicit_port = authority_host_port.contains(':');
+    if parsed.scheme() != "https"
+        || has_explicit_port
+        || has_explicit_userinfo
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else { return false };
+    let segments = parsed.path_segments().map(|segments| segments.collect::<Vec<_>>());
+    match host {
+        "dexscreener.com" | "www.dexscreener.com" => {
+            let Some(segments) = segments else { return false };
+            segments.len() == 2
+                && segments[0].eq_ignore_ascii_case(dex_chain_id(chain).unwrap_or_default())
+                && same_pool_path(chain, segments[1], pool)
+        }
+        "geckoterminal.com" | "www.geckoterminal.com" => {
+            let Some(network) = gecko_network_id(chain) else { return false };
+            let Some(segments) = segments else { return false };
+            segments.len() == 3
+                && segments[0].eq_ignore_ascii_case(network)
+                && segments[1].eq_ignore_ascii_case("pools")
+                && same_pool_path(chain, segments[2], pool)
+        }
+        _ => false,
+    }
+}
+
+/// Return a source URL only when it is an exact, HTTPS market page for the
+/// supplied chain and pool. Old or malformed persisted URLs fall back to the
+/// canonical DexScreener pair page.
+pub fn canonical_market_url(
+    chain: Chain,
+    pool: &str,
+    source_url: Option<&str>,
+) -> String {
+    source_url
+        .filter(|url| trusted_market_url(url, chain, pool))
+        .map(str::to_owned)
+        .unwrap_or_else(|| dex_pair_url(chain, pool))
+}
+
+pub fn load_curated(path: impl AsRef<Path>) -> Result<Vec<CuratedPool>, DiscoveryError> {
+    let bytes = std::fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
 fn candidate_from_pair(pair: &DexPair, registry: &Registry) -> Option<DiscoveryCandidate> {
     let chain = chain_from_dex_id(&pair.chain_id)?;
     let base_address = pair.base_token.address.clone()?;
     let quote_address = pair.quote_token.address.clone()?;
-    if !valid_chain_address(chain, &pair.pair_address)
-        || !valid_chain_address(chain, &base_address)
-        || !valid_chain_address(chain, &quote_address)
+    if !valid_pair_address(chain, pair)
+        || !valid_token_address(chain, &base_address)
+        || !valid_token_address(chain, &quote_address)
     {
         return None;
     }
@@ -1028,15 +1104,16 @@ fn leaderboard_candidate_from_pair(
     let chain = chain_from_dex_id(&pair.chain_id)?;
     let base_address = pair.base_token.address.as_deref()?;
     let quote_address = pair.quote_token.address.as_deref()?;
-    if !valid_chain_address(chain, &pair.pair_address)
-        || !valid_chain_address(chain, base_address)
-        || !valid_chain_address(chain, quote_address)
+    if !valid_pair_address(chain, pair)
+        || !valid_token_address(chain, base_address)
+        || !valid_token_address(chain, quote_address)
     {
         return None;
     }
     let matched = registry::lookup(registry, chain, quote_address)
         .or_else(|| registry::lookup(registry, chain, base_address))?;
-    let trade_url = dex_pair_url(chain, &pair.pair_address);
+    let trade_url =
+        canonical_market_url(chain, &pair.pair_address, pair.url.as_deref());
     let txns_24h = pair
         .txns
         .as_ref()
@@ -2109,7 +2186,8 @@ mod tests {
     }
 
     fn fixture_address(name: &str) -> String {
-        let seed = name.bytes().fold(0u8, |sum, byte| sum.wrapping_add(byte.to_ascii_lowercase()));
+        let seed =
+            name.bytes().fold(0u8, |sum, byte| sum.wrapping_add(byte.to_ascii_lowercase()));
         bs58::encode([seed; 32]).into_string()
     }
 
@@ -2141,6 +2219,118 @@ mod tests {
             }),
             liquidity: Some(DexLiquidity { usd: Some(500.0), base: None, quote: None }),
         }
+    }
+
+    #[test]
+    fn leaderboard_fixture_uses_exact_source_market_url() {
+        let pairs: Vec<DexPair> = serde_json::from_str(include_str!(
+            "../tests/fixtures/discovery/token-pairs-robinhood-nvda.json"
+        ))
+        .expect("fixture parses");
+        let registry = vec![entry(
+            Chain::RobinhoodChain,
+            "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+            "NVDA",
+        )];
+        let candidate = leaderboard_candidates_from_pairs(&registry, pairs)
+            .into_iter()
+            .next()
+            .expect("fixture has a stock pair");
+        assert_eq!(
+            candidate.trade_url,
+            "https://dexscreener.com/robinhood/0xd4eb21209c4d6093f80b5b84f5c45cc093ea14a3"
+        );
+        assert!(!candidate.trade_url.contains("robinhoodchain"));
+    }
+
+    #[test]
+    fn market_url_fallback_maps_supported_dex_chain_ids() {
+        let pool = "0xd4EB21209C4D6093f80B5b84f5C45cc093EA14a3";
+        assert_eq!(
+            dex_pair_url(Chain::RobinhoodChain, pool),
+            format!("https://dexscreener.com/robinhood/{pool}")
+        );
+        assert_eq!(
+            dex_pair_url(Chain::Bnb, pool),
+            format!("https://dexscreener.com/bsc/{pool}")
+        );
+        assert_eq!(
+            canonical_market_url(
+                Chain::RobinhoodChain,
+                pool,
+                Some("https://dexscreener.com/robinhoodchain/0xdead")
+            ),
+            format!("https://dexscreener.com/robinhood/{pool}")
+        );
+        assert_eq!(
+            canonical_market_url(
+                Chain::RobinhoodChain,
+                pool,
+                Some("https://evil.example/robinhood/0xdead")
+            ),
+            format!("https://dexscreener.com/robinhood/{pool}")
+        );
+        assert_eq!(
+            canonical_market_url(
+                Chain::RobinhoodChain,
+                pool,
+                Some("https://dexscreener.com/robinhood/0xd4eb21209c4d6093f80b5b84f5c45cc093ea14a3")
+            ),
+            "https://dexscreener.com/robinhood/0xd4eb21209c4d6093f80b5b84f5c45cc093ea14a3"
+        );
+        let fallback = format!("https://dexscreener.com/robinhood/{pool}");
+        for source_url in [
+            format!("https://dexscreener.com:443/robinhood/{pool}"),
+            format!("https://user@dexscreener.com/robinhood/{pool}"),
+            format!("https://dexscreener.com.evil.test/robinhood/{pool}"),
+            format!("https://dexscreener.com/%72obinhood/{pool}"),
+        ] {
+            assert_eq!(
+                canonical_market_url(Chain::RobinhoodChain, pool, Some(&source_url)),
+                fallback
+            );
+        }
+        let solana_pool = "AbcDEf123";
+        assert_eq!(
+            canonical_market_url(
+                Chain::Solana,
+                solana_pool,
+                Some("https://dexscreener.com/solana/abcdef123")
+            ),
+            format!("https://dexscreener.com/solana/{solana_pool}")
+        );
+    }
+
+    #[test]
+    fn ethereum_v4_pool_id_is_kept_when_registry_token_matches() {
+        let mut pair = leaderboard_pair("v4-pool", Chain::Ethereum, Some(2_000.0));
+        pair.chain_id = "ethereum".to_owned();
+        pair.dex_id = "uniswap".to_owned();
+        pair.pair_address = format!("0x{}", "ab".repeat(32));
+        pair.labels = vec!["v4".to_owned()];
+        pair.base_token.address = Some(format!("0x{}", "01".repeat(20)));
+        pair.quote_token.address =
+            Some("0xc845b2894dBddd03858fd2D643B4eF725fE0849d".to_owned());
+        let registry = vec![entry(
+            Chain::Ethereum,
+            "0xc845b2894dBddd03858fd2D643B4eF725fE0849d",
+            "NVDA",
+        )];
+        let mut no_label = pair.clone();
+        no_label.labels.clear();
+        assert!(leaderboard_candidates_from_pairs(&registry, [no_label]).is_empty());
+        let mut wrong_dex = pair.clone();
+        wrong_dex.dex_id = "other-dex".to_owned();
+        assert!(leaderboard_candidates_from_pairs(&registry, [wrong_dex]).is_empty());
+        let candidate = leaderboard_candidates_from_pairs(&registry, [pair])
+            .pop()
+            .expect("official Ethereum NVDA v4 pair is retained");
+        assert_eq!(candidate.chain, Chain::Ethereum);
+        assert_eq!(candidate.ticker.as_deref(), Some("NVDA"));
+        assert_eq!(
+            candidate.trade_url,
+            format!("https://dexscreener.com/ethereum/0x{}", "ab".repeat(32))
+        );
     }
 
     fn leaderboard_candidate(

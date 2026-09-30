@@ -127,6 +127,13 @@ pub(crate) async fn api_leaderboard(
     let prices_updated_at = state.prices.read().await.updated_at.clone();
     let total = board.total.max(board.entries.len());
     let mut entries = board.entries;
+    for entry in &mut entries {
+        entry.trade_url = discovery::chain_from_dex_id(&entry.chain)
+            .map(|chain| {
+                discovery::canonical_market_url(chain, &entry.pool, Some(&entry.trade_url))
+            })
+            .unwrap_or_default();
+    }
     sort_entries(&mut entries, sort, descending);
     let entries = page_entries(entries, page, per);
     Json(serde_json::json!({

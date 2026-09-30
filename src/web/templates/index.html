@@ -21,6 +21,16 @@
     <h1 id="home-title">QED checks whether a pool uses the stock-token contract published by its issuer.</h1>
   </div>
 </section>
+<section class="lookup home-ticker-lookup" aria-labelledby="ticker-lookup-title">
+  <h2 id="ticker-lookup-title">Find issuer contracts</h2>
+  <form id="ticker-lookup-form" method="get" action="/tokens">
+    <label for="ticker-lookup">Ticker</label>
+    <div class="input-row">
+      <input id="ticker-lookup" name="ticker" type="search" placeholder="NVDA" autocomplete="off" spellcheck="false" required>
+      <button class="button primary-button" type="submit">View issuer contracts <span aria-hidden="true">→</span></button>
+    </div>
+  </form>
+</section>
 <section class="leaderboard-section" aria-labelledby="leaderboard-title">
   <div class="section-heading">
     <div>
@@ -45,7 +55,7 @@
             <th scope="col">24h change</th>
             <th scope="col">24h volume</th>
             <th scope="col">Liquidity</th>
-            <th scope="col" class="trade-heading"><span class="visually-hidden">Trade</span></th>
+            <th scope="col" class="trade-heading"><span class="visually-hidden">Market</span></th>
           </tr>
         </thead>
         <tbody>
@@ -64,7 +74,7 @@
             <td class="number-cell change-cell {{ row.change_class }}" data-label="24h change">{{ row.change }}</td>
             <td class="number-cell" data-label="24h volume">{{ row.volume }}</td>
             <td class="number-cell" data-label="Liquidity">{{ row.liquidity }}</td>
-            <td class="trade-cell" data-label="Trade"><a href="{{ row.trade_url }}"{% if row.verdict == "verified" %} title="contract match only, not proof of backing or custody, reserves, price, safety or endorsement"{% endif %} target="_blank" rel="noopener noreferrer">Trade<span aria-hidden="true"> ↗</span></a><small class="trade-limit">External venue; QED checks contract match only.</small></td>
+            <td class="trade-cell" data-label="Market"><a href="{{ row.trade_url }}"{% if row.verdict == "verified" %} title="contract match only, not proof of backing or custody, reserves, price, safety or endorsement"{% endif %} target="_blank" rel="noopener noreferrer">Market<span aria-hidden="true"> ↗</span></a><small class="trade-limit">External market page; QED checks contract match only.</small></td>
           </tr>
         {% endfor %}
         {% if leaderboard.show_empty %}
@@ -73,7 +83,7 @@
         </tbody>
       </table>
     </div>
-    <p class="contract-match-footnote">QED checks whether a pool uses the stock-token contract published by its issuer. It does not prove backing or custody, solvency, price, safety, or endorsement. Trade links open external venues. Rows and records can expire or change when registry data updates; re-check before relying on them.</p>
+    <p class="contract-match-footnote">QED checks whether a pool uses the stock-token contract published by its issuer. It does not prove backing or custody, solvency, price, safety, or endorsement. Market links open exact external pair pages. Rows and records can expire or change when registry data updates; re-check before relying on them.</p>
     <p class="leaderboard-status" title="{{ leaderboard.status_tooltip }}" aria-live="polite">{{ leaderboard.status_line }}</p>
   </div>
 </section>

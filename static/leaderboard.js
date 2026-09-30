@@ -296,7 +296,7 @@
               h('th', { scope: 'col' }, [sortButton('volume', '24h volume')]),
               h('th', { scope: 'col' }, [sortButton('liquidity', 'Liquidity')]),
               h('th', { scope: 'col', class: 'trade-heading' }, [
-                h('span', { class: 'visually-hidden' }, 'Trade'),
+                h('span', { class: 'visually-hidden' }, 'Market'),
               ]),
             ]),
           ]);
@@ -368,7 +368,7 @@
               }, [h('span', { class: 'metric-value' }, changeLabel)]),
               metricCell(row, 'volume_24h_usd', '24h volume', row.volume_24h_usd, '$'),
               metricCell(row, 'liquidity_usd', 'Liquidity', row.liquidity_usd, '$'),
-              h('td', { class: 'trade-cell', 'data-label': 'Trade' }, tradeUrl ? [
+              h('td', { class: 'trade-cell', 'data-label': 'Market' }, tradeUrl ? [
                 h('a', {
                   href: tradeUrl,
                   title: row.verdict === 'verified'
@@ -377,7 +377,7 @@
                   target: '_blank',
                   rel: 'noopener noreferrer',
                   onClick: (event) => event.stopPropagation(),
-                }, ['Trade', h('span', { 'aria-hidden': 'true' }, ' ↗')]),
+                }, ['Market', h('span', { 'aria-hidden': 'true' }, ' ↗')]),
               ] : '—'),
             ]);
           });

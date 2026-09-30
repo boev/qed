@@ -26,7 +26,7 @@
   <div class="section-heading"><div><p class="eyebrow">Current listings</p><h2 id="pools-title">Pools QED can see now</h2></div></div>
   <p class="directory-note">A stock-paired pool is only listed here when a venue reports the ticker. Its verdict says whether the observed quote contract matches the issuer registry.</p>
   {% if pools.len() == 0 %}<p class="muted">No current leaderboard pool is tagged {{ ticker }}.</p>{% else %}
-  <div class="directory-pools">{% for pool in pools %}<article class="directory-pool {{ pool.verdict_class }}"><div><strong>{{ pool.pair }}</strong><span>{{ pool.chain }} · {{ pool.dex }}</span></div><span class="directory-verdict">{{ pool.verdict }}</span><div class="directory-actions"><a href="{{ pool.detail_url }}">Pool page ↗</a>{% if pool.trade_url.len() > 0 %}<span class="trade-link-item"><a href="{{ pool.trade_url }}" target="_blank" rel="noopener noreferrer">Trade ↗</a></span>{% endif %}</div></article>{% endfor %}</div>
+  <div class="directory-pools">{% for pool in pools %}<article class="directory-pool {{ pool.verdict_class }}"><div><strong>{{ pool.pair }}</strong><span>{{ pool.chain }} · {{ pool.dex }}</span></div><span class="directory-verdict">{{ pool.verdict }}</span><div class="directory-actions"><a href="{{ pool.detail_url }}">Pool page ↗</a>{% if pool.trade_url.len() > 0 %}<span class="trade-link-item"><a href="{{ pool.trade_url }}" target="_blank" rel="noopener noreferrer">Market page ↗</a></span>{% endif %}</div></article>{% endfor %}</div>
   <p class="contract-match-footnote">contract match only, not proof of backing or custody, price, or endorsement</p>
   {% endif %}
 </section>
