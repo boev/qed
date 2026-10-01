@@ -32,7 +32,10 @@
   <form id="ticker-lookup-form" method="get" action="/tokens">
     <label for="ticker">Ticker</label>
     <div class="input-row">
-      <input id="ticker" name="ticker" type="search" inputmode="text" autocomplete="off" spellcheck="false" placeholder="NVDA" required>
+      <div class="ticker-combobox">
+        <input id="ticker" name="ticker" type="search" inputmode="text" autocomplete="off" spellcheck="false" placeholder="NVDA" role="combobox" aria-autocomplete="list" aria-controls="ticker-suggestions" aria-expanded="false" required>
+        <div id="ticker-suggestions" class="ticker-suggestions" role="listbox" aria-label="Ticker suggestions" hidden></div>
+      </div>
       <button class="button secondary-button" type="submit">Find contract <span aria-hidden="true">→</span></button>
     </div>
   </form>

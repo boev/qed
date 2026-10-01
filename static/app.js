@@ -62,6 +62,86 @@
   };
   window.__qedFormatRelative = formatRelative;
   window.__qedFormatTimes = formatTimes;
+  let registryTickers = null;
+  let registryTickersPromise = null;
+  const isLookupTicker = (ticker) => typeof ticker === 'string'
+    && ticker.length > 0
+    && ticker.length <= 32
+    && /^[A-Za-z0-9._-]+$/.test(ticker);
+  const closeTickerSuggestions = (input) => {
+    const list = document.getElementById('ticker-suggestions');
+    if (!list) return;
+    list.hidden = true;
+    list.replaceChildren();
+    input.setAttribute('aria-expanded', 'false');
+    input.removeAttribute('aria-activedescendant');
+  };
+  const updateTickerSuggestions = (input) => {
+    const list = document.getElementById('ticker-suggestions');
+    if (!list || registryTickers === null) return;
+    if (document.activeElement !== input) {
+      closeTickerSuggestions(input);
+      return;
+    }
+    const query = input.value.trim().toLowerCase();
+    const matches = query
+      ? registryTickers.filter((ticker) => ticker.toLowerCase().startsWith(query)).slice(0, 8)
+      : [];
+    list.replaceChildren(...matches.map((ticker, index) => {
+      const option = document.createElement('div');
+      option.id = `ticker-suggestion-${index}`;
+      option.className = 'ticker-suggestion';
+      option.setAttribute('role', 'option');
+      option.setAttribute('aria-selected', 'false');
+      option.dataset.ticker = ticker;
+      option.textContent = ticker;
+      return option;
+    }));
+    list.hidden = matches.length === 0;
+    input.setAttribute('aria-expanded', String(matches.length > 0));
+    input.removeAttribute('aria-activedescendant');
+  };
+  const selectTickerSuggestion = (input, ticker) => {
+    input.value = ticker;
+    closeTickerSuggestions(input);
+    input.focus();
+  };
+  const loadTickerSuggestions = () => {
+    if (!registryTickersPromise) {
+      registryTickersPromise = fetch('/api/registry', { headers: { Accept: 'application/json' } })
+        .then((response) => {
+          if (!response.ok) throw new Error('Registry suggestions unavailable');
+          return response.json();
+        })
+        .then((entries) => {
+          if (!Array.isArray(entries)) throw new Error('Registry suggestions unavailable');
+          const seen = new Set();
+          registryTickers = [];
+          entries.forEach((entry) => {
+            if (!entry || entry.removed_at != null || entry.stale_since != null) return;
+            const ticker = entry.ticker;
+            if (!isLookupTicker(ticker)) return;
+            const key = ticker.toLowerCase();
+            if (seen.has(key)) return;
+            seen.add(key);
+            registryTickers.push(ticker);
+          });
+        })
+        .catch(() => {
+          registryTickers = [];
+        });
+    }
+    return registryTickersPromise.then(() => {
+      const input = document.getElementById('ticker');
+      if (input) updateTickerSuggestions(input);
+    });
+  };
+  const initTickerLookup = () => {
+    if (registryTickers !== null) {
+      const input = document.getElementById('ticker');
+      if (input) updateTickerSuggestions(input);
+    }
+  };
 
   const copyText = (value) => {
     if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(value);
@@ -78,6 +158,15 @@
 
   const handleClick = (event) => {
     if (!(event.target instanceof Element)) return;
+    const suggestion = event.target.closest('.ticker-suggestion');
+    if (suggestion) {
+      event.preventDefault();
+      const input = document.getElementById('ticker');
+      if (input) selectTickerSuggestion(input, suggestion.dataset.ticker);
+      return;
+    }
+    const tickerInput = document.getElementById('ticker');
+    if (tickerInput && !event.target.closest('.ticker-combobox')) closeTickerSuggestions(tickerInput);
     const row = event.target.closest('.leaderboard-row[data-detail-url]');
     if (row && !event.target.closest('a')) {
       window.location.href = row.dataset.detailUrl;
@@ -119,6 +208,34 @@
   };
 
   const handleKeydown = (event) => {
+    const input = event.target instanceof HTMLInputElement && event.target.id === 'ticker'
+      ? event.target : null;
+    if (input) {
+      const list = document.getElementById('ticker-suggestions');
+      const options = list ? Array.from(list.querySelectorAll('[role="option"]')) : [];
+      const activeIndex = options.findIndex((option) => option.getAttribute('aria-selected') === 'true');
+      if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && options.length > 0) {
+        event.preventDefault();
+        const direction = event.key === 'ArrowDown' ? 1 : -1;
+        const nextIndex = activeIndex < 0
+          ? (direction > 0 ? 0 : options.length - 1)
+          : (activeIndex + direction + options.length) % options.length;
+        options.forEach((option, index) => option.setAttribute('aria-selected', String(index === nextIndex)));
+        input.setAttribute('aria-activedescendant', options[nextIndex].id);
+        options[nextIndex].scrollIntoView({ block: 'nearest' });
+        return;
+      }
+      if (event.key === 'Escape' && list && !list.hidden) {
+        event.preventDefault();
+        closeTickerSuggestions(input);
+        return;
+      }
+      if (event.key === 'Enter' && activeIndex >= 0) {
+        event.preventDefault();
+        selectTickerSuggestion(input, options[activeIndex].dataset.ticker);
+        return;
+      }
+    }
     if (event.key !== 'Enter' && event.key !== ' ') return;
     const row = event.target.closest?.('.leaderboard-row[data-detail-url]');
     if (!row || event.target.closest('a')) return;
@@ -131,6 +248,7 @@
     if (saved === 'dark' || saved === 'light') document.documentElement.dataset.theme = saved;
     setActiveNav();
     formatTimes();
+    initTickerLookup();
     const params = new URLSearchParams(window.location.search);
     if (params.get('hero') === 'open') document.documentElement.classList.add('hero-open');
     if (params.get('nerd') === '1') {
@@ -145,15 +263,39 @@
 
   document.addEventListener('click', handleClick);
   document.addEventListener('keydown', handleKeydown);
+  document.addEventListener('focusin', (event) => {
+    if (event.target instanceof HTMLInputElement && event.target.id === 'ticker') {
+      void loadTickerSuggestions();
+    }
+  });
+  document.addEventListener('input', (event) => {
+    if (event.target instanceof HTMLInputElement && event.target.id === 'ticker') {
+      void loadTickerSuggestions();
+    }
+  });
+  document.addEventListener('pointerdown', (event) => {
+    if (event.target instanceof Element && event.target.closest('.ticker-suggestion')) {
+      event.preventDefault();
+    }
+  });
+  document.addEventListener('focusout', (event) => {
+    if (event.target instanceof HTMLInputElement && event.target.id === 'ticker') {
+      window.setTimeout(() => {
+        if (!event.target.matches(':focus')) closeTickerSuggestions(event.target);
+      }, 0);
+    }
+  });
   document.addEventListener('DOMContentLoaded', boot, { once: true });
   document.addEventListener('htmx:afterSettle', () => {
     setActiveNav();
     formatTimes();
+    initTickerLookup();
     window.__qedLeaderboardBoot?.();
   });
   document.addEventListener('htmx:historyRestore', () => {
     setActiveNav();
     formatTimes();
+    initTickerLookup();
   });
   boot();
 })();

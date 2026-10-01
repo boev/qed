@@ -29,7 +29,6 @@ body {
   position: relative;
   isolation: isolate;
   margin: 0;
-  min-width: 320px;
   background: var(--bg);
   color: var(--text);
   caret-color: transparent;
@@ -411,20 +410,25 @@ tr:last-child td {
 .site-footer a:focus-visible {
   color: var(--purple);
 }
-.site-footer .repository-link {
+.repository-link {
   display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  flex: 0 0 44px;
   width: 44px;
   height: 44px;
+  align-items: center;
+  justify-content: center;
   color: var(--subtle);
 }
-.site-footer .repository-link svg {
-  width: 16px;
-  height: 16px;
+.repository-link svg {
+  width: 18px;
+  height: 18px;
   fill: currentColor;
 }
-.site-footer .repository-link:focus-visible {
+.repository-link:hover,
+.repository-link:focus-visible {
+  color: var(--purple);
+}
+.repository-link:focus-visible {
   outline: 2px solid var(--purple);
   outline-offset: 3px;
   border-radius: 4px;
@@ -486,6 +490,11 @@ label {
   display: flex;
   gap: 8px;
 }
+#lookup-form .input-row > .button,
+#ticker-lookup-form .input-row > .button {
+  flex: 0 0 144px;
+  white-space: nowrap;
+}
 input {
   min-width: 0;
   flex: 1;
@@ -504,6 +513,38 @@ input::placeholder {
 input:focus {
   border-color: var(--purple);
   outline: 3px solid color-mix(in srgb,var(--purple) 24%,transparent);
+}
+#ticker-lookup-form .ticker-combobox {
+  position: relative;
+  min-width: 0;
+  flex: 1;
+}
+#ticker-lookup-form .ticker-combobox > input {
+  width: 100%;
+}
+.ticker-suggestions {
+  position: absolute;
+  z-index: 2;
+  top: calc(100% + 4px);
+  right: 0;
+  left: 0;
+  max-height: 240px;
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+.ticker-suggestion {
+  padding: 7px 9px;
+  border-radius: 5px;
+  color: var(--text);
+  cursor: pointer;
+}
+.ticker-suggestion:hover,
+.ticker-suggestion[aria-selected="true"] {
+  background: var(--surface-alt);
 }
 .checking, .muted {
   margin: 8px 0 0;
@@ -1150,6 +1191,10 @@ html[data-theme="dark"] .theme-moon {
   .page-shell {
     width: min(100% - 24px, 1100px);
   }
+  .site-header {
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 8px;
+  }
   .header-actions {
     grid-column: 2;
     grid-row: 1;
@@ -1173,6 +1218,15 @@ html[data-theme="dark"] .theme-moon {
   .theme-toggle {
     grid-column: 2;
     grid-row: 1;
+  }
+  #lookup-form .input-row,
+  #ticker-lookup-form .input-row {
+    display: grid;
+  }
+  #lookup-form .input-row > .button,
+  #ticker-lookup-form .input-row > .button {
+    width: 100%;
+    flex: initial;
   }
   .page-content {
     padding-top: 16px;

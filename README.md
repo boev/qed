@@ -2,7 +2,7 @@
 
 QED is a read-only contract-to-issuer-registry checker and directory for stock-paired pools. It checks whether a pool uses the stock-token contract published by its issuer. It does not prove backing or custody, and it does not verify reserves, solvency, safety, price, liquidity, or endorsement.
 
-Source repository: [github.com/boev/qed](https://github.com/boev/qed).
+Source repository: [github.com/boev/qed](https://github.com/boev/qed). Live website: [qed.web3-energy.com](https://qed.web3-energy.com).
 
 ## How a check works
 
@@ -131,7 +131,10 @@ purple and green color washes replace decorative geometry and stay static
 when reduced motion is enabled. Its headline remains “QED checks whether a
 pool uses the stock-token contract published by its issuer.” and its
 explanation remains “A ticker is not a contract. Compare the pool with the
-issuer's published stock-token contract.”
+issuer's published stock-token contract.” The Check page lazily loads active
+registry tickers on first focus, filters them case-insensitively, supports
+pointer and keyboard selection, and keeps manual ticker lookup available if
+suggestions are unavailable.
 
 
 ## Architecture

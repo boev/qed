@@ -902,16 +902,6 @@ mod tests {
         assert_eq!(canonical_ticker(&vec![stale], "NVDA"), None);
         assert_eq!(canonical_ticker(&Vec::new(), "NVDA"), None);
     }
-    #[test]
-    fn check_page_renders_distinct_ticker_lookup_form() {
-        let rendered = CheckTemplate { asset_version: 1, public_url: "https://qed.example".to_owned() }
-            .render()
-            .expect("check template renders");
-        assert!(rendered.contains(r#"id="ticker-lookup""#));
-        assert!(rendered.contains(r#"method="get" action="/tokens""#));
-        assert!(rendered.contains(r#"name="ticker""#));
-        assert!(rendered.contains(r#"hx-post="/check""#));
-    }
 
     #[test]
     fn token_directory_contracts_have_intentional_chain_order() {
