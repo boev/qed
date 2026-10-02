@@ -2161,6 +2161,7 @@ mod tests {
             evidence: Vec::new(),
             checked_at: "2026-09-22T00:00:00Z".to_owned(),
             attestation_id: None,
+            powers: None,
         };
 
         let card = featured_from_check(candidate.clone(), result.clone());

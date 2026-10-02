@@ -1,0 +1,35 @@
+{
+  "upgradeable_and_restricted": {
+    "implementation": "0x0000000000000000000000000000000000000011",
+    "admin": "0x0000000000000000000000000000000000000012",
+    "beacon": "0x0000000000000000000000000000000000000013",
+    "paused": true,
+    "owner": "0x0000000000000000000000000000000000000014",
+    "pauser": "0x0000000000000000000000000000000000000015",
+    "sanctionsList": "0x0000000000000000000000000000000000000016"
+  },
+  "paused": { "paused": true },
+  "unpaused": { "paused": false },
+  "unpaused_with_roles": {
+    "paused": false,
+    "pauser": "0x0000000000000000000000000000000000000015",
+    "owner": "0x0000000000000000000000000000000000000014"
+  },
+  "sourcify": {
+    "exact_match": {
+      "status": 200,
+      "body": { "match": "exact_match", "runtimeMatch": "exact_match", "creationMatch": null }
+    },
+    "match": {
+      "status": 200,
+      "body": { "match": "match", "runtimeMatch": "match", "creationMatch": null }
+    },
+    "not_found": { "status": 404, "body": {} },
+    "none": { "status": 200, "body": { "match": "none" } },
+    "bad_request": {
+      "status": 400,
+      "body": { "customCode": "invalid_parameter", "message": "invalid field selector" }
+    },
+    "server_error": { "status": 503, "body": {} }
+  }
+}

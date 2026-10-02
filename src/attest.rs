@@ -167,20 +167,11 @@ pub fn record_read(
         hasher.update(&bytes);
         let result_hash = hex_lower(&hasher.finalize());
         let mut log = cell.borrow_mut();
-        if log.reads.len() >= MAX_READ_LOG_ENTRIES {
-            return;
-        }
-        let raw_result = if raw_result
-            && log.raw_result_bytes.saturating_add(bytes.len()) <= MAX_RAW_RESULT_BYTES
-        {
-            log.raw_result_bytes = log.raw_result_bytes.saturating_add(bytes.len());
-            Some(result.clone())
-        } else {
-            None
-        };
         if method == "eth_blockNumber" {
             if log.block.is_none() {
                 log.block = block;
+            }
+            if log.reads.len() < MAX_READ_LOG_ENTRIES {
                 log.reads.push(Read {
                     method: method.to_owned(),
                     params,
@@ -195,6 +186,8 @@ pub fn record_read(
         if method == "getSlot" {
             if log.slot.is_none() {
                 log.slot = slot;
+            }
+            if log.reads.len() < MAX_READ_LOG_ENTRIES {
                 log.reads.push(Read {
                     method: method.to_owned(),
                     params,
@@ -206,6 +199,23 @@ pub fn record_read(
             }
             return;
         }
+        if log.block.is_none() {
+            log.block = block;
+        }
+        if log.slot.is_none() {
+            log.slot = slot;
+        }
+        if log.reads.len() >= MAX_READ_LOG_ENTRIES {
+            return;
+        }
+        let raw_result = if raw_result
+            && log.raw_result_bytes.saturating_add(bytes.len()) <= MAX_RAW_RESULT_BYTES
+        {
+            log.raw_result_bytes = log.raw_result_bytes.saturating_add(bytes.len());
+            Some(result.clone())
+        } else {
+            None
+        };
         log.reads.push(Read {
             method: method.to_owned(),
             params,
@@ -1583,7 +1593,15 @@ mod tests {
             )),
             readers: std::sync::Arc::new(Vec::new()),
             http: reqwest::Client::new(),
+            source_http: reqwest::Client::new(),
             check_cache: moka::future::Cache::builder().build(),
+            powers_cache: moka::future::Cache::builder().build(),
+            powers_retry_cache: moka::future::Cache::builder().build(),
+            powers_failure_cache: moka::future::Cache::builder().build(),
+            powers_locks: moka::future::Cache::builder().build(),
+            powers_prefetching: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             leaderboard_check_cache: moka::future::Cache::builder().build(),
             check_inflight: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -1615,9 +1633,73 @@ mod tests {
             usage_stats: std::sync::Arc::new(crate::state::UsageStats::new()),
             rate_limiter: std::sync::Arc::new(crate::state::RateLimiter::default()),
             expensive_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(32)),
+            powers_prefetch_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
             wallet_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             registry_api_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
         }
+    }
+
+    #[tokio::test]
+    async fn fresh_attestation_matches_the_position_read_method_fixture() {
+        const PRE_CHANGE_METHODS: [&str; 2] = ["eth_blockNumber", "eth_call"];
+
+        let ((), read_log) = capture_reads(async {
+            let block_result = json!("0x7b");
+            record_read("eth_blockNumber", json!([]), &block_result, false, Some(123), None);
+            let call_result = json!("0x01");
+            record_read(
+                "eth_call",
+                json!([{"to": "0x0000000000000000000000000000000000000001"}]),
+                &call_result,
+                true,
+                Some(123),
+                None,
+            );
+        })
+        .await;
+        let state = test_state(false);
+        let pool = sample().pool;
+        let attestation = sign_payload(
+            &state,
+            Chain::Base,
+            pool.pool.clone(),
+            Verdict::NoMatch,
+            None,
+            None,
+            pool,
+            None,
+            None,
+            "2026-10-02T00:00:00Z".to_owned(),
+            "2026-10-03T00:00:00Z".to_owned(),
+            read_log,
+        )
+        .expect("fresh attestation");
+        let methods = attestation.reads.iter().map(|read| read.method.as_str()).collect::<Vec<_>>();
+
+        assert_eq!(methods, PRE_CHANGE_METHODS);
+        assert_eq!(attestation.block, Some(123));
+    }
+
+    #[tokio::test]
+    async fn solana_get_slot_read_is_kept_after_account_context_slot() {
+        let ((), read_log) = capture_reads(async {
+            let account_result = json!({"context": {"slot": 456}});
+            record_read(
+                "getAccountInfo",
+                json!(["mint"]),
+                &account_result,
+                false,
+                None,
+                Some(456),
+            );
+            let slot_result = json!(455);
+            record_read("getSlot", json!([]), &slot_result, false, None, Some(455));
+        })
+        .await;
+        let methods = read_log.reads.iter().map(|read| read.method.as_str()).collect::<Vec<_>>();
+
+        assert_eq!(methods, ["getAccountInfo", "getSlot"]);
+        assert_eq!(read_log.slot, Some(456));
     }
     fn verified_registry_entry() -> Entry {
         Entry {
@@ -1688,9 +1770,48 @@ mod tests {
             evidence: Vec::new(),
             checked_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             attestation_id: None,
+            powers: None,
         };
 
         assert!(create_for_check(&state, &result, ReadLog::default()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn check_powers_remain_outside_the_signed_attestation_payload() {
+        let state = test_state(false);
+        let pool = sample().pool;
+        let result = CheckResult {
+            input: pool.pool.clone(),
+            chain: Chain::Base,
+            pool: Some(pool),
+            verdict: Verdict::NoMatch,
+            quote_share_of_supply: None,
+            evidence: Vec::new(),
+            checked_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            attestation_id: None,
+            powers: Some(crate::powers::PowersRecord {
+                chain: Chain::Base,
+                contract: "0x0000000000000000000000000000000000000002".to_owned(),
+                can_seize: Vec::new(),
+                can_block: Vec::new(),
+                can_change_rules: Vec::new(),
+                unavailable: Vec::new(),
+                source_verified_subject: crate::powers::SourceVerifiedSubject::Contract,
+                source_verified: crate::powers::SourceVerified::None,
+                source_verified_proxy: None,
+                observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                block: None,
+                slot: None,
+                reads: Vec::new(),
+            }),
+        };
+
+        let attestation = create_for_check(&state, &result, ReadLog::default())
+            .await
+            .expect("NoMatch attestation");
+        let payload = canonical_payload_json(&attestation).expect("canonical payload");
+        assert!(!payload.contains("\"powers\""));
+        verify(&attestation).expect("signed payload remains valid");
     }
 
     #[test]
@@ -1851,6 +1972,18 @@ mod tests {
         assert!(log.reads[0].raw_result.is_none());
         assert!(log.reads[1].raw_result.is_some());
         assert!(log.raw_result_bytes <= MAX_RAW_RESULT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn context_slot_is_retained_as_attestation_position() {
+        let (_, log) = capture_reads(async {
+            let response = json!({"context": {"slot": 9876}, "value": null});
+            record_read("getAccountInfo", json!([]), &response, true, None, Some(9876));
+        })
+        .await;
+
+        assert_eq!(log.slot, Some(9876));
+        assert_eq!(log.reads[0].slot, Some(9876));
     }
     #[tokio::test]
     async fn file_store_round_trip_is_offline() {

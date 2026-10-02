@@ -1,9 +1,9 @@
 use super::views::{
     CertificateResultTemplate, CertificateTemplate, CertificateView, ChainTemplate,
     CheckResultPageTemplate, CheckTemplate, DirectoryContractView, DirectoryPoolView,
-    FeaturedTemplate, FeaturedView, GlossaryTemplate, GuideVerifyTemplate, IndexTemplate,
-    RegistryTableQuery, RegistryTableTemplate, RegistryTemplate, ResultTemplate, TokenTemplate,
-    ValidatedCardView, ValidatedTemplate, WalletHoldingView, WalletHoldingsTemplate,
+    DirectoryPowersView, FeaturedTemplate, FeaturedView, GlossaryTemplate, GuideVerifyTemplate,
+    IndexTemplate, RegistryTableQuery, RegistryTableTemplate, RegistryTemplate, ResultTemplate,
+    TokenTemplate, ValidatedCardView, ValidatedTemplate, WalletHoldingView, WalletHoldingsTemplate,
     WalletTemplate, WalletTradeLinkView,
 };
 use super::{ASSET_VERSION, render_page};
@@ -438,6 +438,16 @@ pub(crate) async fn token_page(
         .filter(|entry| entry.ticker.eq_ignore_ascii_case(&canonical_ticker))
         .map(contract_view)
         .collect();
+    for contract in &mut contracts {
+        if let Some(record) =
+            crate::powers::cached_record(&state, contract.chain_kind, &contract.contract).await
+        {
+            contract.powers = powers_view(record);
+        } else {
+            crate::powers::schedule_prefetch(&state, contract.chain_kind, &contract.contract).await;
+            contract.powers = DirectoryPowersView::unavailable();
+        }
+    }
     sort_directory_contracts(&mut contracts);
     let leaderboard = state.leaderboard.read().await;
     let mut pools: Vec<_> = leaderboard
@@ -591,10 +601,42 @@ fn contract_view(entry: &Entry) -> DirectoryContractView {
         issuer: entry.issuer.clone(),
         ticker: entry.ticker.clone(),
         chain: entry.chain.to_string(),
+        chain_kind: entry.chain,
         chain_icon: super::views::chain_icon(entry.chain),
         contract: entry.contract.clone(),
         explorer_url: super::views::explorer_link(entry.chain, &entry.contract),
         source_url: entry.source_url.clone(),
+        powers: DirectoryPowersView::unavailable(),
+    }
+}
+
+fn powers_view(record: crate::powers::PowersRecord) -> DirectoryPowersView {
+    fn details(reasons: Vec<crate::powers::Reason>) -> Vec<String> {
+        reasons.into_iter().map(|reason| format!("{}: {}", reason.code, reason.detail)).collect()
+    }
+    fn status(source: crate::powers::SourceVerified) -> &'static str {
+        match source {
+            crate::powers::SourceVerified::ExactMatch => "Exact match",
+            crate::powers::SourceVerified::Match => "Match",
+            crate::powers::SourceVerified::None => "No match",
+            crate::powers::SourceVerified::Unavailable => "Unavailable",
+        }
+    }
+
+    DirectoryPowersView {
+        available: true,
+        can_seize: details(record.can_seize),
+        can_block: details(record.can_block),
+        can_change_rules: details(record.can_change_rules),
+        unavailable: details(record.unavailable),
+        source_verified_subject: record.source_verified_subject.label().to_owned(),
+        source_verified: status(record.source_verified).to_owned(),
+        source_verified_proxy: record
+            .source_verified_proxy
+            .map(status)
+            .unwrap_or_default()
+            .to_owned(),
+        observed_at: record.observed_at,
     }
 }
 
@@ -808,6 +850,181 @@ pub(crate) async fn recheck_certificate(
 mod tests {
     use super::*;
 
+    struct GatedPowerReader {
+        started: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::pool::PoolReader for GatedPowerReader {
+        fn chain(&self) -> Chain {
+            Chain::Solana
+        }
+
+        async fn read_pool(&self, _address: &str) -> Result<crate::pool::PoolInfo, PoolError> {
+            Err(PoolError::Reader("unused token-page test reader".to_owned()))
+        }
+
+        async fn power_facts(
+            &self,
+            _address: &str,
+        ) -> Result<crate::powers::PowerFacts, PoolError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(crate::powers::PowerFacts::default())
+        }
+    }
+
+    fn token_page_state(reader: Box<dyn crate::pool::PoolReader>, entry: registry::Entry) -> AppState {
+        AppState {
+            registry: std::sync::Arc::new(tokio::sync::RwLock::new(vec![entry])),
+            registry_status: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::discovery::RegistrySnapshot::default(),
+            )),
+            readers: std::sync::Arc::new(vec![reader]),
+            http: reqwest::Client::new(),
+            source_http: reqwest::Client::new(),
+            check_cache: moka::future::Cache::builder().build(),
+            powers_cache: moka::future::Cache::builder().build(),
+            powers_retry_cache: moka::future::Cache::builder().build(),
+            powers_failure_cache: moka::future::Cache::builder().build(),
+            powers_locks: moka::future::Cache::builder().build(),
+            powers_prefetching: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
+            leaderboard_check_cache: moka::future::Cache::builder().build(),
+            check_inflight: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            featured: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            featured_status: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::discovery::FeaturedStatus::default(),
+            )),
+            leaderboard: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::discovery::Leaderboard::default(),
+            )),
+            prices: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::discovery::PriceSnapshot::default(),
+            )),
+            attestations: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            signing_key: std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[5; 32])),
+            dev_signer: false,
+            attest_store: std::sync::Arc::new(crate::attest::FileAttestationStore::new(
+                std::path::PathBuf::from("target/test-token-page-attestations"),
+            )),
+            board_store: std::sync::Arc::new(crate::discovery::DurableBoardStore::default()),
+            registry_hash: std::sync::Arc::new(std::sync::RwLock::new(String::new())),
+            registry_api_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            public_url: std::sync::Arc::new("http://localhost:3000".to_owned()),
+            admin_auth: std::sync::Arc::new(crate::state::AdminAuth::new(
+                Some("test-admin"),
+                Some("test-password"),
+            )),
+            usage_stats: std::sync::Arc::new(crate::state::UsageStats::new()),
+            rate_limiter: std::sync::Arc::new(crate::state::RateLimiter::default()),
+            expensive_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            powers_prefetch_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+            wallet_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            registry_api_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+
+    #[tokio::test]
+    async fn token_page_returns_from_cache_while_missing_power_reads_fill_in_background() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let address = "11111111111111111111111111111111";
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let state = token_page_state(
+            Box::new(GatedPowerReader {
+                started: started.clone(),
+                release: release.clone(),
+            }),
+            registry::Entry {
+                issuer: "Issuer".to_owned(),
+                ticker: "NVDA".to_owned(),
+                name: "Issuer NVDA".to_owned(),
+                chain: Chain::Solana,
+                contract: address.to_owned(),
+                decimals: Some(9),
+                source: "test".to_owned(),
+                source_url: "https://issuer.example/nvda".to_owned(),
+                last_checked: registry::now_rfc3339(),
+                removed_at: None,
+                stale_since: None,
+            },
+        );
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::web::router(state.clone())
+                .oneshot(Request::get("/tokens/NVDA").body(Body::empty()).unwrap()),
+        )
+        .await
+        .expect("token page must not await live powers reads")
+        .expect("token page response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("token page body");
+        assert!(String::from_utf8_lossy(&body).contains("NVDA tokenized"));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("cache miss schedules background power read");
+        release.notify_one();
+        let key = (Chain::Solana, address.to_owned(), crate::state::current_registry_version());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.powers_retry_cache.get(&key).await.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background observation enters short retry cache");
+    }
+
+    #[tokio::test]
+    async fn queued_power_prefetch_does_not_occupy_user_check_capacity() {
+        let address = "11111111111111111111111111111111";
+        let state = token_page_state(
+            Box::new(GatedPowerReader {
+                started: std::sync::Arc::new(tokio::sync::Notify::new()),
+                release: std::sync::Arc::new(tokio::sync::Notify::new()),
+            }),
+            registry::Entry {
+                issuer: "Issuer".to_owned(),
+                ticker: "NVDA".to_owned(),
+                name: "Issuer NVDA".to_owned(),
+                chain: Chain::Solana,
+                contract: address.to_owned(),
+                decimals: Some(9),
+                source: "test".to_owned(),
+                source_url: "https://issuer.example/nvda".to_owned(),
+                last_checked: registry::now_rfc3339(),
+                removed_at: None,
+                stale_since: None,
+            },
+        );
+        let _prefetch_permits = [
+            state.powers_prefetch_concurrency.clone().acquire_owned().await.unwrap(),
+            state.powers_prefetch_concurrency.clone().acquire_owned().await.unwrap(),
+        ];
+
+        crate::powers::schedule_prefetch(&state, Chain::Solana, address).await;
+        let key = (Chain::Solana, address.to_owned(), crate::state::current_registry_version());
+        assert!(state.powers_prefetching.lock().await.contains(&key));
+        let _user_check_permit = state
+            .expensive_concurrency
+            .clone()
+            .try_acquire_owned()
+            .expect("queued prefetch leaves the user-check permit available");
+    }
     #[test]
     fn wallet_address_routing_keeps_solana_distinct_and_checks_all_evm_chains() {
         assert_eq!(wallet_chains("11111111111111111111111111111111"), Some(vec![Chain::Solana]));
@@ -910,10 +1127,18 @@ mod tests {
             issuer: issuer.to_owned(),
             ticker: "NVDA".to_owned(),
             chain: chain.to_owned(),
+            chain_kind: match chain {
+                "Solana" => Chain::Solana,
+                "Robinhood Chain" => Chain::RobinhoodChain,
+                "Ethereum" => Chain::Ethereum,
+                "BNB Chain" => Chain::Bnb,
+                _ => Chain::Base,
+            },
             chain_icon: "ethereum",
             contract: format!("0x{issuer}"),
             explorer_url: "https://explorer.example".to_owned(),
             source_url: "https://issuer.example".to_owned(),
+            powers: DirectoryPowersView::unavailable(),
         };
         let mut contracts = vec![
             view("Base", "base"),
@@ -939,11 +1164,36 @@ mod tests {
             contracts: vec![DirectoryContractView {
                 issuer: "Issuer".to_owned(),
                 ticker: "NVDA".to_owned(),
-                chain: "Solana".to_owned(),
-                chain_icon: "solana",
-                contract: "So11111111111111111111111111111111111111112".to_owned(),
+                chain: "Base".to_owned(),
+                chain_kind: Chain::Base,
+                chain_icon: "ethereum",
+                contract: "0x0000000000000000000000000000000000000002".to_owned(),
                 explorer_url: "https://explorer.example/token".to_owned(),
                 source_url: "https://issuer.example/nvda".to_owned(),
+                powers: powers_view(crate::powers::PowersRecord {
+                    chain: Chain::Base,
+                    contract: "0x0000000000000000000000000000000000000002".to_owned(),
+                    can_seize: Vec::new(),
+                    can_block: vec![crate::powers::Reason::new(
+                        "pausable",
+                        "Paused status could not be read.",
+                    )],
+                    can_change_rules: vec![crate::powers::Reason::new(
+                        "eip1967_implementation",
+                        "Implementation source is verified.",
+                    )],
+                    unavailable: vec![crate::powers::Reason::new(
+                        "rpc_unavailable",
+                        "A supported read failed temporarily.",
+                    )],
+                    source_verified_subject: crate::powers::SourceVerifiedSubject::Implementation,
+                    source_verified: crate::powers::SourceVerified::ExactMatch,
+                    source_verified_proxy: Some(crate::powers::SourceVerified::Match),
+                    observed_at: "2026-10-01T00:00:00Z".to_owned(),
+                    block: Some(123),
+                    slot: None,
+                    reads: Vec::new(),
+                }),
             }],
             pools: Vec::new(),
             json_ld: "{}".to_owned(),
@@ -951,8 +1201,15 @@ mod tests {
         .render()
         .expect("token template renders");
         assert!(rendered.contains(r#"class="contract-card""#));
-        assert!(rendered.contains(r#"#solana"#));
+        assert!(rendered.contains(r#"#ethereum"#));
         assert!(rendered.contains("Explorer"));
+        assert!(rendered.contains("unavailable (transient)"));
+        assert!(rendered.contains("rpc_unavailable: A supported read failed temporarily."));
+        assert!(rendered.contains("Exact match"));
+        assert!(rendered.contains("Implementation source"));
+        assert!(rendered.contains("proxy: Match"));
+        assert!(!rendered.contains("No evidence observed"));
+        assert!(rendered.contains("Absence of observed signals is not proof"));
         assert!(rendered.contains("Issuer source"));
         assert!(!rendered.contains("decimals"));
     }

@@ -41,6 +41,25 @@
         <a class="button secondary-button" href="{{ contract.explorer_url }}" target="_blank" rel="noopener noreferrer">Explorer <span aria-hidden="true">↗</span></a>
         <a class="button secondary-button" href="{{ contract.source_url }}" target="_blank" rel="noopener noreferrer">Issuer source <span aria-hidden="true">↗</span></a>
       </div>
+      <details class="powers-panel">
+        <summary>Observed token-control signals</summary>
+        {% if contract.powers.available %}
+        <dl>
+          <dt>Seizure signals</dt>
+          <dd>{% if contract.powers.can_seize.len() == 0 %}{% if contract.powers.unavailable.len() > 0 %}unavailable (transient){% else %}No evidence observed{% endif %}{% else %}<ul>{% for reason in contract.powers.can_seize %}<li>{{ reason }}</li>{% endfor %}</ul>{% endif %}</dd>
+          <dt>Blocking signals</dt>
+          <dd>{% if contract.powers.can_block.len() == 0 %}{% if contract.powers.unavailable.len() > 0 %}unavailable (transient){% else %}No evidence observed{% endif %}{% else %}<ul>{% for reason in contract.powers.can_block %}<li>{{ reason }}</li>{% endfor %}</ul>{% endif %}</dd>
+          <dt>Rule-change signals</dt>
+          <dd>{% if contract.powers.can_change_rules.len() == 0 %}{% if contract.powers.unavailable.len() > 0 %}unavailable (transient){% else %}No evidence observed{% endif %}{% else %}<ul>{% for reason in contract.powers.can_change_rules %}<li>{{ reason }}</li>{% endfor %}</ul>{% endif %}</dd>
+          {% if contract.powers.unavailable.len() > 0 %}<dt>Unavailable reads (transient)</dt><dd><ul>{% for reason in contract.powers.unavailable %}<li>{{ reason }}</li>{% endfor %}</ul></dd>{% endif %}
+          <dt>{{ contract.powers.source_verified_subject }}</dt><dd>{{ contract.powers.source_verified }}{% if contract.powers.source_verified_proxy.len() > 0 %}; proxy: {{ contract.powers.source_verified_proxy }}{% endif %}</dd>
+          <dt>Observed at</dt><dd><time>{{ contract.powers.observed_at }}</time></dd>
+        </dl>
+        {% else %}
+        <p>Power evidence is unavailable for this page request.</p>
+        {% endif %}
+        <p>Absence of observed signals is not proof that no authority exists. These observations do not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.</p>
+      </details>
     </article>
     {% endfor %}
   </div>

@@ -106,6 +106,13 @@ pub trait PoolReader: Send + Sync {
     ) -> Result<Vec<WalletHolding>, PoolError> {
         Err(PoolError::Reader("wallet holdings are unsupported".to_owned()))
     }
+    async fn power_facts(
+        &self,
+        _address: &str,
+    ) -> Result<crate::powers::PowerFacts, PoolError> {
+        Err(PoolError::Reader("token powers are unsupported on this chain".to_owned()))
+    }
+
 
     async fn code_at(&self, _address: &str) -> Result<Vec<u8>, PoolError> {
         Err(PoolError::CodeLookupUnsupported)

@@ -2,6 +2,7 @@ use super::{PoolError, PoolInfo, PoolReader, TokenMeta, TokenSide, WalletHolding
 use crate::chain::Chain;
 use crate::state::RpcRateLimiter;
 use alloy::{
+    eips::BlockId,
     network::Ethereum,
     primitives::{Address, B256, U256, address, aliases::U24},
     providers::{DynProvider, Provider, ProviderBuilder},
@@ -31,6 +32,15 @@ sol! {
         /// ERC-8056's optional stock-token split/dividend multiplier.
         function uiMultiplier() external view returns (uint256 value);
     }
+    #[sol(rpc)]
+    interface TokenPowerProbe {
+        function paused() external view returns (bool value);
+        function owner() external view returns (address value);
+        function pauser() external view returns (address value);
+        function sanctionsList() external view returns (address value);
+        function implementation() external view returns (address value);
+    }
+
 
     #[sol(rpc)]
     interface V2Pair {
@@ -98,9 +108,90 @@ fn record_eth_call<T: Debug>(params: Value, result: &T) {
     crate::attest::record_read("eth_call", params, &value, true, None, None);
 }
 
+fn raw_hex(bytes: &[u8]) -> String {
+    let mut value = String::with_capacity(2 + bytes.len() * 2);
+    value.push_str("0x");
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(value, "{byte:02x}");
+    }
+    value
+}
+
+fn address_word(value: &Address) -> String {
+    format!("0x{:064x}", U256::from_be_slice(value.as_slice()))
+}
+
+fn record_power_call<T>(
+    to: Address,
+    calldata: &[u8],
+    block: u64,
+    method: &str,
+    result: Result<T, alloy::contract::Error>,
+    encode_result: impl FnOnce(&T) -> String,
+) -> (Option<T>, Option<crate::powers::Reason>) {
+    let params = json!([
+        {"to": canonical(to), "data": raw_hex(calldata)},
+        format!("0x{block:x}")
+    ]);
+    match result {
+        Ok(value) => {
+            let raw_result = Value::String(encode_result(&value));
+            crate::attest::record_read(
+                "eth_call",
+                params,
+                &raw_result,
+                true,
+                Some(block),
+                None,
+            );
+            (Some(value), None)
+        }
+        Err(error) => {
+            let revert_data = error.as_revert_data();
+            let absent = revert_data.is_some()
+                || matches!(
+                    &error,
+                    alloy::contract::Error::UnknownFunction(_)
+                        | alloy::contract::Error::UnknownSelector(_)
+                        | alloy::contract::Error::ZeroData(_, _)
+                        | alloy::contract::Error::AbiError(_)
+                );
+            let raw_result = if let Some(data) = revert_data {
+                Value::String(raw_hex(&data))
+            } else if absent {
+                Value::String("0x".to_owned())
+            } else {
+                json!({"available": false})
+            };
+            crate::attest::record_read(
+                "eth_call",
+                params,
+                &raw_result,
+                true,
+                Some(block),
+                None,
+            );
+            let unavailable = (!absent).then(|| {
+                crate::powers::Reason::new(
+                    "rpc_unavailable",
+                    format!("{method} read did not complete; this observation is unavailable."),
+                )
+            });
+            (None, unavailable)
+        }
+    }
+}
+
 const MAX_POOL_DISCOVERY_CANDIDATES: usize = 128;
 const MAX_POOL_DISCOVERY_OPERATIONS: usize = 512;
 const POOL_DISCOVERY_DEADLINE: Duration = Duration::from_secs(5);
+const EIP1967_IMPLEMENTATION_SLOT: &str =
+    "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
+const EIP1967_ADMIN_SLOT: &str =
+    "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103";
+const EIP1967_BEACON_SLOT: &str =
+    "0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50";
 
 struct PoolDiscoveryBudget {
     started: Instant,
@@ -864,8 +955,44 @@ impl EvmReader {
             balance: Some(balance.to_string()),
         }
     }
-}
+    async fn power_storage_address(
+        &self,
+        contract: Address,
+        slot: &str,
+        block_id: BlockId,
+        block: u64,
+    ) -> (Option<String>, Option<crate::powers::Reason>) {
+        let key = U256::from_str_radix(slot.trim_start_matches("0x"), 16)
+            .expect("the EIP-1967 slot constants are valid");
+        let params = json!([canonical(contract), slot, format!("0x{block:x}")]);
+        let value = match self.provider.get_storage_at(contract, key).block_id(block_id).await {
+            Ok(value) => value,
+            Err(_) => {
+                crate::attest::record_read(
+                    "eth_getStorageAt",
+                    params,
+                    &json!({"available": false}),
+                    true,
+                    Some(block),
+                    None,
+                );
+                return (
+                    None,
+                    Some(crate::powers::Reason::new(
+                        "rpc_unavailable",
+                        "EIP-1967 storage read did not complete; this observation is unavailable.",
+                    )),
+                );
+            }
+        };
+        let raw_value = Value::String(format!("0x{value:064x}"));
+        crate::attest::record_read("eth_getStorageAt", params, &raw_value, true, Some(block), None);
+        let bytes = value.to_be_bytes::<32>();
+        let address = Address::from_slice(&bytes[12..]);
+        ((address != Address::ZERO).then(|| canonical(address)), None)
+    }
 
+}
 #[async_trait]
 impl PoolReader for EvmReader {
     fn chain(&self) -> Chain {
@@ -897,6 +1024,129 @@ impl PoolReader for EvmReader {
         known_tokens: &[String],
     ) -> Result<Vec<WalletHolding>, PoolError> {
         EvmReader::wallet_holdings(self, owner, known_tokens).await
+    }
+    async fn power_facts(
+        &self,
+        address: &str,
+    ) -> Result<crate::powers::PowerFacts, PoolError> {
+        let contract = parse_address(address)?;
+        let block = self
+            .provider
+            .get_block_number()
+            .await
+            .map_err(|_| PoolError::Reader("reading current block number failed".to_owned()))?;
+        let block_result = Value::String(format!("0x{block:x}"));
+        crate::attest::record_read(
+            "eth_blockNumber",
+            json!([]),
+            &block_result,
+            false,
+            Some(block),
+            None,
+        );
+        let block_id = BlockId::number(block);
+        let mut unavailable = Vec::new();
+        let (implementation, issue) = self
+            .power_storage_address(contract, EIP1967_IMPLEMENTATION_SLOT, block_id, block)
+            .await;
+        unavailable.extend(issue);
+        let (admin, issue) =
+            self.power_storage_address(contract, EIP1967_ADMIN_SLOT, block_id, block).await;
+        unavailable.extend(issue);
+        let (beacon, issue) =
+            self.power_storage_address(contract, EIP1967_BEACON_SLOT, block_id, block).await;
+        unavailable.extend(issue);
+
+        let probe = TokenPowerProbe::new(contract, &self.provider);
+        let call = probe.paused();
+        let calldata = call.calldata().to_vec();
+        let (paused, issue) = record_power_call(
+            contract,
+            &calldata,
+            block,
+            "paused()",
+            call.block(block_id).call().await,
+            |value| format!("0x{:064x}", u8::from(*value)),
+        );
+        unavailable.extend(issue);
+
+        let call = probe.owner();
+        let calldata = call.calldata().to_vec();
+        let (owner_value, issue) = record_power_call(
+            contract,
+            &calldata,
+            block,
+            "owner()",
+            call.block(block_id).call().await,
+            address_word,
+        );
+        unavailable.extend(issue);
+
+        let call = probe.pauser();
+        let calldata = call.calldata().to_vec();
+        let (pauser_value, issue) = record_power_call(
+            contract,
+            &calldata,
+            block,
+            "pauser()",
+            call.block(block_id).call().await,
+            address_word,
+        );
+        unavailable.extend(issue);
+
+        let call = probe.sanctionsList();
+        let calldata = call.calldata().to_vec();
+        let (sanctions_list_value, issue) = record_power_call(
+            contract,
+            &calldata,
+            block,
+            "sanctionsList()",
+            call.block(block_id).call().await,
+            address_word,
+        );
+        unavailable.extend(issue);
+
+        let beacon_implementation = if let Some(beacon) = beacon.as_deref() {
+            let beacon = parse_address(beacon)?;
+            let beacon_probe = TokenPowerProbe::new(beacon, &self.provider);
+            let call = beacon_probe.implementation();
+            let calldata = call.calldata().to_vec();
+            let (implementation, issue) = record_power_call(
+                beacon,
+                &calldata,
+                block,
+                "beacon.implementation()",
+                call.block(block_id).call().await,
+                address_word,
+            );
+            unavailable.extend(issue);
+            implementation
+                .filter(|implementation| *implementation != Address::ZERO)
+                .map(canonical)
+        } else {
+            None
+        };
+
+        let mut facts = crate::powers::evm::analyze(crate::powers::evm::ProbeSnapshot {
+            implementation,
+            admin,
+            beacon,
+            beacon_implementation,
+            paused,
+            owner: owner_value
+                .filter(|owner| *owner != Address::ZERO)
+                .map(canonical),
+            pauser: pauser_value
+                .filter(|pauser| *pauser != Address::ZERO)
+                .map(canonical),
+            sanctions_list: sanctions_list_value
+                .filter(|list| *list != Address::ZERO)
+                .map(canonical),
+            unavailable: Vec::new(),
+        });
+        facts.transient_failure = !unavailable.is_empty();
+        facts.unavailable = unavailable;
+        Ok(facts)
     }
 
     async fn code_at(&self, address: &str) -> Result<Vec<u8>, PoolError> {
@@ -977,6 +1227,10 @@ mod tests {
 
     fn call_key(to: &str, data: &str) -> String {
         format!("call:{}:{}", to.to_ascii_lowercase(), data.to_ascii_lowercase())
+    }
+
+    fn storage_key(address: &str, slot: &str) -> String {
+        format!("storage:{}:{}", address.to_ascii_lowercase(), slot.to_ascii_lowercase())
     }
 
     fn selector_key(to: &str, selector: &str) -> String {
@@ -1126,6 +1380,7 @@ mod tests {
 
     fn request_key(request: &Value) -> String {
         match request.get("method").and_then(Value::as_str) {
+            Some("eth_blockNumber") => "eth_blockNumber".to_owned(),
             Some("eth_call") => {
                 let params = request["params"][0].clone();
                 let data = params
@@ -1135,6 +1390,10 @@ mod tests {
                     .unwrap_or_default();
                 call_key(params["to"].as_str().unwrap_or_default(), data)
             }
+            Some("eth_getStorageAt") => storage_key(
+                request["params"][0].as_str().unwrap_or_default(),
+                request["params"][1].as_str().unwrap_or_default(),
+            ),
             Some("eth_getCode") => get_code_key(request["params"][0].as_str().unwrap_or_default()),
             _ => String::new(),
         }
@@ -1160,6 +1419,78 @@ mod tests {
         let (url, task) = fixture_server(responses).await;
         let reader = EvmReader::new(chain, &url).unwrap();
         (reader, task)
+    }
+
+    fn function_selector(signature: &str) -> String {
+        let hash = alloy::primitives::keccak256(signature.as_bytes());
+        raw_hex(&hash[..4])
+    }
+
+    #[tokio::test]
+    async fn powers_reads_decode_at_one_block_and_mark_transport_failures_unavailable() {
+        let block = 42;
+        let beacon = TOKEN1;
+        let mut map = responses();
+        map.insert("eth_blockNumber".to_owned(), format!("0x{block:x}"));
+        map.insert(
+            storage_key(TOKEN0, EIP1967_IMPLEMENTATION_SLOT),
+            format!("0x{}", uint_word(0)),
+        );
+        map.insert(
+            storage_key(TOKEN0, EIP1967_ADMIN_SLOT),
+            format!("0x{}", uint_word(0)),
+        );
+        map.insert(storage_key(TOKEN0, EIP1967_BEACON_SLOT), address_word(beacon));
+        put_selector(
+            &mut map,
+            TOKEN0,
+            &function_selector("paused()"),
+            format!("0x{}", uint_word(1)),
+        );
+        put_selector(
+            &mut map,
+            TOKEN0,
+            &function_selector("owner()"),
+            address_word(TOKEN1),
+        );
+        put_selector(&mut map, TOKEN0, &function_selector("sanctionsList()"), "0x".to_owned());
+        put_selector(
+            &mut map,
+            beacon,
+            &function_selector("implementation()"),
+            address_word(TOKEN0),
+        );
+
+        let (reader, task) = reader_for(map, Chain::Base).await;
+        let (facts, log) = crate::attest::capture_reads(reader.power_facts(TOKEN0)).await;
+        task.abort();
+        let facts = facts.expect("token-power probes complete");
+
+        assert!(facts.source_is_proxy);
+        assert_eq!(facts.source_target.as_deref(), Some(TOKEN0));
+        assert!(facts.can_block.iter().any(|reason| {
+            reason.code == "pausable" && reason.detail.contains("currently paused")
+        }));
+        assert!(facts.can_change_rules.iter().any(|reason| reason.code == "owner_getter"));
+        assert!(facts.transient_failure);
+        assert_eq!(facts.unavailable.iter().map(|reason| reason.code.as_str()).collect::<Vec<_>>(), ["rpc_unavailable"]);
+        assert_eq!(log.block, Some(block));
+        assert!(log.reads.iter().filter(|read| {
+            read.method == "eth_call" || read.method == "eth_getStorageAt"
+        }).all(|read| read.block == Some(block)));
+
+        let pauser_selector = function_selector("pauser()");
+        let pauser_read = log.reads.iter().find(|read| {
+            read.method == "eth_call"
+                && read.params[0]["data"].as_str().is_some_and(|data| data.starts_with(&pauser_selector))
+        }).expect("pauser call captured");
+        assert_eq!(pauser_read.raw_result, Some(json!({"available": false})));
+        let empty_decode = log.reads.iter().find(|read| {
+            read.method == "eth_call"
+                && read.params[0]["data"].as_str().is_some_and(|data| data.starts_with(&function_selector("sanctionsList()")))
+        }).expect("empty ABI result captured");
+        assert_eq!(empty_decode.raw_result, Some(json!("0x")));
+        assert!(empty_decode.block == Some(block));
     }
 
     #[tokio::test]

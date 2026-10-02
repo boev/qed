@@ -1,0 +1,64 @@
+{
+  "authorities": {
+    "mintAuthority": "MintAuthority111111111111111111111111111111",
+    "freezeAuthority": "FreezeAuthority11111111111111111111111111",
+    "extensions": []
+  },
+  "permanent_delegate": {
+    "mintAuthority": null,
+    "freezeAuthority": null,
+    "extensions": [
+      { "extension": "permanentDelegate", "state": { "delegate": "Delegate11111111111111111111111111111111" } }
+    ]
+  },
+  "default_account_state_frozen": {
+    "extensions": [
+      { "extension": "defaultAccountState", "state": { "accountState": "frozen" } }
+    ]
+  },
+  "default_account_state_initialized": {
+    "extensions": [
+      { "extension": "defaultAccountState", "state": { "accountState": "initialized" } }
+    ]
+  },
+  "pausable": {
+    "extensions": [
+      { "extension": "pausableConfig", "state": { "authority": "PauseAuthority1111111111111111111111111", "paused": true } }
+    ]
+  },
+  "transfer_hook": {
+    "extensions": [
+      { "extension": "transferHook", "state": { "authority": "HookAuthority111111111111111111111111111", "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" } }
+    ]
+  },
+  "transfer_hook_unset": {
+    "extensions": [
+      { "extension": "transferHook", "state": { "authority": "5aMNNLQJwAEeoemTEMkv5NVjqKwvvefRYCQ5Z67HFvEq", "programId": null } }
+    ]
+  },
+  "transfer_hook_malformed": {
+    "extensions": [
+      { "extension": "transferHook", "state": { "authority": null, "programId": "not-a-public-key" } }
+    ]
+  },
+  "unparseable_extension": {
+    "extensions": [
+      { "extension": "unparseableExtension", "state": {} }
+    ]
+  },
+  "confidential_transfer_manual_approval": {
+    "extensions": [
+      { "extension": "confidentialTransferMint", "state": { "authority": "ConfidentialAuthority111111111111111111", "autoApproveNewAccounts": false, "auditorElgamalPubkey": "AuditorKey1111111111111111111111111111111" } }
+    ]
+  },
+  "confidential_transfer_auto_approval": {
+    "extensions": [
+      { "extension": "confidentialTransferMint", "state": { "authority": "ConfidentialAuthority111111111111111111", "autoApproveNewAccounts": true } }
+    ]
+  },
+  "mint_close_authority": {
+    "extensions": [
+      { "extension": "mintCloseAuthority", "state": { "closeAuthority": "CloseAuthority11111111111111111111111111" } }
+    ]
+  }
+}

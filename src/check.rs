@@ -47,6 +47,7 @@ pub struct CheckResult {
     pub evidence: Vec<String>,
     pub checked_at: String,
     pub attestation_id: Option<String>,
+    pub powers: Option<crate::powers::PowersRecord>,
 }
 
 /// Check an address against the configured readers and issuer registry.
@@ -81,6 +82,14 @@ pub async fn check(state: &AppState, address: &str) -> CheckResult {
     let (mut result, read_log) = crate::attest::capture_reads(check_uncached(state, address)).await;
     if let Some(attestation) = crate::attest::create_for_check(state, &result, read_log).await {
         result.attestation_id = Some(attestation.id);
+    }
+    if let Some(pool) = result.pool.as_ref() {
+        let registry = state.registry.read().await;
+        let token_address = registered_token_address(pool, &registry).map(str::to_owned);
+        drop(registry);
+        if let Some(token_address) = token_address {
+            result.powers = crate::powers::inspect(state, result.chain, &token_address).await.ok();
+        }
     }
 
     // A refresh advances the version while holding the registry write lock.
@@ -414,6 +423,7 @@ async fn check_uncached(state: &AppState, address: &str) -> CheckResult {
         evidence,
         checked_at: now(),
         attestation_id: None,
+        powers: None,
     }
 }
 
@@ -446,6 +456,12 @@ fn selected_sides<'a>(pool: &'a PoolInfo, entries: &[Entry]) -> (&'a TokenSide, 
         (&pool.base, &pool.quote)
     }
 }
+
+fn registered_token_address<'a>(pool: &'a PoolInfo, entries: &[Entry]) -> Option<&'a str> {
+    let (_, token_side) = selected_sides(pool, entries);
+    crate::registry::lookup(entries, pool.chain, &token_side.address).map(|_| token_side.address.as_str())
+}
+
 
 struct PoolEvaluation {
     verdict: Verdict,
@@ -728,6 +744,7 @@ fn unknown(input: &str, chain: Chain, reason: String, mut evidence: Vec<String>)
         evidence,
         checked_at: now(),
         attestation_id: None,
+        powers: None,
     }
 }
 
@@ -811,7 +828,15 @@ mod tests {
             )),
             readers: std::sync::Arc::new(readers),
             http: reqwest::Client::new(),
+            source_http: reqwest::Client::new(),
             check_cache: moka::future::Cache::builder().build(),
+            powers_cache: moka::future::Cache::builder().build(),
+            powers_retry_cache: moka::future::Cache::builder().build(),
+            powers_failure_cache: moka::future::Cache::builder().build(),
+            powers_locks: moka::future::Cache::builder().build(),
+            powers_prefetching: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             leaderboard_check_cache: moka::future::Cache::builder().build(),
             check_inflight: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -845,6 +870,7 @@ mod tests {
             usage_stats: std::sync::Arc::new(crate::state::UsageStats::new()),
             rate_limiter: std::sync::Arc::new(crate::state::RateLimiter::default()),
             expensive_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(32)),
+            powers_prefetch_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
             wallet_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             registry_api_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
         }
@@ -1153,6 +1179,18 @@ mod tests {
         assert_eq!(result.quote_share_of_supply, Some(0.1));
     }
     #[test]
+    fn powers_follow_registry_matched_base_side() {
+        let stock = "0x0000000000000000000000000000000000000010";
+        let pool = pool(
+            stock,
+            "NVDAx",
+            "0x0000000000000000000000000000000000000012",
+        );
+        let address = registered_token_address(&pool, &[entry("NVDA", stock)]);
+        assert_eq!(address, Some(stock));
+    }
+
+    #[test]
     fn mismatch_when_base_claims_registry_ticker() {
         let input = pool(
             "0x0000000000000000000000000000000000000011",
@@ -1257,7 +1295,15 @@ mod tests {
             )),
             readers: std::sync::Arc::new(vec![Box::new(FailingReader) as Box<dyn PoolReader>]),
             http: reqwest::Client::new(),
+            source_http: reqwest::Client::new(),
             check_cache: moka::future::Cache::builder().build(),
+            powers_cache: moka::future::Cache::builder().build(),
+            powers_retry_cache: moka::future::Cache::builder().build(),
+            powers_failure_cache: moka::future::Cache::builder().build(),
+            powers_locks: moka::future::Cache::builder().build(),
+            powers_prefetching: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             leaderboard_check_cache: moka::future::Cache::builder().build(),
             check_inflight: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -1291,6 +1337,7 @@ mod tests {
             usage_stats: std::sync::Arc::new(crate::state::UsageStats::new()),
             rate_limiter: std::sync::Arc::new(crate::state::RateLimiter::default()),
             expensive_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(32)),
+            powers_prefetch_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
             wallet_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             registry_api_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
         };
@@ -1361,7 +1408,15 @@ mod tests {
             )),
             readers: std::sync::Arc::new(Vec::new()),
             http: reqwest::Client::new(),
+            source_http: reqwest::Client::new(),
             check_cache: moka::future::Cache::builder().build(),
+            powers_cache: moka::future::Cache::builder().build(),
+            powers_retry_cache: moka::future::Cache::builder().build(),
+            powers_failure_cache: moka::future::Cache::builder().build(),
+            powers_locks: moka::future::Cache::builder().build(),
+            powers_prefetching: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             leaderboard_check_cache: moka::future::Cache::builder().build(),
             check_inflight: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -1395,6 +1450,7 @@ mod tests {
             usage_stats: std::sync::Arc::new(crate::state::UsageStats::new()),
             rate_limiter: std::sync::Arc::new(crate::state::RateLimiter::default()),
             expensive_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(32)),
+            powers_prefetch_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
             wallet_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             registry_api_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
         };

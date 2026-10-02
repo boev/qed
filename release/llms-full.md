@@ -50,12 +50,14 @@ Examples below use `https://qed.example`; replace it with the deployed public UR
 - `GET /api/leaderboard?page=1&per=50&sort=volume&dir=desc` returns the ranked page and global ranks.
 - `GET /api/prices?ids=solana:POOL` returns current price data.
 - `GET /api/status` returns registry, leaderboard, featured, and price freshness state.
-- `GET /api/check/{address}` checks a token or pool and returns a point-in-time `CheckResult`.
+- `GET /api/check/{address}` checks a token or pool and returns a point-in-time `CheckResult`, including token-power observations for the registry-matched pool side when available.
+- `GET /api/powers/{address}?chain={chain}` returns observed control signals and source-verification status for active issuer registry contracts. `chain` is optional: one match returns a record; matches across chains return an array. Solana `source_verified` covers the Token-2022 token-program build; EVM proxy records verify the resolved implementation source and report proxy source status separately. These statuses describe source-repository matching, not backing or issuer endorsement.
 - `POST /api/wallet` with `{"address":"…"}` in the request body checks stock-token holdings without putting an address in the URL. Results are not cached by address.
 - `GET /api/attest/{id}` returns a signed attestation JSON document.
 - `POST /verify` with an attestation JSON body returns `ok`, `cryptographic`, `trusted_signer`, `environment_match`, and `fresh` booleans.
-- `POST /mcp` exposes the check, wallet, registry lookup, and attestation verification tools over stateless Streamable HTTP.
+- `POST /mcp` exposes `qed_check`, `qed_powers`, `qed_wallet`, `qed_registry_lookup`, and `qed_verify` over stateless Streamable HTTP.
 - `GET /.well-known/qed.json` returns the public signing key and algorithm metadata.
+- `GET /.well-known/mcp/server-card.json` returns the read-only MCP server card. The repository includes an MCP registry manifest at `server.json`.
 
 For example:
 
@@ -68,7 +70,7 @@ curl https://qed.example/openapi.json
 
 ## MCP
 
-QED implements the current MCP Streamable HTTP protocol revision `2026-07-28` and advertises supported versions `["2026-07-28","2025-11-25","2025-06-18","2025-03-26"]` through `server/discover`: modern requests carry per-request protocol metadata and receive one JSON response, with no sessions or SSE streams. For compatibility with clients using the initialization lifecycle, QED answers legacy `initialize` requests for `2025-11-25`, `2025-06-18`, and `2025-03-26` without creating a session. `GET /mcp` returns `405 Method Not Allowed`.
+QED implements the current MCP Streamable HTTP protocol revision `2026-07-28` and advertises supported versions `["2026-07-28","2025-11-25","2025-06-18","2025-03-26"]` through `server/discover`: modern requests carry per-request protocol metadata and receive one JSON response, with no sessions or SSE streams. For compatibility with clients using the initialization lifecycle, QED answers legacy `initialize` requests for `2025-11-25`, `2025-06-18`, and `2025-03-26` without creating a session. `GET /mcp` returns `405 Method Not Allowed`. All tools are read-only; `qed_powers` reports observed seizure, blocking, rule-change, and source-verification signals for registered issuer contracts. Its optional `chain` filter selects one registry chain; without it, cross-chain matches are all returned. `source_verified_subject` distinguishes OSEC's Solana Token-2022 token-program build (`token_program`), a direct Sourcify-checked EVM contract (`contract`), and a resolved EVM proxy implementation (`implementation`); proxy source status is reported separately. `source_verified` describes source matching, not backing or issuer endorsement.
 
 Connect Claude Code:
 
@@ -89,9 +91,18 @@ curl -sS https://qed.example/mcp \
   -H 'Content-Type: application/json' \
   -H 'MCP-Protocol-Version: 2025-11-25' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"qed_registry_lookup","arguments":{"ticker":"NVDA"}}}'
+curl -sS https://qed.example/mcp \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'Content-Type: application/json' \
+  -H 'MCP-Protocol-Version: 2025-11-25' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"qed_powers","arguments":{"address":"REGISTERED_ISSUER_TOKEN_ADDRESS","chain":"base"}}}'
+
 ```
 
-The four tools are `qed_check`, `qed_wallet`, `qed_registry_lookup`, and `qed_verify`. QED checks whether a pool uses the stock-token contract published by its issuer. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Re-check a certificate after expiry or when the issuer registry changes.
+The five tools are `qed_check`, `qed_powers`, `qed_wallet`, `qed_registry_lookup`, and `qed_verify`. QED checks whether a pool uses the stock-token contract published by its issuer. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Re-check a certificate after expiry or when the issuer registry changes.
+
+For `qed_powers`, `structuredContent` is a `PowersRecord` object when one registered-chain match exists. If multiple chains match and `chain` is omitted, it is an object shaped as `{ "records": [ ... ] }`, never a top-level array. `GET /api/powers/{address}` retains its separate REST shape: one record or a multi-chain array.
+
 
 
 ## Human pages

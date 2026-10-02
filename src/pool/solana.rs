@@ -214,6 +214,112 @@ impl SolanaReader {
             total_supply: Some(supply.amount),
         })
     }
+    pub async fn power_facts(
+        &self,
+        address: &str,
+    ) -> Result<crate::powers::PowerFacts, PoolError> {
+        let mint = canonical_address(address)?;
+        let response: RpcContext<Option<Value>> = self
+            .rpc(
+                "getAccountInfo",
+                json!([mint, { "encoding": "jsonParsed", "commitment": "confirmed" }]),
+            )
+            .await?;
+        let account = response
+            .value
+            .ok_or_else(|| PoolError::Unknown(format!("Solana mint {mint} does not exist")))?;
+        let program_id = account
+            .get("owner")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PoolError::Reader("parsed mint response has no token program owner".to_owned()))?;
+        let program_id = canonical_address(program_id)?;
+        let mint_info = account
+            .get("data")
+            .and_then(|data| data.get("parsed"))
+            .and_then(|parsed| parsed.get("info"))
+            .ok_or_else(|| PoolError::Reader("mint account did not return parsed token data".to_owned()))?;
+        let mut facts = crate::powers::solana::analyze_mint_info(mint_info);
+        facts.source_target = Some(program_id.clone());
+
+        let program_response: RpcContext<Option<RpcAccount>> = self
+            .rpc(
+                "getAccountInfo",
+                json!([program_id, { "encoding": "base64", "commitment": "confirmed" }]),
+            )
+            .await?;
+        let Some(program_account) = program_response.value else {
+            facts.can_change_rules.push(crate::powers::Reason::new(
+                "token_program_upgrade_authority",
+                "Token program account was absent; upgrade authority classification is unknown.",
+            ));
+            return Ok(facts);
+        };
+        if program_account.owner != crate::powers::solana::UPGRADEABLE_LOADER_ID {
+            facts.can_change_rules.push(crate::powers::Reason::new(
+                "token_program_upgrade_authority",
+                format!(
+                    "Token program is owned by {}; upgrade authority classification is unknown.",
+                    program_account.owner
+                ),
+            ));
+            return Ok(facts);
+        }
+        let Some(program_data_id) =
+            crate::powers::solana::program_data_address(&program_account.data)
+        else {
+            facts.can_change_rules.push(crate::powers::Reason::new(
+                "token_program_upgrade_authority",
+                "Token program account did not contain a valid ProgramData address; classification is unknown.",
+            ));
+            return Ok(facts);
+        };
+        let program_data_response: RpcContext<Option<RpcAccount>> = self
+            .rpc(
+                "getAccountInfo",
+                json!([program_data_id, { "encoding": "base64", "commitment": "confirmed" }]),
+            )
+            .await?;
+        let Some(program_data_account) = program_data_response.value else {
+            facts.can_change_rules.push(crate::powers::Reason::new(
+                "token_program_upgrade_authority",
+                "Token program's ProgramData account was absent; upgrade authority classification is unknown.",
+            ));
+            return Ok(facts);
+        };
+        if program_data_account.owner != crate::powers::solana::UPGRADEABLE_LOADER_ID {
+            facts.can_change_rules.push(crate::powers::Reason::new(
+                "token_program_upgrade_authority",
+                "Token program's ProgramData account had an unexpected owner; upgrade authority classification is unknown.",
+            ));
+            return Ok(facts);
+        }
+        let Some(authority) =
+            crate::powers::solana::upgrade_authority(&program_data_account.data)
+        else {
+            facts.can_change_rules.push(crate::powers::Reason::new(
+                "token_program_upgrade_authority",
+                "ProgramData state did not contain a valid upgrade-authority field; classification is unknown.",
+            ));
+            return Ok(facts);
+        };
+        let authority_owner = if let Some(authority) = authority.as_deref() {
+            let response: RpcContext<Option<RpcAccount>> = self
+                .rpc(
+                    "getAccountInfo",
+                    json!([authority, { "encoding": "base64", "commitment": "confirmed" }]),
+                )
+                .await?;
+            response.value.map(|account| account.owner)
+        } else {
+            None
+        };
+        crate::powers::solana::add_program_authority_fact(
+            &mut facts,
+            authority.as_deref(),
+            authority_owner.as_deref(),
+        );
+        Ok(facts)
+    }
 
     /// Find pools where `token` is either the declared base or quote mint.
     /// Candidate quotes constrain the opposite side, so callers can ask for
@@ -488,13 +594,14 @@ impl SolanaReader {
                     "{method}: invalid JSON-RPC response: missing result; body: {body}"
                 ))
             })?;
+            let slot = Self::response_slot(method, result);
             crate::attest::record_read(
                 method,
                 request.params.clone(),
                 result,
                 method == "getAccountInfo",
                 None,
-                (method == "getSlot").then(|| result.as_u64()).flatten(),
+                slot,
             );
             return serde_json::from_value(result.clone()).map_err(|error| {
                 PoolError::Reader(format!(
@@ -504,6 +611,13 @@ impl SolanaReader {
         }
         unreachable!("RPC retry loop always returns")
     }
+
+    fn response_slot(method: &str, result: &Value) -> Option<u64> {
+    result
+        .pointer("/context/slot")
+        .and_then(Value::as_u64)
+        .or_else(|| (method == "getSlot").then(|| result.as_u64()).flatten())
+}
 
     async fn get_account_info(&self, address: &str) -> Result<Option<RpcAccount>, PoolError> {
         let response: RpcContext<Option<RpcAccount>> = self
@@ -702,6 +816,12 @@ impl PoolReader for SolanaReader {
         known_tokens: &[String],
     ) -> Result<Vec<WalletHolding>, PoolError> {
         SolanaReader::wallet_holdings(self, owner, known_tokens).await
+    }
+    async fn power_facts(
+        &self,
+        address: &str,
+    ) -> Result<crate::powers::PowerFacts, PoolError> {
+        SolanaReader::power_facts(self, address).await
     }
 
     async fn pools_for_token(
@@ -1102,6 +1222,19 @@ mod tests {
         vec![value; size]
     }
 
+
+    #[test]
+    fn reads_context_slot_from_account_responses() {
+        assert_eq!(
+            SolanaReader::response_slot(
+                "getAccountInfo",
+                &json!({"context": {"slot": 9876}, "value": null}),
+            ),
+            Some(9876)
+        );
+        assert_eq!(SolanaReader::response_slot("getSlot", &json!(9877)), Some(9877));
+        assert_eq!(SolanaReader::response_slot("getAccountInfo", &json!({"value": null})), None);
+    }
     #[test]
     fn decodes_wallet_token_account_fixture() {
         let mut data = vec![0u8; 165];

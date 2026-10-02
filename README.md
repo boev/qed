@@ -11,7 +11,7 @@ Source repository: [github.com/boev/qed](https://github.com/boev/qed). Live webs
 - **Keep an issuer registry** merged from xStocks, Ondo Global Markets, and Robinhood Chain sources (seeded, refreshed at runtime), browsable by ticker, chain, and issuer.
 - **List current contract matches**: a directory, per-pool summaries, featured pools, a ranked leaderboard with prices, and an RSS feed, with exact venue and explorer deep links.
 - **Scan a wallet** for stock-token holdings and show which contracts match the registry, without putting the address in a URL.
-- **Serve machines**: JSON API, OpenAPI 3.1, `llms.txt`/`llms-full.txt` for language models, and an MCP endpoint (`POST /mcp`) so AI agents and wallet copilots run the same check before a swap.
+- **Serve machines**: JSON API, OpenAPI 3.1, `llms.txt`/`llms-full.txt`, and a stateless MCP endpoint (`POST /mcp`) with check, token-power, wallet, registry-lookup, and attestation-verification tools. `/.well-known/mcp/server-card.json` advertises the read-only server to agent clients.
 
 What QED does **not** do: it does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement, and it does not give investment advice. A certificate proves what QED read and signed at one point in time.
 
@@ -90,7 +90,7 @@ writes reduced-motion Firefox screenshots to `/tmp/qed-crawl/`.
 
 ## API and routes
 
-The machine-readable entry points are `/llms.txt`, `/llms-full.txt`, `/openapi.json`, `/api`, and `/mcp`. `/mcp` is a stateless Streamable HTTP endpoint for the check, wallet, registry-lookup, and attestation-verification tools; it supports MCP versions `2026-07-28`, `2025-11-25`, `2025-06-18`, and `2025-03-26` (legacy initialization). The deployed service serves those paths directly. The public source repository is [github.com/boev/qed](https://github.com/boev/qed).
+The machine-readable entry points are `/llms.txt`, `/llms-full.txt`, `/openapi.json`, `/api`, `/mcp`, and `/.well-known/mcp/server-card.json`. `/mcp` is a stateless Streamable HTTP endpoint for `qed_check`, `qed_powers`, `qed_wallet`, `qed_registry_lookup`, and `qed_verify`; it supports MCP versions `2026-07-28`, `2025-11-25`, `2025-06-18`, and `2025-03-26` (legacy initialization). The deployed service serves those paths directly. The public source repository is [github.com/boev/qed](https://github.com/boev/qed).
 
 | Method | Route | Result |
 | --- | --- | --- |
@@ -107,15 +107,17 @@ The machine-readable entry points are `/llms.txt`, `/llms-full.txt`, `/openapi.j
 | POST | `/v/{id}/recheck` | Re-run the recorded reads. |
 | GET | `/api` | HTML API guide. |
 | GET | `/openapi.json` | OpenAPI 3.1 route document. |
-| POST | `/mcp` | Stateless MCP Streamable HTTP tools for checks, wallet holdings, issuer-registry lookup, and attestation verification. |
+| POST | `/mcp` | Stateless MCP Streamable HTTP tools for checks, token-power signals, wallet holdings, issuer-registry lookup, and attestation verification. |
 | GET | `/pools/featured` | Featured-pool HTML fragment/page. |
-| GET | `/api/check/{address}` | JSON check result. |
+| GET | `/api/check/{address}` | JSON check result with token-power observations for the issuer-registry-matched pool side when available. |
+| GET | `/api/powers/{address}?chain={chain}` | Observed control signals and source status; optional `chain` filters matching registry entries, otherwise multiple chain records are returned as an array. Proxy records report implementation source verification plus the proxy's separate status. |
 | POST | `/api/wallet` | JSON body `{ "address": "…" }`; check stock-token holdings without putting the address in the URL. |
 | GET | `/api/attest/{id}` | Signed attestation JSON. |
 | GET | `/api/registry`, `/api/pools/featured` | Registry and featured pool JSON. |
 | GET | `/api/leaderboard`, `/api/prices`, `/api/status` | Ranked pools, prices, and freshness state. |
 | POST | `/verify` | Verify an attestation payload and signature. |
 | GET | `/.well-known/qed.json` | Public signer metadata and key. |
+| GET | `/.well-known/mcp/server-card.json` | Read-only MCP server card with remote endpoint and tool summaries. |
 | GET | `/healthz` | Service health. |
 | GET | `/imprint`, `/privacy`, `/terms` | Legal pages. |
 | GET | `/robots.txt`, `/sitemap.xml` | Crawler metadata. |

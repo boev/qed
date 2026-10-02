@@ -244,7 +244,7 @@ fi
 printf 'hero-open DOM/CSS check passed\n'
 
 # Fragment, metadata, discoverability, and API routes are status-checked separately.
-for path in /registry/table /pools/featured /robots.txt /sitemap.xml /validated.xml /llms.txt /llms-full.txt /api /openapi.json /api/registry /api/pools/featured /api/leaderboard /api/prices /api/status; do
+for path in /registry/table /pools/featured /robots.txt /sitemap.xml /validated.xml /llms.txt /llms-full.txt /api /openapi.json /api/registry /api/pools/featured /api/leaderboard /api/prices /api/status /.well-known/mcp/server-card.json; do
   code="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE$path")"
   [[ "$code" == "200" ]] || { printf 'FAIL %s: HTTP %s\n' "$path" "$code" >&2; exit 1; }
   printf 'status %s %s\n' "$code" "$path"
@@ -254,8 +254,8 @@ verify_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type:
 printf 'status %s POST /verify\n' "$verify_code"
 mcp_body="$(curl -fsS -X POST -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' --data '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' "$BASE/mcp")"
 mcp_names="$(jq -c '[.result.tools[].name] | sort' <<<"$mcp_body")"
-[[ "$mcp_names" == '["qed_check","qed_registry_lookup","qed_verify","qed_wallet"]' ]] || { printf 'FAIL /mcp: unexpected tool list %s\n' "$mcp_names" >&2; exit 1; }
-printf 'status 200 POST /mcp; four MCP tools listed\n'
+[[ "$mcp_names" == '["qed_check","qed_powers","qed_registry_lookup","qed_verify","qed_wallet"]' ]] || { printf 'FAIL /mcp: unexpected tool list %s\n' "$mcp_names" >&2; exit 1; }
+printf 'status 200 POST /mcp; five MCP tools listed\n'
 for removed_path in /seal /badge; do
   code="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE$removed_path")"
   [[ "$code" == "404" ]] || { printf 'FAIL %s: HTTP %s\n' "$removed_path" "$code" >&2; exit 1; }

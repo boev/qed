@@ -75,6 +75,11 @@ pub(crate) struct LeaderboardQuery {
     dir: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct PowersQuery {
+    chain: Option<String>,
+}
+
 fn metric(entry: &LeaderboardEntry, sort: &str) -> Option<f64> {
     match sort {
         "change" => entry.change_24h_pct,
@@ -225,6 +230,31 @@ pub(crate) async fn api_check(
     }
     Ok(Json(check::check(&state, address).await))
 }
+pub(crate) async fn api_powers(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    Query(query): Query<PowersQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let chain = match query.chain.as_deref() {
+        Some(chain) => Some(crate::chain::Chain::parse(chain).ok_or(StatusCode::BAD_REQUEST)?),
+        None => None,
+    };
+    match crate::powers::for_registered(&state, &address, chain).await {
+        Ok(mut records) => {
+            let value = if records.len() == 1 {
+                serde_json::to_value(records.pop().expect("one powers record"))
+            } else {
+                serde_json::to_value(records)
+            }
+            .expect("powers records serialize");
+            Ok(Json(value))
+        }
+        Err(crate::powers::LookupError::InvalidAddress) => Err(StatusCode::BAD_REQUEST),
+        Err(crate::powers::LookupError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(crate::powers::LookupError::ReadFailed) => Err(StatusCode::BAD_GATEWAY),
+    }
+}
+
 
 pub(crate) async fn api_wallet(
     State(state): State<AppState>,
@@ -291,7 +321,15 @@ mod tests {
             )),
             readers: std::sync::Arc::new(Vec::new()),
             http: reqwest::Client::new(),
+            source_http: reqwest::Client::new(),
             check_cache: moka::future::Cache::builder().build(),
+            powers_cache: moka::future::Cache::builder().build(),
+            powers_retry_cache: moka::future::Cache::builder().build(),
+            powers_failure_cache: moka::future::Cache::builder().build(),
+            powers_locks: moka::future::Cache::builder().build(),
+            powers_prefetching: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             leaderboard_check_cache: moka::future::Cache::builder().build(),
             check_inflight: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -323,9 +361,91 @@ mod tests {
             usage_stats: std::sync::Arc::new(crate::state::UsageStats::new()),
             rate_limiter: std::sync::Arc::new(crate::state::RateLimiter::default()),
             expensive_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(32)),
+            powers_prefetch_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
             wallet_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             registry_api_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
         }
+    }
+
+    #[tokio::test]
+    async fn powers_api_returns_all_registered_chain_records_or_a_filtered_record() {
+        let address = "0x0000000000000000000000000000000000000011";
+        let state = test_state(false);
+        *state.registry.write().await = [crate::chain::Chain::RobinhoodChain, crate::chain::Chain::Base]
+            .into_iter()
+            .map(|chain| crate::registry::Entry {
+                issuer: "Issuer".to_owned(),
+                ticker: "NVDA".to_owned(),
+                name: "Issuer NVDA".to_owned(),
+                chain,
+                contract: address.to_owned(),
+                decimals: Some(18),
+                source: "test".to_owned(),
+                source_url: "https://issuer.example".to_owned(),
+                last_checked: crate::registry::now_rfc3339(),
+                removed_at: None,
+                stale_since: None,
+            })
+            .collect();
+        let version = current_registry_version();
+        for chain in [crate::chain::Chain::RobinhoodChain, crate::chain::Chain::Base] {
+            state
+                .powers_cache
+                .insert(
+                    (chain, address.to_owned(), version),
+                    crate::powers::PowersRecord {
+                        chain,
+                        contract: address.to_owned(),
+                        can_seize: Vec::new(),
+                        can_block: Vec::new(),
+                        can_change_rules: Vec::new(),
+                        unavailable: Vec::new(),
+                        source_verified_subject: crate::powers::SourceVerifiedSubject::Contract,
+                        source_verified: crate::powers::SourceVerified::None,
+                        source_verified_proxy: None,
+                        observed_at: "2026-01-01T00:00:00Z".to_owned(),
+                        block: Some(42),
+                        slot: None,
+                        reads: Vec::new(),
+                    },
+                )
+                .await;
+        }
+
+        let app = crate::web::router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/powers/{address}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("multi-chain powers response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let all: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            all.as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["chain"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["RobinhoodChain", "Base"]
+        );
+
+        let response = app
+            .oneshot(
+                Request::get(format!("/api/powers/{address}?chain=base"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("filtered powers response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let filtered: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(filtered["chain"], "Base");
     }
     fn entry(pool: &str, rank: usize, volume: Option<f64>, price: Option<f64>) -> LeaderboardEntry {
         LeaderboardEntry {
@@ -583,6 +703,60 @@ mod tests {
         let result = api_check(State(test_state(false)), Path("not-an-address".to_owned())).await;
         assert!(matches!(result, Err(StatusCode::BAD_REQUEST)));
     }
+    #[tokio::test]
+    async fn powers_api_routes_invalid_and_unregistered_contracts_without_chain_reads() {
+        let app = crate::web::router(test_state(false));
+        for (address, expected) in [
+            ("not-an-address", StatusCode::BAD_REQUEST),
+            ("0x0000000000000000000000000000000000000001", StatusCode::NOT_FOUND),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/api/powers/{address}"))
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("powers API response");
+            assert_eq!(response.status(), expected);
+        }
+    }
+    #[tokio::test]
+    async fn mcp_legacy_tools_are_counted_from_the_bounded_json_body() {
+        let state = test_state(false);
+        let app = crate::web::router(state.clone());
+        for name in ["qed_check", "qed_wallet"] {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": { "address": "not-an-address" } }
+            })
+            .to_string();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/mcp")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::CONTENT_LENGTH, body.len().to_string())
+                        .body(Body::from(body))
+                        .expect("MCP request"),
+                )
+                .await
+                .expect("MCP response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 64 * 1024).await.expect("MCP tool body");
+            let value: serde_json::Value = serde_json::from_slice(&body).expect("JSON-RPC response");
+            assert_eq!(value["result"]["isError"], true);
+        }
+        let metrics = state.usage_stats.snapshot();
+        assert_eq!(metrics.checks, 1);
+        assert_eq!(metrics.wallet_requests, 1);
+    }
+
 
     #[tokio::test]
     async fn registry_api_reuses_etag_for_unchanged_snapshot() {

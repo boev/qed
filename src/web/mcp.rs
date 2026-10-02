@@ -98,6 +98,7 @@ pub(crate) async fn handle(
                     StatusCode::OK,
                 );
             };
+            state.usage_stats.record_mcp_tool(name);
             let Some(arguments) = params.get("arguments").filter(|value| value.is_object()) else {
                 return rpc_error(
                     id,
@@ -248,7 +249,9 @@ fn tool_table() -> Value {
     json!([
         {
             "name": "qed_check",
+            "title": "Check issuer contract match",
             "description": "Check whether a pool or token address matches an issuer's published stock-token contract. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -258,8 +261,24 @@ fn tool_table() -> Value {
             },
         },
         {
+            "name": "qed_powers",
+            "title": "Read token powers",
+            "description": "Read supported token authority settings and source-verification status for an active issuer registry contract. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Active issuer registry token contract address." },
+                    "chain": { "type": "string", "enum": ["solana", "robinhood", "base", "ethereum", "bnb"], "description": "Optional chain filter when the address is registered on more than one chain." }
+                },
+                "required": ["address"],
+            },
+        },
+        {
             "name": "qed_wallet",
+            "title": "Read wallet holdings",
             "description": "Read stock-token holdings for a wallet address. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -270,7 +289,9 @@ fn tool_table() -> Value {
         },
         {
             "name": "qed_registry_lookup",
+            "title": "Look up issuer contracts",
             "description": "Look up active issuer registry contracts for a ticker. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -281,7 +302,9 @@ fn tool_table() -> Value {
         },
         {
             "name": "qed_verify",
+            "title": "Verify QED certificate",
             "description": "Verify an attestation's signature, trusted signer, environment and freshness. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -291,6 +314,33 @@ fn tool_table() -> Value {
             },
         },
     ])
+}
+
+pub(crate) async fn server_card(State(state): State<AppState>) -> Json<Value> {
+    let tools = tool_table()
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|tool| {
+            json!({
+                "name": tool["name"],
+                "title": tool["title"],
+                "description": tool["description"],
+            })
+        })
+        .collect::<Vec<_>>();
+    let website = state.public_url.trim_end_matches('/');
+    Json(json!({
+        "name": "QED",
+        "description": "Read-only checks of whether a pool uses the stock-token contract published by its issuer. This does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
+        "serverInfo": { "name": "QED", "version": env!("CARGO_PKG_VERSION") },
+        "remotes": [{ "type": "streamable-http", "url": format!("{website}/mcp") }],
+        "tools": tools,
+        "website": website,
+        "repository": "https://github.com/boev/qed",
+        "readOnly": true,
+        "readOnlyStatement": "All QED tools are read-only; they do not submit transactions or change chain state."
+    }))
 }
 
 async fn run_tool(state: &AppState, name: &str, arguments: &Value) -> Value {
@@ -317,6 +367,56 @@ async fn run_tool(state: &AppState, name: &str, arguments: &Value) -> Value {
             match serde_json::to_value(result) {
                 Ok(payload) => tool_result(payload, text, false),
                 Err(_) => tool_error("QED could not serialize the check result."),
+            }
+        }
+        "qed_powers" => {
+            let Some(address) = string_argument(arguments, "address") else {
+                return tool_error("address must be a string");
+            };
+            if !check::valid_public_input(address) {
+                return tool_error("Address is not a supported token contract.");
+            }
+            let chain = match arguments.get("chain").and_then(Value::as_str) {
+                Some(chain) => crate::chain::Chain::parse(chain),
+                None => None,
+            };
+            match crate::powers::for_registered(state, address, chain).await {
+                Ok(records) => {
+                    let text = if records.len() == 1 {
+                        let record = &records[0];
+                        let proxy_status = record
+                            .source_verified_proxy
+                            .map(|status| format!(" Proxy source is {}.", status.as_str()))
+                            .unwrap_or_default();
+                        format!(
+                            "Observed {} seize facts, {} transfer-blocking facts, and {} rule-change facts for {} on {}; {} is {}.{}",
+                            record.can_seize.len(),
+                            record.can_block.len(),
+                            record.can_change_rules.len(),
+                            record.contract,
+                            record.chain,
+                            record.source_verified_subject.label(),
+                            record.source_verified.as_str(),
+                            proxy_status
+                        )
+                    } else {
+                        format!(
+                            "Observed token powers for {} active registry contracts on multiple chains.",
+                            records.len()
+                        )
+                    };
+                    let payload = powers_structured_content(records);
+                    tool_result(payload, text, false)
+                }
+                Err(crate::powers::LookupError::InvalidAddress) => {
+                    tool_error("Address is not a supported token contract.")
+                }
+                Err(crate::powers::LookupError::NotFound) => {
+                    tool_error("Address is not an active issuer registry contract.")
+                }
+                Err(crate::powers::LookupError::ReadFailed) => {
+                    tool_error("QED could not complete the supported powers reads.")
+                }
             }
         }
         "qed_wallet" => {
@@ -381,9 +481,16 @@ async fn run_tool(state: &AppState, name: &str, arguments: &Value) -> Value {
     }
 }
 
+fn powers_structured_content(mut records: Vec<crate::powers::PowersRecord>) -> Value {
+    if records.len() == 1 {
+        return json!(records.pop().expect("one powers record"));
+    }
+    json!({ "records": records })
+}
+
 fn validate_tool_arguments(name: &str, arguments: &Value) -> Result<(), &'static str> {
     let string_field = match name {
-        "qed_check" | "qed_wallet" => Some("address"),
+        "qed_check" | "qed_powers" | "qed_wallet" => Some("address"),
         "qed_registry_lookup" => Some("ticker"),
         _ => None,
     };
@@ -391,6 +498,16 @@ fn validate_tool_arguments(name: &str, arguments: &Value) -> Result<(), &'static
         && !arguments.get(field).is_some_and(Value::is_string)
     {
         return Err("Invalid params: required tool argument must be a string");
+    }
+    if name == "qed_powers"
+        && arguments.get("chain").is_some_and(|chain| {
+            !chain
+                .as_str()
+                .and_then(crate::chain::Chain::parse)
+                .is_some()
+        })
+    {
+        return Err("Invalid params: chain must be a supported chain name");
     }
     if name == "qed_verify" && !arguments.get("attestation").is_some_and(Value::is_object) {
         return Err("Invalid params: attestation must be an object");
@@ -489,7 +606,15 @@ mod tests {
             )),
             readers: std::sync::Arc::new(Vec::new()),
             http: reqwest::Client::new(),
+            source_http: reqwest::Client::new(),
             check_cache: moka::future::Cache::builder().build(),
+            powers_cache: moka::future::Cache::builder().build(),
+            powers_retry_cache: moka::future::Cache::builder().build(),
+            powers_failure_cache: moka::future::Cache::builder().build(),
+            powers_locks: moka::future::Cache::builder().build(),
+            powers_prefetching: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             leaderboard_check_cache: moka::future::Cache::builder().build(),
             check_inflight: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             featured: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -516,6 +641,7 @@ mod tests {
             usage_stats: std::sync::Arc::new(crate::state::UsageStats::new()),
             rate_limiter: std::sync::Arc::new(crate::state::RateLimiter::default()),
             expensive_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(32)),
+            powers_prefetch_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
             wallet_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             registry_api_concurrency: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
         }
@@ -535,6 +661,58 @@ mod tests {
             removed_at: None,
             stale_since: None,
         }
+    }
+
+    fn powers_record(chain: crate::chain::Chain, contract: &str) -> crate::powers::PowersRecord {
+        crate::powers::PowersRecord {
+            chain,
+            contract: contract.to_owned(),
+            can_seize: Vec::new(),
+            can_block: Vec::new(),
+            can_change_rules: Vec::new(),
+            unavailable: Vec::new(),
+            source_verified_subject: crate::powers::SourceVerifiedSubject::Contract,
+            source_verified: crate::powers::SourceVerified::None,
+            source_verified_proxy: None,
+            observed_at: "2026-10-02T00:00:00Z".to_owned(),
+            block: None,
+            slot: None,
+            reads: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn powers_tool_wraps_multi_chain_records_in_an_object() {
+        let single = tool_result(
+            powers_structured_content(vec![powers_record(
+                crate::chain::Chain::Base,
+                "0x0000000000000000000000000000000000000001",
+            )]),
+            "single".to_owned(),
+            false,
+        );
+        assert_eq!(
+            single["structuredContent"]["contract"],
+            "0x0000000000000000000000000000000000000001"
+        );
+        assert!(single["structuredContent"]["records"].is_null());
+
+        let multiple = tool_result(
+            powers_structured_content(vec![
+                powers_record(
+                    crate::chain::Chain::Base,
+                    "0x0000000000000000000000000000000000000001",
+                ),
+                powers_record(
+                    crate::chain::Chain::RobinhoodChain,
+                    "0x0000000000000000000000000000000000000001",
+                ),
+            ]),
+            "multiple".to_owned(),
+            false,
+        );
+        assert!(multiple["structuredContent"].is_object());
+        assert_eq!(multiple["structuredContent"]["records"].as_array().unwrap().len(), 2);
     }
 
     async fn post_rpc(method: &str, params: Value) -> Response {
@@ -685,16 +863,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_has_four_complete_schemas() {
+    async fn tools_list_has_five_complete_read_only_schemas() {
         let value = response_json(post_rpc("tools/list", json!({})).await).await;
         let tools = value["result"]["tools"].as_array().expect("tools array");
         let names: Vec<_> = tools.iter().filter_map(|tool| tool["name"].as_str()).collect();
-        assert_eq!(names, ["qed_check", "qed_wallet", "qed_registry_lookup", "qed_verify"]);
-        for (tool, field) in tools.iter().zip(["address", "address", "ticker", "attestation"]) {
+        assert_eq!(
+            names,
+            ["qed_check", "qed_powers", "qed_wallet", "qed_registry_lookup", "qed_verify"]
+        );
+        for (tool, field) in tools
+            .iter()
+            .zip(["address", "address", "address", "ticker", "attestation"])
+        {
             assert_eq!(tool["inputSchema"]["type"], "object");
             assert_eq!(tool["inputSchema"]["required"][0], field);
+            assert!(tool["title"].as_str().is_some_and(|title| !title.is_empty()));
+            assert_eq!(tool["annotations"]["readOnlyHint"], true);
+            assert_eq!(tool["annotations"]["destructiveHint"], false);
+            assert_eq!(tool["annotations"]["idempotentHint"], true);
+            assert_eq!(tool["annotations"]["openWorldHint"], true);
             assert!(tool["description"].as_str().unwrap().contains(NON_CLAIMS));
         }
+        assert_eq!(
+            tools[1]["inputSchema"]["properties"]["chain"]["enum"],
+            json!(["solana", "robinhood", "base", "ethereum", "bnb"])
+        );
+        assert_eq!(tools[1]["inputSchema"]["required"], json!(["address"]));
+    }
+    #[tokio::test]
+    async fn static_server_card_describes_the_public_read_only_remote() {
+        let response = crate::web::router(test_state())
+            .oneshot(
+                Request::get("/.well-known/mcp/server-card.json")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("server card response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = response_json(response).await;
+        assert_eq!(value["name"], "QED");
+        assert_eq!(value["serverInfo"]["name"], "QED");
+        assert_eq!(value["remotes"][0]["type"], "streamable-http");
+        assert_eq!(value["remotes"][0]["url"], "http://localhost:3000/mcp");
+        assert_eq!(value["readOnly"], true);
+        assert!(value["readOnlyStatement"].as_str().unwrap().contains("read-only"));
+        assert_eq!(value["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
+        let manifest: Value =
+            serde_json::from_str(include_str!("../../server.json")).expect("manifest JSON");
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["tools"].as_array().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn powers_tool_invalid_address_returns_a_tool_error() {
+        let response = post_modern_rpc(
+            "tools/call",
+            json!({ "name": "qed_powers", "arguments": { "address": "not-an-address" } }),
+        )
+        .await;
+        let value = response_json(response).await;
+        assert_eq!(value["result"]["isError"], true);
+        assert!(
+            value["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("not a supported")
+        );
+    }
+
+    #[tokio::test]
+    async fn powers_tool_rejects_unknown_chain_as_invalid_params() {
+        let response = post_modern_rpc(
+            "tools/call",
+            json!({
+                "name": "qed_powers",
+                "arguments": {
+                    "address": "0x0000000000000000000000000000000000000001",
+                    "chain": "avalanche"
+                }
+            }),
+        )
+        .await;
+        let value = response_json(response).await;
+        assert_eq!(value["error"]["code"], -32602);
     }
 
     #[tokio::test]

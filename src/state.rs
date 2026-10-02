@@ -10,7 +10,7 @@ use chrono::{SecondsFormat, Utc};
 use ed25519_dalek::SigningKey;
 use moka::future::Cache;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock as StdRwLock, Weak};
@@ -163,6 +163,13 @@ impl UsageStats {
         }
     }
 
+    pub(crate) fn record_mcp_tool(&self, name: &str) {
+        if matches!(name, "qed_check" | "qed_powers" | "qed_verify") {
+            self.checks.fetch_add(1, Ordering::Relaxed);
+        } else if name == "qed_wallet" {
+            self.wallet_requests.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     pub(crate) fn record_html_page_view(&self) {
         self.html_page_views.fetch_add(1, Ordering::Relaxed);
     }
@@ -288,7 +295,13 @@ pub struct AppState {
     pub registry_status: Arc<RwLock<RegistrySnapshot>>,
     pub readers: Arc<Vec<Box<dyn PoolReader>>>,
     pub http: reqwest::Client,
+    pub source_http: reqwest::Client,
     pub check_cache: Cache<String, CachedCheckResult>,
+    pub powers_cache: Cache<PowersCacheKey, crate::powers::PowersRecord>,
+    pub powers_retry_cache: Cache<PowersCacheKey, crate::powers::PowersRecord>,
+    pub powers_failure_cache: Cache<PowersCacheKey, ()>,
+    pub powers_locks: Cache<PowersCacheKey, Arc<tokio::sync::Mutex<()>>>,
+    pub powers_prefetching: Arc<tokio::sync::Mutex<HashSet<PowersCacheKey>>>,
     pub leaderboard_check_cache: Cache<(crate::chain::Chain, String), CheckResult>,
     pub check_inflight: Arc<CheckInFlight>,
     pub featured: Arc<RwLock<Vec<FeaturedPool>>>,
@@ -307,9 +320,12 @@ pub struct AppState {
     pub usage_stats: Arc<UsageStats>,
     pub rate_limiter: Arc<RateLimiter>,
     pub expensive_concurrency: Arc<tokio::sync::Semaphore>,
+    pub powers_prefetch_concurrency: Arc<tokio::sync::Semaphore>,
     pub wallet_concurrency: Arc<tokio::sync::Semaphore>,
     pub registry_api_concurrency: Arc<tokio::sync::Semaphore>,
 }
+
+pub type PowersCacheKey = (crate::chain::Chain, String, u64);
 
 const REQUEST_WINDOW: Duration = Duration::from_secs(60);
 const REQUEST_PRUNE_INTERVAL: Duration = Duration::from_secs(10);

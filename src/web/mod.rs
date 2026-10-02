@@ -19,7 +19,7 @@ mod openapi;
 mod pages;
 mod views;
 pub(crate) use api::{
-    admin_stats, api_attestation, api_check, api_featured, api_leaderboard, api_prices,
+    admin_stats, api_attestation, api_check, api_featured, api_leaderboard, api_powers, api_prices,
     api_registry, api_status, api_wallet, healthz, verify_attestation, well_known,
 };
 pub(crate) use discoverability::{api_docs, llms, llms_full, validated_feed};
@@ -77,6 +77,7 @@ pub fn router(state: AppState) -> Router {
         .route("/llms.txt", get(llms))
         .route("/llms-full.txt", get(llms_full))
         .route("/api", get(api_docs))
+        .route("/.well-known/mcp/server-card.json", get(mcp::server_card))
         .route("/mcp", post(mcp::handle))
         .route("/openapi.json", get(openapi::document))
         .route("/pools/featured", get(featured))
@@ -88,6 +89,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/prices", get(api_prices))
         .route("/api/status", get(api_status))
         .route("/api/check/{address}", get(api_check))
+        .route("/api/powers/{address}", get(api_powers))
         .route("/api/wallet", post(api_wallet))
         .route("/api/attest/{id}", get(api_attestation))
         .route("/verify", post(verify_attestation))
@@ -152,19 +154,13 @@ async fn usage_metrics(
     let path = request.uri().path();
     let method = request.method();
     let is_mcp = path == "/mcp";
-    let mcp_name = if is_mcp {
-        request.headers().get("Mcp-Name").and_then(|value| value.to_str().ok())
-    } else {
-        None
-    };
     let is_admin = path == "/admin/stats";
     let is_api = path == "/api" || path.starts_with("/api/") || is_mcp;
     let is_check = (method == Method::GET && path.starts_with("/api/check/"))
+        || (method == Method::GET && path.starts_with("/api/powers/"))
         || (method == Method::POST && (path == "/check" || path == "/verify"))
-        || (method == Method::POST && path.starts_with("/v/") && path.ends_with("/recheck"))
-        || (is_mcp && matches!(mcp_name, Some("qed_check" | "qed_verify")));
-    let is_wallet =
-        path == "/wallet" || path == "/api/wallet" || (is_mcp && mcp_name == Some("qed_wallet"));
+        || (method == Method::POST && path.starts_with("/v/") && path.ends_with("/recheck"));
+    let is_wallet = path == "/wallet" || path == "/api/wallet";
     let is_health = path == "/healthz";
     let is_static_asset = path == "/static" || path.starts_with("/static/");
     state
@@ -195,6 +191,7 @@ async fn rate_limit(
     let is_expensive = (request.method() == Method::POST && path == "/mcp")
         || (request.method() == Method::POST && path == "/check")
         || path.starts_with("/api/check/")
+        || path.starts_with("/api/powers/")
         || path == "/verify"
         || (request.method() == Method::GET
             && (path.starts_with("/validated/") || path.starts_with("/v/")))

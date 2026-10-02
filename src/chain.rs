@@ -43,6 +43,17 @@ impl Chain {
         };
         hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
     }
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().replace(['-', '_', ' '], "").as_str() {
+            "solana" => Some(Self::Solana),
+            "robinhood" | "robinhoodchain" | "rh" => Some(Self::RobinhoodChain),
+            "base" => Some(Self::Base),
+            "ethereum" | "eth" => Some(Self::Ethereum),
+            "bnb" | "bnbchain" | "binance" => Some(Self::Bnb),
+            _ => None,
+        }
+    }
+
 }
 
 impl fmt::Display for Chain {
@@ -91,6 +102,22 @@ mod tests {
         assert_eq!(Chain::detect("0x0000000000000000000000000000000000000001"), None);
     }
 
+
+    #[test]
+    fn parses_power_chain_filters_and_aliases() {
+        for (input, expected) in [
+            ("solana", Chain::Solana),
+            ("Robinhood Chain", Chain::RobinhoodChain),
+            ("robinhood-chain", Chain::RobinhoodChain),
+            ("rh", Chain::RobinhoodChain),
+            ("base", Chain::Base),
+            ("eth", Chain::Ethereum),
+            ("BNB Chain", Chain::Bnb),
+        ] {
+            assert_eq!(Chain::parse(input), Some(expected), "{input}");
+        }
+        assert_eq!(Chain::parse("avalanche"), None);
+    }
     #[test]
     fn rejects_malformed_addresses() {
         assert_eq!(Chain::detect("not-an-address"), None);

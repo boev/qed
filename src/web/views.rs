@@ -518,10 +518,41 @@ pub(crate) struct DirectoryContractView {
     pub(crate) issuer: String,
     pub(crate) ticker: String,
     pub(crate) chain: String,
+    pub(crate) chain_kind: Chain,
     pub(crate) chain_icon: &'static str,
     pub(crate) contract: String,
     pub(crate) explorer_url: String,
     pub(crate) source_url: String,
+    pub(crate) powers: DirectoryPowersView,
+}
+
+#[derive(Debug)]
+pub(crate) struct DirectoryPowersView {
+    pub(crate) available: bool,
+    pub(crate) can_seize: Vec<String>,
+    pub(crate) can_block: Vec<String>,
+    pub(crate) can_change_rules: Vec<String>,
+    pub(crate) unavailable: Vec<String>,
+    pub(crate) source_verified_subject: String,
+    pub(crate) source_verified: String,
+    pub(crate) source_verified_proxy: String,
+    pub(crate) observed_at: String,
+}
+
+impl DirectoryPowersView {
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            available: false,
+            can_seize: Vec::new(),
+            can_block: Vec::new(),
+            can_change_rules: Vec::new(),
+            unavailable: Vec::new(),
+            source_verified_proxy: String::new(),
+            source_verified_subject: "Source verification".to_owned(),
+            source_verified: "Unavailable".to_owned(),
+            observed_at: String::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1287,14 +1318,7 @@ fn format_share(value: f64) -> String {
     }
 }
 pub(crate) fn parse_chain(value: &str) -> Option<Chain> {
-    match value.to_ascii_lowercase().replace(['-', '_', ' '], "").as_str() {
-        "solana" => Some(Chain::Solana),
-        "robinhood" | "robinhoodchain" | "rh" => Some(Chain::RobinhoodChain),
-        "base" => Some(Chain::Base),
-        "ethereum" | "eth" => Some(Chain::Ethereum),
-        "bnb" | "bnbchain" | "binance" => Some(Chain::Bnb),
-        _ => None,
-    }
+    Chain::parse(value)
 }
 
 pub(crate) fn chain_slug(chain: Chain) -> &'static str {

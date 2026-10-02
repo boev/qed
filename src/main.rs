@@ -5,6 +5,7 @@ mod config;
 mod discovery;
 mod net;
 mod pool;
+mod powers;
 mod registry;
 mod state;
 mod web;
@@ -93,9 +94,23 @@ async fn main() -> Result<()> {
         .build()
         .context("building HTTP client")?;
 
+    let source_http = reqwest::Client::builder()
+        .user_agent("qed/0.1")
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building source verification HTTP client")?;
+
     let registry_hash_state = Arc::new(StdRwLock::new(registry_hash));
     let check_cache =
         Cache::builder().max_capacity(10_000).time_to_live(Duration::from_secs(30)).build();
+    let powers_cache: Cache<
+        (crate::chain::Chain, String, u64),
+        crate::powers::PowersRecord,
+    > = Cache::builder()
+        .max_capacity(10_000)
+        .time_to_live(Duration::from_secs(30 * 60))
+        .build();
     let registry_endpoints = RegistryEndpoints {
         xstocks: config.registry_xstocks_url.clone(),
         ondo: config.registry_ondo_url.clone(),
@@ -110,6 +125,7 @@ async fn main() -> Result<()> {
             &registry_hash_state,
             &registry_status,
             &check_cache,
+            &powers_cache,
             &registry_endpoints,
         )
         .await;
@@ -242,7 +258,22 @@ async fn main() -> Result<()> {
         registry_status: Arc::clone(&registry_status),
         readers: Arc::new(configured_readers),
         http: client.clone(),
+        source_http,
         check_cache: check_cache.clone(),
+        powers_cache: powers_cache.clone(),
+        powers_retry_cache: Cache::builder()
+            .max_capacity(10_000)
+            .time_to_live(Duration::from_secs(30))
+            .build(),
+        powers_failure_cache: Cache::builder()
+            .max_capacity(10_000)
+            .time_to_live(Duration::from_secs(30))
+            .build(),
+        powers_locks: Cache::builder()
+            .max_capacity(10_000)
+            .time_to_live(Duration::from_secs(30 * 60))
+            .build(),
+        powers_prefetching: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         leaderboard_check_cache: Cache::builder()
             .time_to_live(Duration::from_secs(30 * 60))
             .build(),
@@ -265,6 +296,7 @@ async fn main() -> Result<()> {
         usage_stats,
         rate_limiter: Arc::clone(&rate_limiter),
         expensive_concurrency: Arc::new(tokio::sync::Semaphore::new(32)),
+        powers_prefetch_concurrency: Arc::new(tokio::sync::Semaphore::new(2)),
         wallet_concurrency: Arc::new(tokio::sync::Semaphore::new(1)),
         registry_api_concurrency: Arc::new(tokio::sync::Semaphore::new(4)),
     };
@@ -292,6 +324,7 @@ async fn main() -> Result<()> {
     let refresh_hash_state = registry_hash_state.clone();
     let refresh_status_state = Arc::clone(&registry_status);
     let refresh_check_cache = check_cache.clone();
+    let refresh_powers_cache = powers_cache.clone();
     let refresh_endpoints = registry_endpoints.clone();
     tokio::spawn(async move {
         let mut interval =
@@ -305,6 +338,7 @@ async fn main() -> Result<()> {
                 &refresh_hash_state,
                 &refresh_status_state,
                 &refresh_check_cache,
+                &refresh_powers_cache,
                 &refresh_endpoints,
             )
             .await;
@@ -426,6 +460,10 @@ async fn refresh_registry(
     registry_hash: &Arc<StdRwLock<String>>,
     registry_status: &Arc<RwLock<discovery::RegistrySnapshot>>,
     check_cache: &Cache<String, CachedCheckResult>,
+    powers_cache: &Cache<
+        (crate::chain::Chain, String, u64),
+        crate::powers::PowersRecord,
+    >,
     endpoints: &RegistryEndpoints,
 ) {
     {
@@ -478,6 +516,7 @@ async fn refresh_registry(
         // replaced registry snapshot.
         advance_registry_version();
         check_cache.invalidate_all();
+        powers_cache.invalidate_all();
     }
 
     let snapshot = registry.clone();
