@@ -4,6 +4,17 @@ QED is a read-only contract-to-issuer-registry checker and directory for stock-p
 
 Source repository: [github.com/boev/qed](https://github.com/boev/qed). Live website: [qed.web3-energy.com](https://qed.web3-energy.com).
 
+## What QED can do
+
+- **Check a pool or token address** on Solana, Robinhood Chain, Base, Ethereum, or BNB Chain and report whether the quote token is the contract the issuer published. Verdicts: Verified, Mismatch, No match, or Unknown with the reason. Every check lists its evidence: chain detection, the pool and its sides, token metadata, supply share, and the registry entries compared.
+- **Issue a signed certificate** for a check: canonical JSON, SHA-256 identifier, Ed25519 signature, registry hash and expiry, chain position of each read. Anyone can verify it with `POST /verify` and the published key at `/.well-known/qed.json`, or re-run the reads with **Re-check**.
+- **Keep an issuer registry** merged from xStocks, Ondo Global Markets, and Robinhood Chain sources (seeded, refreshed at runtime), browsable by ticker, chain, and issuer.
+- **List current contract matches**: a directory, per-pool summaries, featured pools, a ranked leaderboard with prices, and an RSS feed, with exact venue and explorer deep links.
+- **Scan a wallet** for stock-token holdings and show which contracts match the registry, without putting the address in a URL.
+- **Serve machines**: JSON API, OpenAPI 3.1, `llms.txt`/`llms-full.txt` for language models, and an MCP endpoint (`POST /mcp`) so AI agents and wallet copilots run the same check before a swap.
+
+What QED does **not** do: it does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement, and it does not give investment advice. A certificate proves what QED read and signed at one point in time.
+
 ## How a check works
 
 - Detect the address as Solana, an EVM address, or a strict Uniswap v4 pool ID.
