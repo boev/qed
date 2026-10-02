@@ -41,6 +41,10 @@
         <a class="button secondary-button" href="{{ contract.explorer_url }}" target="_blank" rel="noopener noreferrer">Explorer <span aria-hidden="true">↗</span></a>
         <a class="button secondary-button" href="{{ contract.source_url }}" target="_blank" rel="noopener noreferrer">Issuer source <span aria-hidden="true">↗</span></a>
       </div>
+      <div class="powers-summary" role="group" aria-label="Token control signals">
+        {% for badge in contract.powers.summary_badges %}<span class="count-badge">{{ badge }}</span>{% endfor %}
+        <span class="count-badge">{{ contract.powers.source_badge }}</span>
+      </div>
       <details class="powers-panel">
         <summary>Observed token-control signals</summary>
         {% if contract.powers.available %}

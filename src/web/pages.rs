@@ -622,6 +622,30 @@ fn powers_view(record: crate::powers::PowersRecord) -> DirectoryPowersView {
             crate::powers::SourceVerified::Unavailable => "Unavailable",
         }
     }
+    let has_control_signals = !record.can_seize.is_empty()
+        || !record.can_block.is_empty()
+        || !record.can_change_rules.is_empty();
+    let mut summary_badges = Vec::with_capacity(4);
+    if !record.can_seize.is_empty() {
+        summary_badges.push("Can seize".to_owned());
+    }
+    if !record.can_block.is_empty() {
+        summary_badges.push("Can block".to_owned());
+    }
+    if !record.can_change_rules.is_empty() {
+        summary_badges.push("Can change rules".to_owned());
+    }
+    if !record.unavailable.is_empty() {
+        summary_badges.push("Signals unavailable (transient)".to_owned());
+    } else if !has_control_signals {
+        summary_badges.push("No control signals observed".to_owned());
+    }
+    let source_badge = match record.source_verified {
+        crate::powers::SourceVerified::ExactMatch => "Source verified (exact match)",
+        crate::powers::SourceVerified::Match => "Source verified (match)",
+        crate::powers::SourceVerified::None => "Source unverified",
+        crate::powers::SourceVerified::Unavailable => "Source unavailable",
+    };
 
     DirectoryPowersView {
         available: true,
@@ -629,6 +653,7 @@ fn powers_view(record: crate::powers::PowersRecord) -> DirectoryPowersView {
         can_block: details(record.can_block),
         can_change_rules: details(record.can_change_rules),
         unavailable: details(record.unavailable),
+        summary_badges,
         source_verified_subject: record.source_verified_subject.label().to_owned(),
         source_verified: status(record.source_verified).to_owned(),
         source_verified_proxy: record
@@ -636,6 +661,7 @@ fn powers_view(record: crate::powers::PowersRecord) -> DirectoryPowersView {
             .map(status)
             .unwrap_or_default()
             .to_owned(),
+        source_badge: source_badge.to_owned(),
         observed_at: record.observed_at,
     }
 }
@@ -1213,6 +1239,122 @@ mod tests {
         assert!(rendered.contains("Issuer source"));
         assert!(!rendered.contains("decimals"));
     }
+
+    fn powers_record(source_verified: crate::powers::SourceVerified) -> crate::powers::PowersRecord {
+        crate::powers::PowersRecord {
+            chain: Chain::Base,
+            contract: "0x0000000000000000000000000000000000000002".to_owned(),
+            can_seize: Vec::new(),
+            can_block: Vec::new(),
+            can_change_rules: Vec::new(),
+            unavailable: Vec::new(),
+            source_verified_subject: crate::powers::SourceVerifiedSubject::Contract,
+            source_verified,
+            source_verified_proxy: None,
+            observed_at: "2026-10-01T00:00:00Z".to_owned(),
+            block: None,
+            slot: None,
+            reads: Vec::new(),
+        }
+    }
+
+    fn render_token_powers(powers: DirectoryPowersView) -> String {
+        TokenTemplate {
+            asset_version: 1,
+            public_url: "https://qed.example".to_owned(),
+            ticker: "NVDA".to_owned(),
+            title: "NVDA tokenized".to_owned(),
+            contracts: vec![DirectoryContractView {
+                issuer: "Issuer".to_owned(),
+                ticker: "NVDA".to_owned(),
+                chain: "Base".to_owned(),
+                chain_kind: Chain::Base,
+                chain_icon: "ethereum",
+                contract: "0x0000000000000000000000000000000000000002".to_owned(),
+                explorer_url: "https://explorer.example/token".to_owned(),
+                source_url: "https://issuer.example/nvda".to_owned(),
+                powers,
+            }],
+            pools: Vec::new(),
+            json_ld: "{}".to_owned(),
+        }
+        .render()
+        .expect("token template renders")
+    }
+
+    #[test]
+    fn token_power_summary_renders_fact_availability_and_source_badges() {
+        for (field, expected_badge) in [
+            ("seize", "Can seize"),
+            ("block", "Can block"),
+            ("rules", "Can change rules"),
+        ] {
+            let mut record = powers_record(crate::powers::SourceVerified::None);
+            let reason = crate::powers::Reason::new("signal", "observed");
+            match field {
+                "seize" => record.can_seize.push(reason),
+                "block" => record.can_block.push(reason),
+                _ => record.can_change_rules.push(reason),
+            }
+            let rendered = render_token_powers(powers_view(record));
+            assert!(rendered.contains(expected_badge));
+            assert!(!rendered.contains("No control signals observed"));
+        }
+
+        let no_facts = render_token_powers(powers_view(powers_record(
+            crate::powers::SourceVerified::None,
+        )));
+        assert!(no_facts.contains(
+            r#"class="powers-summary" role="group" aria-label="Token control signals""#
+        ));
+        assert!(no_facts.contains("No control signals observed"));
+
+        let mut failed_read = powers_record(crate::powers::SourceVerified::None);
+        failed_read.unavailable.push(crate::powers::Reason::new("rpc", "temporarily unavailable"));
+        let unavailable = render_token_powers(powers_view(failed_read));
+        assert!(unavailable.contains("Signals unavailable (transient)"));
+
+        for (source, expected_badge) in [
+            (
+                crate::powers::SourceVerified::ExactMatch,
+                "Source verified (exact match)",
+            ),
+            (crate::powers::SourceVerified::Match, "Source verified (match)"),
+            (crate::powers::SourceVerified::None, "Source unverified"),
+            (crate::powers::SourceVerified::Unavailable, "Source unavailable"),
+        ] {
+            let rendered = render_token_powers(powers_view(powers_record(source)));
+            assert!(rendered.contains(expected_badge), "{expected_badge}");
+        }
+
+        let missing_record = render_token_powers(DirectoryPowersView::unavailable());
+        assert!(missing_record.contains("Signals unavailable (transient)"));
+        assert!(missing_record.contains("Source unavailable"));
+    }
+
+    #[test]
+    fn homepage_links_powers_and_preserves_protected_statements() {
+        let rendered = IndexTemplate {
+            asset_version: 1,
+            public_url: "https://qed.example".to_owned(),
+            leaderboard: super::super::views::LeaderboardPageView::from_value(serde_json::json!({
+                "entries": []
+            })),
+        }
+        .render()
+        .expect("homepage template renders");
+
+        assert!(rendered.contains(
+            "A ticker is not a contract. Compare the pool with the issuer's published stock-token contract."
+        ));
+        assert!(rendered.contains(
+            "QED checks whether a pool uses the stock-token contract published by its issuer."
+        ));
+        assert!(rendered.contains(
+            r#"<a href="/tokens/NVDA">QED also shows what the issuer can do to each token.</a>"#
+        ));
+    }
+
 
     #[test]
     fn recheck_live_query_accepts_boolean_and_numeric_values() {

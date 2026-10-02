@@ -533,9 +533,11 @@ pub(crate) struct DirectoryPowersView {
     pub(crate) can_block: Vec<String>,
     pub(crate) can_change_rules: Vec<String>,
     pub(crate) unavailable: Vec<String>,
+    pub(crate) summary_badges: Vec<String>,
     pub(crate) source_verified_subject: String,
     pub(crate) source_verified: String,
     pub(crate) source_verified_proxy: String,
+    pub(crate) source_badge: String,
     pub(crate) observed_at: String,
 }
 
@@ -547,8 +549,10 @@ impl DirectoryPowersView {
             can_block: Vec::new(),
             can_change_rules: Vec::new(),
             unavailable: Vec::new(),
+            summary_badges: vec!["Signals unavailable (transient)".to_owned()],
             source_verified_proxy: String::new(),
             source_verified_subject: "Source verification".to_owned(),
+            source_badge: "Source unavailable".to_owned(),
             source_verified: "Unavailable".to_owned(),
             observed_at: String::new(),
         }

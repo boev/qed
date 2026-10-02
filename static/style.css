@@ -1370,6 +1370,11 @@ html[data-theme="dark"] .theme-moon {
   display: grid;
   gap: 10px;
 }
+.powers-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
 .contract-card {
   display: grid;
   gap: 15px;
