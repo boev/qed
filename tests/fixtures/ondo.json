@@ -1,11 +1,22 @@
 {
   "data": [
     {
+      "symbol": "AAPLon",
+      "ticker": "AAPL",
+      "underlyingName": "Apple",
+      "displayName": "Apple Token",
+      "addresses": [
+        {"address": "0xAbCd000000000000000000000000000000000001", "networkChainId": "ethereum-1", "decimals": 18},
+        {"address": "0xAbCd000000000000000000000000000000000002", "networkChainId": "bsc-56", "decimals": 18},
+        {"address": "So11111111111111111111111111111111111111112", "networkChainId": "solana-900", "decimals": 6}
+      ]
+    },
+    {
       "symbol": "OUSG",
       "name": "Ondo Short-Term US Government Bond Fund",
       "deployments": [
-        {"address": "0xAbCd000000000000000000000000000000000002", "network": "Ethereum", "decimals": 18},
-        {"address": "0xAbCd000000000000000000000000000000000003", "chainId": 56, "decimals": 18}
+        {"address": "0xAbCd000000000000000000000000000000000003", "network": "Ethereum", "decimals": 18},
+        {"address": "0xAbCd000000000000000000000000000000000004", "chainId": 56, "decimals": 18}
       ]
     }
   ]

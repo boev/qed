@@ -67,6 +67,7 @@ writes reduced-motion Firefox screenshots to `/tmp/qed-crawl/`.
 | `QED_PREVIOUS_KEYS` | unset | Comma-separated base58 public signing keys trusted during key rotation. |
 | `QED_REGISTRY_XSTOCKS_URL` | `https://api.xstocks.fi/api/v2/public/assets` | xStocks registry source endpoint. |
 | `QED_REGISTRY_ONDO_URL` | `https://api.gm.ondo.finance/v1/assets/all/metadata` | Ondo registry source endpoint. |
+| `QED_REGISTRY_ONDO_API_KEY` | unset | Required API key from Ondo onboarding; sent only as the `x-api-key` header. |
 | `QED_REGISTRY_ROBINHOOD_URL` | `https://api.robinhood.com/rhj/assets` | Robinhood registry source endpoint. |
 | `QED_RPC_SOLANA` | Solana mainnet public RPC | Solana JSON-RPC endpoint. |
 | `QED_RPC_ROBINHOOD` | Robinhood Chain public RPC | Robinhood Chain JSON-RPC endpoint. |
@@ -78,7 +79,7 @@ writes reduced-motion Firefox screenshots to `/tmp/qed-crawl/`.
 
 ## API and routes
 
-The machine-readable entry points are `/llms.txt`, `/llms-full.txt`, `/openapi.json`, and `/api`. The deployed service serves those paths directly. The public source repository is [github.com/boev/qed](https://github.com/boev/qed).
+The machine-readable entry points are `/llms.txt`, `/llms-full.txt`, `/openapi.json`, `/api`, and `/mcp`. `/mcp` is a stateless Streamable HTTP endpoint for the check, wallet, registry-lookup, and attestation-verification tools; it supports MCP versions `2026-07-28`, `2025-11-25`, `2025-06-18`, and `2025-03-26` (legacy initialization). The deployed service serves those paths directly. The public source repository is [github.com/boev/qed](https://github.com/boev/qed).
 
 | Method | Route | Result |
 | --- | --- | --- |
@@ -95,6 +96,7 @@ The machine-readable entry points are `/llms.txt`, `/llms-full.txt`, `/openapi.j
 | POST | `/v/{id}/recheck` | Re-run the recorded reads. |
 | GET | `/api` | HTML API guide. |
 | GET | `/openapi.json` | OpenAPI 3.1 route document. |
+| POST | `/mcp` | Stateless MCP Streamable HTTP tools for checks, wallet holdings, issuer-registry lookup, and attestation verification. |
 | GET | `/pools/featured` | Featured-pool HTML fragment/page. |
 | GET | `/api/check/{address}` | JSON check result. |
 | POST | `/api/wallet` | JSON body `{ "address": "…" }`; check stock-token holdings without putting the address in the URL. |
@@ -120,7 +122,7 @@ Leaderboard Market links open exact external pair pages. Pool-detail pages may a
 | Meteora DLMM | `https://app.meteora.ag/dlmm/{pool}` | [Meteora](https://app.meteora.ag/) |
 | Long.xyz | No exact pool deep link published, so QED shows no Long.xyz homepage link. | — |
 | DexScreener | `https://dexscreener.com/{chain}/{pool}`, using DexScreener chain IDs such as `robinhood`, `bsc`, `ethereum`, `base`, and `solana` | [DexScreener](https://dexscreener.com/) |
-| Explorer | Solana `https://solscan.io/account/{pool}`; Robinhood `https://explorer.mainnet.chain.robinhood.com/address/{pool}`; Base `https://basescan.org/address/{pool}`; Ethereum `https://etherscan.io/address/{pool}`; BNB `https://bscscan.com/address/{pool}` | Chain explorer |
+| Explorer | Solana `https://solscan.io/account/{pool}`; Robinhood `https://robinhoodchain.blockscout.com/address/{pool}`; Base `https://basescan.org/address/{pool}`; Ethereum `https://etherscan.io/address/{pool}`; BNB `https://bscscan.com/address/{pool}` | Chain explorer |
 
 ## Links and presentation
 

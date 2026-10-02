@@ -54,6 +54,7 @@ Examples below use `https://qed.example`; replace it with the deployed public UR
 - `POST /api/wallet` with `{"address":"…"}` in the request body checks stock-token holdings without putting an address in the URL. Results are not cached by address.
 - `GET /api/attest/{id}` returns a signed attestation JSON document.
 - `POST /verify` with an attestation JSON body returns `ok`, `cryptographic`, `trusted_signer`, `environment_match`, and `fresh` booleans.
+- `POST /mcp` exposes the check, wallet, registry lookup, and attestation verification tools over stateless Streamable HTTP.
 - `GET /.well-known/qed.json` returns the public signing key and algorithm metadata.
 
 For example:
@@ -64,6 +65,34 @@ curl 'https://qed.example/api/check/POOL_OR_TOKEN_ADDRESS'
 curl https://qed.example/api/attest/ATTESTATION_ID
 curl https://qed.example/openapi.json
 ```
+
+## MCP
+
+QED implements the current MCP Streamable HTTP protocol revision `2026-07-28` and advertises supported versions `["2026-07-28","2025-11-25","2025-06-18","2025-03-26"]` through `server/discover`: modern requests carry per-request protocol metadata and receive one JSON response, with no sessions or SSE streams. For compatibility with clients using the initialization lifecycle, QED answers legacy `initialize` requests for `2025-11-25`, `2025-06-18`, and `2025-03-26` without creating a session. `GET /mcp` returns `405 Method Not Allowed`.
+
+Connect Claude Code:
+
+```sh
+claude mcp add --transport http qed https://qed.web3-energy.com/mcp
+```
+
+Raw curl example using the legacy initialization lifecycle:
+
+```sh
+curl -sS https://qed.example/mcp \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+
+curl -sS https://qed.example/mcp \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'Content-Type: application/json' \
+  -H 'MCP-Protocol-Version: 2025-11-25' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"qed_registry_lookup","arguments":{"ticker":"NVDA"}}}'
+```
+
+The four tools are `qed_check`, `qed_wallet`, `qed_registry_lookup`, and `qed_verify`. QED checks whether a pool uses the stock-token contract published by its issuer. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Re-check a certificate after expiry or when the issuer registry changes.
+
 
 ## Human pages
 - [Home](https://qed.example/)

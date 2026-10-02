@@ -52,7 +52,7 @@ pub(crate) struct TokenLookupQuery {
     pub(crate) ticker: Option<String>,
 }
 
-fn canonical_ticker(registry: &registry::Registry, query: &str) -> Option<String> {
+pub(crate) fn canonical_ticker(registry: &registry::Registry, query: &str) -> Option<String> {
     let query = query.trim();
     if query.is_empty()
         || query.len() > 32
@@ -889,7 +889,8 @@ mod tests {
             stale_since: None,
         };
         assert_eq!(canonical_ticker(&vec![entry.clone()], " nvda "), Some("NVDA".to_owned()));
-        let response = token_redirect(&vec![entry.clone()], Some(" nvda ")).unwrap().into_response();
+        let response =
+            token_redirect(&vec![entry.clone()], Some(" nvda ")).unwrap().into_response();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(response.headers().get("location").unwrap(), "/tokens/NVDA");
         assert!(matches!(

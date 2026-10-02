@@ -10,17 +10,30 @@ use thiserror::Error;
 pub enum Error {
     #[error("Ondo request failed")]
     Request(#[from] reqwest::Error),
+    #[error("QED_REGISTRY_ONDO_API_KEY is unset; Ondo refresh skipped")]
+    MissingApiKey,
+    #[error("Ondo API returned HTTP {0}")]
+    HttpStatus(u16),
     #[error("Ondo response was invalid JSON")]
     Json(#[from] serde_json::Error),
     #[error("Ondo response body failed limits: {0}")]
     Body(String),
 }
 
-/// The Ondo endpoint is access-controlled in some environments. A 403 is
-/// returned to the caller so startup can retain the committed registry and
-/// report that Ondo remains manual until public metadata is available.
-pub async fn fetch(client: &Client, endpoint_url: &str) -> Result<Vec<Entry>, Error> {
-    let response = client.get(endpoint_url).send().await?.error_for_status()?;
+/// Ondo requires an API key from its onboarding process; missing credentials
+/// skip this source, and HTTP status errors are reported without response bodies.
+pub async fn fetch(
+    client: &Client,
+    endpoint_url: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<Entry>, Error> {
+    let Some(api_key) = api_key.filter(|key| !key.is_empty()) else {
+        return Err(Error::MissingApiKey);
+    };
+    let response = client.get(endpoint_url).header("x-api-key", api_key).send().await?;
+    if !response.status().is_success() {
+        return Err(Error::HttpStatus(response.status().as_u16()));
+    }
     let body = crate::net::body(response).await.map_err(Error::Body)?;
     map_payload_with_source(
         std::str::from_utf8(&body).map_err(|_| Error::Body("response was not UTF-8".to_owned()))?,
@@ -29,8 +42,7 @@ pub async fn fetch(client: &Client, endpoint_url: &str) -> Result<Vec<Entry>, Er
     )
 }
 
-/// Map the public Ondo metadata shape. The endpoint has used both a top-level
-/// array and `{data: [...]}` over time, so aliases are accepted deliberately.
+/// Map the current Ondo asset metadata shape while retaining older deployment aliases.
 #[cfg(test)]
 pub fn map_payload(payload: &str, checked_at: &str) -> Result<Vec<Entry>, Error> {
     map_payload_with_source(payload, checked_at, ONDO_URL)
@@ -46,11 +58,13 @@ fn map_payload_with_source(
     let mut entries = Vec::new();
     for record in records {
         let inherited_ticker = string(&record, &["ticker", "symbol", "tokenSymbol"]);
-        let inherited_name = string(&record, &["name", "tokenName", "description"]);
+        let inherited_name =
+            string(&record, &["underlyingName", "displayName", "name", "tokenName", "description"]);
         let inherited_chain = chain(
             record
                 .get("chain")
                 .or_else(|| record.get("network"))
+                .or_else(|| record.get("networkChainId"))
                 .or_else(|| record.get("blockchain"))
                 .or_else(|| record.get("chainId")),
         );
@@ -58,6 +72,7 @@ fn map_payload_with_source(
             .and_then(|value| u8::try_from(value).ok());
         let deployments = record
             .get("deployments")
+            .or_else(|| record.get("addresses"))
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_else(|| vec![Value::Object(record.clone())]);
@@ -79,6 +94,7 @@ fn map_payload_with_source(
                 deployment
                     .get("chain")
                     .or_else(|| deployment.get("network"))
+                    .or_else(|| deployment.get("networkChainId"))
                     .or_else(|| deployment.get("blockchain"))
                     .or_else(|| deployment.get("chainId")),
             )
@@ -86,9 +102,12 @@ fn map_payload_with_source(
             let Some(chain) = chain else {
                 continue;
             };
-            let name = string(deployment, &["name", "tokenName", "description"])
-                .or_else(|| inherited_name.clone())
-                .unwrap_or_else(|| ticker.clone());
+            let name = string(
+                deployment,
+                &["underlyingName", "displayName", "name", "tokenName", "description"],
+            )
+            .or_else(|| inherited_name.clone())
+            .unwrap_or_else(|| ticker.clone());
             let decimals = number(deployment, &["decimals", "tokenDecimals"])
                 .and_then(|value| u8::try_from(value).ok())
                 .or(inherited_decimals);
@@ -148,11 +167,11 @@ fn chain(value: Option<&Value>) -> Option<Chain> {
         },
         Some(Value::String(string)) => {
             match string.to_ascii_lowercase().replace([' ', '_', '-'], "").as_str() {
-                "ethereum" | "mainnet" | "eth" => Some(Chain::Ethereum),
-                "bnb" | "bnbchain" | "binancesmartchain" | "bsc" => Some(Chain::Bnb),
+                "ethereum" | "ethereum1" | "mainnet" | "eth" => Some(Chain::Ethereum),
+                "bnb" | "bnbchain" | "binancesmartchain" | "bsc" | "bsc56" => Some(Chain::Bnb),
                 "base" => Some(Chain::Base),
                 "robinhoodchain" => Some(Chain::RobinhoodChain),
-                "solana" => Some(Chain::Solana),
+                "solana" | "solana900" => Some(Chain::Solana),
                 _ => string.parse::<u64>().ok().and_then(|id| chain(Some(&Value::from(id)))),
             }
         }
@@ -162,16 +181,69 @@ fn chain(value: Option<&Value>) -> Option<Chain> {
 
 #[cfg(test)]
 mod tests {
-    use super::map_payload;
+    use super::{Error, fetch, map_payload};
     use crate::chain::Chain;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     #[test]
-    fn maps_data_array_and_deployments() {
+    fn maps_current_addresses_and_legacy_deployments() {
         let payload = include_str!("../../tests/fixtures/ondo.json");
         let entries = map_payload(payload, "2026-09-21T00:00:00Z").unwrap();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].ticker, "AAPL");
+        assert_eq!(entries[0].name, "Apple");
         assert_eq!(entries[0].chain, Chain::Ethereum);
-        assert_eq!(entries[0].ticker, "OUSG");
+        assert_eq!(entries[0].decimals, Some(18));
         assert_eq!(entries[1].chain, Chain::Bnb);
+        assert_eq!(entries[2].chain, Chain::Solana);
+        assert_eq!(entries[3].ticker, "OUSG");
+        assert_eq!(entries[3].chain, Chain::Ethereum);
+        assert_eq!(entries[4].chain, Chain::Bnb);
+    }
+
+    #[tokio::test]
+    async fn missing_api_key_skips_ondo_refresh_before_network_access() {
+        let error = fetch(&reqwest::Client::new(), "http://127.0.0.1:1/not-requested", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, Error::MissingApiKey));
+        assert_eq!(error.to_string(), "QED_REGISTRY_ONDO_API_KEY is unset; Ondo refresh skipped");
+    }
+
+    #[tokio::test]
+    async fn fetch_sends_api_key_and_reports_http_status_without_response_body() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let count = stream.read(&mut chunk).await.expect("read request");
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write response");
+            String::from_utf8_lossy(&request).to_ascii_lowercase()
+        });
+
+        let url = format!("http://{address}/metadata");
+        let error = fetch(&reqwest::Client::new(), &url, Some("test-api-key")).await.unwrap_err();
+        let request = server.await.expect("mock server");
+        assert!(request.contains("x-api-key: test-api-key"));
+        assert_eq!(error.to_string(), "Ondo API returned HTTP 403");
     }
 }

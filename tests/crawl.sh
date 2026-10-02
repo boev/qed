@@ -115,6 +115,7 @@ QED_PREVIOUS_KEYS="$fixture_signer" \
 QED_REGISTRY_XSTOCKS_URL="http://${HOST}:${RPC_PORT}/registry/xstocks" \
 QED_REGISTRY_ONDO_URL="http://${HOST}:${RPC_PORT}/registry/ondo" \
 QED_REGISTRY_ROBINHOOD_URL="http://${HOST}:${RPC_PORT}/registry/robinhood" \
+QED_REGISTRY_ONDO_API_KEY="local-test-api-key" \
   "$BIN" >"$SERVER_LOG" 2>&1 &
 server_pid=$!
 
@@ -251,6 +252,10 @@ done
 verify_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' --data '{}' "$BASE/verify")"
 [[ "$verify_code" != "404" ]] || { printf 'FAIL /verify: endpoint missing\n' >&2; exit 1; }
 printf 'status %s POST /verify\n' "$verify_code"
+mcp_body="$(curl -fsS -X POST -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' --data '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' "$BASE/mcp")"
+mcp_names="$(jq -c '[.result.tools[].name] | sort' <<<"$mcp_body")"
+[[ "$mcp_names" == '["qed_check","qed_registry_lookup","qed_verify","qed_wallet"]' ]] || { printf 'FAIL /mcp: unexpected tool list %s\n' "$mcp_names" >&2; exit 1; }
+printf 'status 200 POST /mcp; four MCP tools listed\n'
 for removed_path in /seal /badge; do
   code="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE$removed_path")"
   [[ "$code" == "404" ]] || { printf 'FAIL %s: HTTP %s\n' "$removed_path" "$code" >&2; exit 1; }

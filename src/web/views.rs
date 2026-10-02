@@ -755,7 +755,7 @@ fn allowed_external_url(url: &str) -> bool {
                     | "basescan.org"
                     | "etherscan.io"
                     | "bscscan.com"
-                    | "explorer.mainnet.chain.robinhood.com"
+                    | "robinhoodchain.blockscout.com"
             )
         )
 }
@@ -1155,7 +1155,7 @@ impl CertificateView {
 pub(crate) fn explorer_link(chain: Chain, subject: &str) -> String {
     let base = match chain {
         Chain::Solana => "https://solscan.io/account/",
-        Chain::RobinhoodChain => "https://explorer.mainnet.chain.robinhood.com/address/",
+        Chain::RobinhoodChain => "https://robinhoodchain.blockscout.com/address/",
         Chain::Base => "https://basescan.org/address/",
         Chain::Ethereum => "https://etherscan.io/address/",
         Chain::Bnb => "https://bscscan.com/address/",
@@ -1340,7 +1340,7 @@ fn prettify_dex(dex: &str) -> String {
 mod tests {
     use super::{
         LeaderboardPageView, LeaderboardRowView, ValidatedCardView, allowed_external_url,
-        html_safe_json, trade_links,
+        explorer_link, html_safe_json, trade_links,
     };
     use crate::discovery::LeaderboardEntry;
     use crate::pool::{PoolInfo, TokenSide};
@@ -1361,6 +1361,16 @@ mod tests {
         assert!(allowed_external_url("https://dexscreener.com/base/0x1"));
         assert!(!allowed_external_url("http://dexscreener.com/base/0x1"));
         assert!(!allowed_external_url("https://evil.example/base/0x1"));
+        assert!(allowed_external_url("https://robinhoodchain.blockscout.com/address/0x1"));
+        assert!(!allowed_external_url("https://explorer.mainnet.chain.robinhood.com/address/0x1"));
+    }
+
+    #[test]
+    fn robinhood_explorer_link_uses_blockscout() {
+        assert_eq!(
+            explorer_link(crate::chain::Chain::RobinhoodChain, "0xpool"),
+            "https://robinhoodchain.blockscout.com/address/0xpool"
+        );
     }
 
     #[test]

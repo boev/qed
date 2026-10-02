@@ -19,6 +19,7 @@ pub struct Config {
     pub rpc_rps_evm: u32,
     pub registry_xstocks_url: String,
     pub registry_ondo_url: String,
+    pub registry_ondo_api_key: Option<String>,
     pub registry_robinhood_url: String,
     /// Read-only seed registry committed with the source tree.
     pub registry_path: PathBuf,
@@ -51,6 +52,7 @@ impl Config {
         let rpc_bnb = value("QED_RPC_BNB", DEFAULT_BNB_RPC);
         let registry_xstocks_url = value("QED_REGISTRY_XSTOCKS_URL", crate::registry::XSTOCKS_URL);
         let registry_ondo_url = value("QED_REGISTRY_ONDO_URL", crate::registry::ONDO_URL);
+        let registry_ondo_api_key = optional_secret("QED_REGISTRY_ONDO_API_KEY");
         let registry_robinhood_url =
             value("QED_REGISTRY_ROBINHOOD_URL", crate::registry::ROBINHOOD_URL);
         if env::var("QED_ENV").is_ok_and(|value| value.eq_ignore_ascii_case("production")) {
@@ -71,6 +73,7 @@ impl Config {
             rpc_rps_evm: rps("QED_RPC_RPS_EVM", 8)?,
             registry_xstocks_url,
             registry_ondo_url,
+            registry_ondo_api_key,
             registry_robinhood_url,
             registry_path: PathBuf::from(value("QED_REGISTRY_PATH", "registry/registry.json")),
             data_dir,

@@ -952,7 +952,7 @@ pub fn chain_label(chain: Chain) -> &'static str {
 pub fn explorer_url(chain: Chain, pool: &str) -> String {
     let base = match chain {
         Chain::Solana => "https://solscan.io/account/",
-        Chain::RobinhoodChain => "https://explorer.mainnet.chain.robinhood.com/address/",
+        Chain::RobinhoodChain => "https://robinhoodchain.blockscout.com/address/",
         Chain::Base => "https://basescan.org/address/",
         Chain::Ethereum => "https://etherscan.io/address/",
         Chain::Bnb => "https://bscscan.com/address/",
@@ -1909,6 +1909,14 @@ mod tests {
     use super::*;
     use crate::chain::Chain;
     use crate::registry::Entry;
+
+    #[test]
+    fn robinhood_explorer_url_uses_blockscout() {
+        assert_eq!(
+            explorer_url(Chain::RobinhoodChain, "0xpool"),
+            "https://robinhoodchain.blockscout.com/address/0xpool"
+        );
+    }
 
     #[derive(Debug, Deserialize)]
     struct DexSearchResponse {

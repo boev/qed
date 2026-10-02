@@ -34,6 +34,7 @@ struct Args {
 struct RegistryEndpoints {
     xstocks: String,
     ondo: String,
+    ondo_api_key: Option<String>,
     robinhood: String,
 }
 
@@ -98,6 +99,7 @@ async fn main() -> Result<()> {
     let registry_endpoints = RegistryEndpoints {
         xstocks: config.registry_xstocks_url.clone(),
         ondo: config.registry_ondo_url.clone(),
+        ondo_api_key: config.registry_ondo_api_key.clone(),
         robinhood: config.registry_robinhood_url.clone(),
     };
     if args.refresh_once {
@@ -439,9 +441,10 @@ async fn refresh_registry(
             (result, registry::now_rfc3339())
         },
         async {
-            let result = registry::ondo::fetch(client, &endpoints.ondo)
-                .await
-                .map_err(|error| error.to_string());
+            let result =
+                registry::ondo::fetch(client, &endpoints.ondo, endpoints.ondo_api_key.as_deref())
+                    .await
+                    .map_err(|error| error.to_string());
             (result, registry::now_rfc3339())
         },
         async {

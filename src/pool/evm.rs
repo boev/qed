@@ -157,7 +157,7 @@ const V4_POOLMANAGER_ROBINHOOD: Address = address!("8366a39cc670b4001a1121b8f6a4
 // Creation transaction blocks from the public chain explorers:
 // Ethereum: https://eth.blockscout.com/tx/0x747e0e02b7590eed32cface28e83260884e0b80675f5ae223c6888053aa68528
 // Base: https://base.blockscout.com/tx/0x25f482fbd94cdea11b018732e455b8e9a940b933cabde3c0c5dd63ea65e85349
-// Robinhood: https://explorer.mainnet.chain.robinhood.com/tx/0x4fb28d4935866f462582c6c931c6f2705e55f5be5eb178c7d8d9329a95c44c41
+// Robinhood: https://robinhoodchain.blockscout.com/tx/0x4fb28d4935866f462582c6c931c6f2705e55f5be5eb178c7d8d9329a95c44c41
 const V4_DEPLOYMENT_ETHEREUM: u64 = 21_688_329;
 const V4_DEPLOYMENT_BASE: u64 = 25_350_988;
 const V4_DEPLOYMENT_ROBINHOOD: u64 = 9_070;
