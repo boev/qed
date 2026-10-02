@@ -513,6 +513,37 @@ mod tests {
         assert_eq!(body["environment_match"], true);
         assert_eq!(body["fresh"], true);
     }
+
+    #[tokio::test]
+    async fn verify_route_accepts_awkward_float_round_trips() {
+        for quote_share in [1.1129609814871755e-8, 0.1 + 0.2] {
+            let attestation =
+                crate::attest::signed_test_attestation_with_quote_share([7; 32], false, quote_share);
+            let id = attestation.id.clone();
+            let serialized = serde_json::to_vec(&attestation).expect("serialize attestation");
+            let response = crate::web::router(test_state(false))
+                .oneshot(
+                    Request::post("/verify")
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serialized))
+                        .expect("verify request"),
+                )
+                .await
+                .expect("verify response");
+
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let body =
+                to_bytes(response.into_body(), 64 * 1024).await.expect("verify response body");
+            let value: serde_json::Value =
+                serde_json::from_slice(&body).expect("verify response JSON");
+            assert_eq!(value["id"], id);
+            assert_eq!(value["cryptographic"], true, "quote share: {quote_share:?}");
+            assert_eq!(value["trusted_signer"], true);
+            assert_eq!(value["fresh"], true);
+            assert_eq!(value["ok"], true);
+        }
+    }
+
     fn assert_negative_dimensions(
         body: &serde_json::Value,
         cryptographic: bool,

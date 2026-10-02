@@ -769,6 +769,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_tool_accepts_awkward_float_round_trips() {
+        for quote_share in [1.1129609814871755e-8, 0.1 + 0.2] {
+            let attestation =
+                crate::attest::signed_test_attestation_with_quote_share([7; 32], true, quote_share);
+            let id = attestation.id.clone();
+            let response = post_modern_version(
+                "tools/call",
+                json!({
+                    "name": "qed_verify",
+                    "arguments": { "attestation": serde_json::to_value(&attestation).unwrap() }
+                }),
+                MODERN_PROTOCOL_VERSION,
+            )
+            .await;
+            let value = response_json(response).await;
+            assert_eq!(value["result"]["isError"], false);
+            assert_eq!(value["result"]["structuredContent"]["id"], id);
+            assert_eq!(value["result"]["structuredContent"]["cryptographic"], true);
+            assert_eq!(value["result"]["structuredContent"]["trusted_signer"], true);
+            assert_eq!(value["result"]["structuredContent"]["fresh"], true);
+            assert_eq!(value["result"]["structuredContent"]["ok"], true);
+        }
+    }
+
+    #[tokio::test]
     async fn wallet_tool_refuses_concurrent_scans() {
         let state = test_state();
         let permit = state.wallet_concurrency.clone().acquire_owned().await.unwrap();

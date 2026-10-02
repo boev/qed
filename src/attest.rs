@@ -1372,6 +1372,15 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 #[cfg(test)]
 pub(crate) fn signed_test_attestation(key: [u8; 32], dev: bool) -> Attestation {
+    signed_test_attestation_with_quote_share(key, dev, 0.2)
+}
+
+#[cfg(test)]
+pub(crate) fn signed_test_attestation_with_quote_share(
+    key: [u8; 32],
+    dev: bool,
+    quote_share: f64,
+) -> Attestation {
     let signing_key = SigningKey::from_bytes(&key);
     let pool = PoolInfo {
         chain: Chain::Base,
@@ -1398,7 +1407,7 @@ pub(crate) fn signed_test_attestation(key: [u8; 32], dev: bool) -> Attestation {
         issuer: None,
         ticker: None,
         pool,
-        quote_share_of_supply: Some(0.2),
+        quote_share_of_supply: Some(quote_share),
         registry_entry: None,
         registry_hash: String::new(),
         reads: Vec::new(),
@@ -1687,6 +1696,20 @@ mod tests {
     #[test]
     fn sign_and_verify_round_trip() {
         verify(&sample()).unwrap();
+    }
+
+    #[test]
+    fn awkward_float_attestations_verify_after_json_round_trip() {
+        for quote_share in [1.1129609814871755e-8, 0.1 + 0.2] {
+            let original = signed_test_attestation_with_quote_share([7; 32], false, quote_share);
+            let serialized = serde_json::to_vec(&original).expect("serialize test attestation");
+            let parsed: Attestation =
+                serde_json::from_slice(&serialized).expect("parse test attestation");
+
+            assert_eq!(parsed.id, original.id, "quote share: {quote_share:?}");
+            assert_eq!(parsed.quote_share_of_supply, Some(quote_share));
+            verify(&parsed).expect("serialized attestation still verifies");
+        }
     }
 
     #[test]
