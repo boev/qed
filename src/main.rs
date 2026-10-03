@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing::{info, warn};
 #[derive(Debug, Parser)]
 #[command(name = "qed", about = "QED registry checker")]
@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
         crate::powers::PowersRecord,
     > = Cache::builder()
         .max_capacity(10_000)
-        .time_to_live(Duration::from_secs(30 * 60))
+        .time_to_live(crate::powers::POWERS_CACHE_TTL)
         .build();
     let registry_endpoints = RegistryEndpoints {
         xstocks: config.registry_xstocks_url.clone(),
@@ -117,6 +117,7 @@ async fn main() -> Result<()> {
         ondo_api_key: config.registry_ondo_api_key.clone(),
         robinhood: config.registry_robinhood_url.clone(),
     };
+    let powers_warm_notify = Arc::new(Notify::new());
     if args.refresh_once {
         refresh_registry(
             &client,
@@ -127,6 +128,7 @@ async fn main() -> Result<()> {
             &check_cache,
             &powers_cache,
             &registry_endpoints,
+            &powers_warm_notify,
         )
         .await;
         return Ok(());
@@ -302,6 +304,20 @@ async fn main() -> Result<()> {
     };
 
     hydrate_attestations(&state).await.context("hydrating persisted attestations")?;
+
+    let warm_state = state.clone();
+    let warm_notify = Arc::clone(&powers_warm_notify);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(crate::powers::POWERS_WARM_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = warm_notify.notified() => {}
+            }
+            crate::powers::warm_current_pool_powers(&warm_state).await;
+        }
+    });
     let listener =
         TcpListener::bind(config.bind).await.with_context(|| format!("binding {}", config.bind))?;
     info!(address = %config.bind, "QED server listening");
@@ -326,6 +342,7 @@ async fn main() -> Result<()> {
     let refresh_check_cache = check_cache.clone();
     let refresh_powers_cache = powers_cache.clone();
     let refresh_endpoints = registry_endpoints.clone();
+    let refresh_warm_notify = Arc::clone(&powers_warm_notify);
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(Duration::from_secs(discovery::REGISTRY_REFRESH_SECS));
@@ -340,6 +357,7 @@ async fn main() -> Result<()> {
                 &refresh_check_cache,
                 &refresh_powers_cache,
                 &refresh_endpoints,
+                &refresh_warm_notify,
             )
             .await;
         }
@@ -465,6 +483,7 @@ async fn refresh_registry(
         crate::powers::PowersRecord,
     >,
     endpoints: &RegistryEndpoints,
+    warm_notify: &Notify,
 ) {
     {
         let mut status = registry_status.write().await;
@@ -536,6 +555,10 @@ async fn refresh_registry(
         status.restored = false;
     }
     status.refreshing = false;
+    drop(status);
+    if changed {
+        warm_notify.notify_one();
+    }
 }
 fn registry_file_hash(path: &Path) -> String {
     let bytes = std::fs::read(path).unwrap_or_default();

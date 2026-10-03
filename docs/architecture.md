@@ -38,7 +38,7 @@ flowchart TB
     S --> OBJ[Attestation store and bounded index]
 ```
 
-Ordinary page and API reads use prepared in-memory snapshots. They do not trigger pool discovery or blockchain reads unless the route explicitly performs a check, wallet scan, token-power observation, re-check, or verification operation. Token pages render only cached token-power records; cache misses schedule deduplicated background reads under the existing expensive-work semaphore. Complete observations use the 30-minute cache, while incomplete reads and hard failures are retained for 30 seconds before retry.
+Ordinary page and API reads use prepared in-memory snapshots. They do not trigger pool discovery or blockchain reads unless the route explicitly performs a check, wallet scan, token-power observation, re-check, or verification operation. Token pages wait up to 2.5 seconds for concurrent token-power observations, then render completed cached results and mark unresolved observations unavailable while deduplicated background reads continue. A low-priority warm pass covers active registry contracts represented by current leaderboard or featured tickers at startup, after registry refresh changes, and every 25 minutes; it re-inspects cached observations at least five minutes before the 30-minute TTL and shares the bounded powers-prefetch semaphore. Complete observations use the 30-minute cache, while incomplete reads and hard failures are retained for 30 seconds before retry.
 
 The shared discovery pass fetches candidate pairs once and derives both the leaderboard and featured-pool candidates from that response. Results common to both lists reuse the same on-chain check result. A failed refresh preserves the previous valid snapshot.
 

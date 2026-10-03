@@ -122,6 +122,7 @@ pub(crate) async fn wallet_holdings_page(
 }
 
 const WALLET_DEADLINE: Duration = Duration::from_secs(20);
+const POWERS_PAGE_DEADLINE: Duration = Duration::from_millis(2500);
 
 pub(crate) async fn wallet_holdings(
     state: &AppState,
@@ -438,14 +439,36 @@ pub(crate) async fn token_page(
         .filter(|entry| entry.ticker.eq_ignore_ascii_case(&canonical_ticker))
         .map(contract_view)
         .collect();
-    for contract in &mut contracts {
+    let mut pending = Vec::new();
+    for (index, contract) in contracts.iter_mut().enumerate() {
         if let Some(record) =
             crate::powers::cached_record(&state, contract.chain_kind, &contract.contract).await
         {
             contract.powers = powers_view(record);
         } else {
             crate::powers::schedule_prefetch(&state, contract.chain_kind, &contract.contract).await;
-            contract.powers = DirectoryPowersView::unavailable();
+            pending.push((index, contract.chain_kind, contract.contract.clone()));
+        }
+    }
+    if !pending.is_empty() {
+        let mut inspections = tokio::task::JoinSet::new();
+        for (_, chain, contract) in &pending {
+            let state = state.clone();
+            let chain = *chain;
+            let contract = contract.clone();
+            inspections.spawn(async move {
+                let _ = crate::powers::inspect_prefetched(&state, chain, &contract).await;
+            });
+        }
+        let _ = tokio::time::timeout(POWERS_PAGE_DEADLINE, async {
+            while inspections.join_next().await.is_some() {}
+        })
+        .await;
+        for (index, chain, contract) in pending {
+            contracts[index].powers = crate::powers::cached_record(&state, chain, &contract)
+                .await
+                .map(powers_view)
+                .unwrap_or_else(DirectoryPowersView::unavailable);
         }
     }
     sort_directory_contracts(&mut contracts);
@@ -879,6 +902,7 @@ mod tests {
     struct GatedPowerReader {
         started: std::sync::Arc<tokio::sync::Notify>,
         release: std::sync::Arc<tokio::sync::Notify>,
+        facts: crate::powers::PowerFacts,
     }
 
     #[async_trait::async_trait]
@@ -897,6 +921,28 @@ mod tests {
         ) -> Result<crate::powers::PowerFacts, PoolError> {
             self.started.notify_one();
             self.release.notified().await;
+            Ok(self.facts.clone())
+    }
+    }
+    struct CountingPowerReader {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::pool::PoolReader for CountingPowerReader {
+        fn chain(&self) -> Chain {
+            Chain::Solana
+        }
+
+        async fn read_pool(&self, _address: &str) -> Result<crate::pool::PoolInfo, PoolError> {
+            Err(PoolError::Reader("unused token-page test reader".to_owned()))
+        }
+
+        async fn power_facts(
+            &self,
+            _address: &str,
+        ) -> Result<crate::powers::PowerFacts, PoolError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(crate::powers::PowerFacts::default())
         }
     }
@@ -958,7 +1004,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token_page_returns_from_cache_while_missing_power_reads_fill_in_background() {
+    async fn token_page_returns_transient_at_deadline_while_prefetch_continues() {
         use axum::{body::Body, http::Request};
         use tower::ServiceExt;
 
@@ -969,6 +1015,7 @@ mod tests {
             Box::new(GatedPowerReader {
                 started: started.clone(),
                 release: release.clone(),
+                facts: crate::powers::PowerFacts::default(),
             }),
             registry::Entry {
                 issuer: "Issuer".to_owned(),
@@ -985,18 +1032,19 @@ mod tests {
             },
         );
         let response = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+            POWERS_PAGE_DEADLINE + Duration::from_secs(1),
             crate::web::router(state.clone())
                 .oneshot(Request::get("/tokens/NVDA").body(Body::empty()).unwrap()),
         )
         .await
-        .expect("token page must not await live powers reads")
+        .expect("token page returns by its power deadline")
         .expect("token page response");
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .expect("token page body");
         assert!(String::from_utf8_lossy(&body).contains("NVDA tokenized"));
+        assert!(String::from_utf8_lossy(&body).contains("Signals unavailable (transient)"));
 
         tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
             .await
@@ -1014,6 +1062,62 @@ mod tests {
         .await
         .expect("background observation enters short retry cache");
     }
+    #[tokio::test]
+    async fn token_page_renders_power_badges_when_read_finishes_before_deadline() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let address = "11111111111111111111111111111111";
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut facts = crate::powers::PowerFacts::default();
+        facts.can_block.push(crate::powers::Reason::new(
+            "freeze_authority",
+            "Freeze authority can block transfers.",
+        ));
+        let state = token_page_state(
+            Box::new(GatedPowerReader {
+                started: started.clone(),
+                release: release.clone(),
+                facts,
+            }),
+            registry::Entry {
+                issuer: "Issuer".to_owned(),
+                ticker: "NVDA".to_owned(),
+                name: "Issuer NVDA".to_owned(),
+                chain: Chain::Solana,
+                contract: address.to_owned(),
+                decimals: Some(9),
+                source: "test".to_owned(),
+                source_url: "https://issuer.example/nvda".to_owned(),
+                last_checked: registry::now_rfc3339(),
+                removed_at: None,
+                stale_since: None,
+            },
+        );
+        let request = tokio::spawn(
+            crate::web::router(state)
+                .oneshot(Request::get("/tokens/NVDA").body(Body::empty()).unwrap()),
+        );
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("power read starts");
+        release.notify_one();
+        let response = tokio::time::timeout(POWERS_PAGE_DEADLINE, request)
+            .await
+            .expect("read completes within the page deadline")
+            .expect("token request task")
+            .expect("token page response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("token page body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("Can block"));
+        assert!(body.contains("Source unavailable"));
+        assert!(!body.contains("Signals unavailable (transient)"));
+    }
+
 
     #[tokio::test]
     async fn queued_power_prefetch_does_not_occupy_user_check_capacity() {
@@ -1022,6 +1126,7 @@ mod tests {
             Box::new(GatedPowerReader {
                 started: std::sync::Arc::new(tokio::sync::Notify::new()),
                 release: std::sync::Arc::new(tokio::sync::Notify::new()),
+                facts: crate::powers::PowerFacts::default(),
             }),
             registry::Entry {
                 issuer: "Issuer".to_owned(),
@@ -1051,6 +1156,110 @@ mod tests {
             .try_acquire_owned()
             .expect("queued prefetch leaves the user-check permit available");
     }
+
+    #[tokio::test]
+    async fn warm_pass_refreshes_stale_current_tickers_and_skips_fresh_ones() {
+        let nvda = "11111111111111111111111111111111";
+        let tsla = "So11111111111111111111111111111111111111112";
+        let gme = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+        let make_entry = |ticker: &str, contract: &str| registry::Entry {
+            issuer: "Issuer".to_owned(),
+            ticker: ticker.to_owned(),
+            name: format!("Issuer {ticker}"),
+            chain: Chain::Solana,
+            contract: contract.to_owned(),
+            decimals: Some(9),
+            source: "test".to_owned(),
+            source_url: "https://issuer.example/token".to_owned(),
+            last_checked: registry::now_rfc3339(),
+            removed_at: None,
+            stale_since: None,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = token_page_state(
+            Box::new(CountingPowerReader { calls: calls.clone() }),
+            make_entry("NVDA", nvda),
+        );
+        state.registry.write().await.extend([make_entry("TSLA", tsla), make_entry("GME", gme)]);
+
+        let mut leaderboard = crate::discovery::Leaderboard::default();
+        leaderboard.entries.push(crate::discovery::LeaderboardEntry {
+            rank: 1,
+            chain: "solana".to_owned(),
+            chain_label: "Solana".to_owned(),
+            dex: "raydium".to_owned(),
+            pool: "leaderboard-pool".to_owned(),
+            base_symbol: "NVDA".to_owned(),
+            quote_symbol: "USDC".to_owned(),
+            issuer: Some("Issuer".to_owned()),
+            ticker: Some("NVDA".to_owned()),
+            verdict: "verified".to_owned(),
+            price_usd: None,
+            change_24h_pct: None,
+            volume_24h_usd: None,
+            liquidity_usd: None,
+            txns_24h: None,
+            detail_url: "/validated/solana/pool".to_owned(),
+            trade_url: "https://dexscreener.com/solana/pool".to_owned(),
+            explorer_url: "https://solscan.io/account/pool".to_owned(),
+            attestation_id: None,
+            checked_at: None,
+        });
+        *state.leaderboard.write().await = leaderboard;
+        *state.featured.write().await = vec![crate::discovery::FeaturedPool {
+            chain: Chain::Solana,
+            dex: "raydium".to_owned(),
+            pool: "featured-pool".to_owned(),
+            base_symbol: "TSLA".to_owned(),
+            base_address: tsla.to_owned(),
+            quote_symbol: "USDC".to_owned(),
+            quote_address: "11111111111111111111111111111111".to_owned(),
+            issuer: Some("Issuer".to_owned()),
+            ticker: Some("TSLA".to_owned()),
+            verdict: "verified".to_owned(),
+            quote_balance: None,
+            quote_share_of_supply: None,
+            volume_24h_usd: None,
+            liquidity_usd: None,
+            curated: false,
+            note: None,
+            updated_at: registry::now_rfc3339(),
+        }];
+
+        let version = crate::state::current_registry_version();
+        let mut cached = powers_record(crate::powers::SourceVerified::Match);
+        cached.chain = Chain::Solana;
+        cached.contract = nvda.to_owned();
+        cached.observed_at = chrono::Utc::now().to_rfc3339();
+        state.powers_cache.insert((Chain::Solana, nvda.to_owned(), version), cached).await;
+        let mut stale_cached = powers_record(crate::powers::SourceVerified::Match);
+        stale_cached.chain = Chain::Solana;
+        stale_cached.contract = tsla.to_owned();
+        stale_cached.observed_at =
+            (chrono::Utc::now() - chrono::Duration::minutes(6)).to_rfc3339();
+        state.powers_cache.insert((Chain::Solana, tsla.to_owned(), version), stale_cached).await;
+
+        let summary = crate::powers::warm_current_pool_powers(&state).await;
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.transient, 1);
+        assert_eq!(summary.ok, 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let refreshed = state
+            .powers_retry_cache
+            .get(&(Chain::Solana, tsla.to_owned(), version))
+            .await
+            .expect("stale cached record was re-inspected");
+        let observed_at = chrono::DateTime::parse_from_rfc3339(&refreshed.observed_at)
+            .expect("refreshed observation timestamp")
+            .with_timezone(&chrono::Utc);
+        assert!(
+            chrono::Utc::now().signed_duration_since(observed_at) < chrono::Duration::minutes(1)
+        );
+        assert!(
+            state.powers_cache.get(&(Chain::Solana, gme.to_owned(), version)).await.is_none()
+        );
+    }
+
     #[test]
     fn wallet_address_routing_keeps_solana_distinct_and_checks_all_evm_chains() {
         assert_eq!(wallet_chains("11111111111111111111111111111111"), Some(vec![Chain::Solana]));

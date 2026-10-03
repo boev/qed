@@ -9,12 +9,21 @@ use axum::http::StatusCode;
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
+use tracing::info;
 
 pub(crate) mod evm;
 pub(crate) mod solana;
 
 const MAX_QUEUED_PREFETCHES: usize = 64;
+pub(crate) const POWERS_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+pub(crate) const POWERS_WARM_INTERVAL: Duration = Duration::from_secs(25 * 60);
+const POWERS_CACHE_REFRESH_AGE: Duration = Duration::from_secs(
+    POWERS_CACHE_TTL.as_secs() - POWERS_WARM_INTERVAL.as_secs(),
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Reason {
@@ -258,6 +267,20 @@ pub(crate) async fn cached_record(
     state.powers_retry_cache.get(&cache_key).await
 }
 
+pub(crate) async fn inspect_prefetched(
+    state: &AppState,
+    chain: Chain,
+    contract: &str,
+) -> Result<PowersRecord, PoolError> {
+    let _permit = state
+        .powers_prefetch_concurrency
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| PoolError::Reader("powers prefetch semaphore closed".to_owned()))?;
+    inspect(state, chain, contract).await
+}
+
 pub(crate) async fn schedule_prefetch(state: &AppState, chain: Chain, address: &str) {
     let Ok(contract) = canonical_contract(chain, address) else {
         return;
@@ -279,11 +302,139 @@ pub(crate) async fn schedule_prefetch(state: &AppState, chain: Chain, address: &
     }
     let state = state.clone();
     tokio::spawn(async move {
-        if let Ok(_permit) = state.powers_prefetch_concurrency.clone().acquire_owned().await {
-            let _ = inspect(&state, chain, &contract).await;
-        }
+        let _ = inspect_prefetched(&state, chain, &contract).await;
         state.powers_prefetching.lock().await.remove(&key);
     });
+}
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct WarmPassSummary {
+    pub(crate) ok: usize,
+    pub(crate) transient: usize,
+    pub(crate) skipped: usize,
+}
+
+fn powers_record_needs_warm_refresh(
+    record: &PowersRecord,
+    now: &chrono::DateTime<Utc>,
+) -> bool {
+    chrono::DateTime::parse_from_rfc3339(&record.observed_at)
+        .map(|observed_at| {
+            now.signed_duration_since(observed_at.with_timezone(&Utc)).num_seconds()
+                >= POWERS_CACHE_REFRESH_AGE.as_secs() as i64
+        })
+        .unwrap_or(true)
+}
+
+pub(crate) async fn warm_current_pool_powers(state: &AppState) -> WarmPassSummary {
+    let started = Instant::now();
+    let mut tickers = HashSet::new();
+    {
+        let leaderboard = state.leaderboard.read().await;
+        tickers.extend(
+            leaderboard
+                .entries
+                .iter()
+                .filter_map(|entry| entry.ticker.as_deref())
+                .map(|ticker| ticker.to_ascii_uppercase()),
+        );
+    }
+    {
+        let featured = state.featured.read().await;
+        tickers.extend(
+            featured
+                .iter()
+                .filter_map(|pool| pool.ticker.as_deref())
+                .map(|ticker| ticker.to_ascii_uppercase()),
+        );
+    }
+
+    let targets = {
+        let registry = state.registry.read().await;
+        let mut seen = HashSet::new();
+        let mut targets = Vec::new();
+        for entry in registry.iter().filter(|entry| registry::matchable(entry)) {
+            if !tickers.contains(&entry.ticker.to_ascii_uppercase()) {
+                continue;
+            }
+            let Ok(contract) = canonical_contract(entry.chain, &entry.contract) else {
+                continue;
+            };
+            if seen.insert((entry.chain, contract.clone())) {
+                targets.push((entry.chain, contract));
+            }
+        }
+        targets
+    };
+
+    let mut summary = WarmPassSummary::default();
+    let version = crate::state::current_registry_version();
+    for (chain, contract) in targets {
+        let key = (chain, contract.clone(), version);
+        let cached_record = state.powers_cache.get(&key).await;
+        let refresh_cached = cached_record
+            .as_ref()
+            .is_some_and(|record| powers_record_needs_warm_refresh(record, &Utc::now()));
+        if cached_record.is_some() && !refresh_cached {
+            summary.skipped += 1;
+            continue;
+        }
+        if state.powers_retry_cache.get(&key).await.is_some()
+            || state.powers_failure_cache.get(&key).await.is_some()
+        {
+            summary.skipped += 1;
+            continue;
+        }
+
+        let Some(_permit) = warm_permit(state).await else {
+            summary.transient += 1;
+            continue;
+        };
+        if refresh_cached {
+            if state
+                .powers_cache
+                .get(&key)
+                .await
+                .is_some_and(|record| !powers_record_needs_warm_refresh(&record, &Utc::now()))
+            {
+                summary.skipped += 1;
+                continue;
+            }
+            state.powers_cache.invalidate(&key).await;
+        }
+        match inspect(state, chain, &contract).await {
+            Ok(_) => {
+                let current_key = (chain, contract, crate::state::current_registry_version());
+                if state.powers_cache.get(&current_key).await.is_some() {
+                    summary.ok += 1;
+                } else {
+                    summary.transient += 1;
+                }
+            }
+            Err(_) => summary.transient += 1,
+        }
+
+    }
+
+    info!(
+        ok = summary.ok,
+        transient = summary.transient,
+        skipped = summary.skipped,
+        elapsed_ms = started.elapsed().as_millis(),
+        "powers warm pass completed"
+    );
+    summary
+}
+
+async fn warm_permit(state: &AppState) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    loop {
+        match state.powers_prefetch_concurrency.clone().try_acquire_owned() {
+            Ok(permit) => return Some(permit),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => return None,
+        }
+    }
 }
 
 
