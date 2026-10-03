@@ -35,6 +35,7 @@ sol! {
     #[sol(rpc)]
     interface TokenPowerProbe {
         function paused() external view returns (bool value);
+        function isPaused() external view returns (bool value);
         function owner() external view returns (address value);
         function pauser() external view returns (address value);
         function sanctionsList() external view returns (address value);
@@ -122,6 +123,19 @@ fn address_word(value: &Address) -> String {
     format!("0x{:064x}", U256::from_be_slice(value.as_slice()))
 }
 
+// PublicNode returned this exact JSON-RPC message for the default Ethereum endpoint's `paused()` revert.
+const PUBLICNODE_REVERT_MESSAGES: &[&str] = &["execution reverted"];
+
+fn is_deterministic_revert_response(error: &alloy::contract::Error) -> bool {
+    let alloy::contract::Error::TransportError(RpcError::ErrorResp(payload)) = error else {
+        return false;
+    };
+    payload.code == 3
+        || PUBLICNODE_REVERT_MESSAGES
+            .iter()
+            .any(|message| payload.message.eq_ignore_ascii_case(message))
+}
+
 fn record_power_call<T>(
     to: Address,
     calldata: &[u8],
@@ -156,7 +170,8 @@ fn record_power_call<T>(
                         | alloy::contract::Error::UnknownSelector(_)
                         | alloy::contract::Error::ZeroData(_, _)
                         | alloy::contract::Error::AbiError(_)
-                );
+                )
+                || is_deterministic_revert_response(&error);
             let raw_result = if let Some(data) = revert_data {
                 Value::String(raw_hex(&data))
             } else if absent {
@@ -1104,6 +1119,18 @@ impl PoolReader for EvmReader {
         );
         unavailable.extend(issue);
 
+        let call = probe.isPaused();
+        let calldata = call.calldata().to_vec();
+        let (is_paused, issue) = record_power_call(
+            contract,
+            &calldata,
+            block,
+            "isPaused()",
+            call.block(block_id).call().await,
+            |value| format!("0x{:064x}", u8::from(*value)),
+        );
+        unavailable.extend(issue);
+
         let call = probe.owner();
         let calldata = call.calldata().to_vec();
         let (owner_value, issue) = record_power_call(
@@ -1167,6 +1194,7 @@ impl PoolReader for EvmReader {
             beacon,
             beacon_implementation,
             paused,
+            is_paused,
             owner: owner_value
                 .filter(|owner| *owner != Address::ZERO)
                 .map(canonical),
@@ -1287,6 +1315,17 @@ mod tests {
         map.insert(selector_key(to, selector), result);
     }
 
+    const RPC_ERROR_FIXTURE_PREFIX: &str = "__rpc_error__:";
+    const TRANSPORT_FAILURE_FIXTURE: &str = "__transport_failure__";
+
+    fn rpc_error_fixture(code: i64, message: &str, data: Option<&str>) -> String {
+        let mut error = json!({"code": code, "message": message});
+        if let Some(data) = data {
+            error["data"] = json!(data);
+        }
+        format!("{RPC_ERROR_FIXTURE_PREFIX}{error}")
+    }
+
     fn standard_v2_pool(map: &mut HashMap<String, String>, pool: &str, token0: &str, token1: &str) {
         put_call(map, pool, "0x0dfe1681", address_word(token0));
         put_call(map, pool, "0xd21220a7", address_word(token1));
@@ -1360,6 +1399,14 @@ mod tests {
         let selector = request_selector_key(&request);
         let result = responses.get(&key).or_else(|| responses.get(&selector)).cloned();
         let response = match result {
+            Some(result) if result == TRANSPORT_FAILURE_FIXTURE => return Ok(()),
+            Some(result) if result.starts_with(RPC_ERROR_FIXTURE_PREFIX) => {
+                let error: Value = serde_json::from_str(
+                    result.strip_prefix(RPC_ERROR_FIXTURE_PREFIX).expect("error prefix"),
+                )
+                .unwrap();
+                json!({"jsonrpc":"2.0","id":id,"error":error})
+            }
             Some(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
             None => json!({
                 "jsonrpc":"2.0",
@@ -1455,6 +1502,21 @@ mod tests {
         (reader, task)
     }
 
+    fn power_probe_responses(paused: String, is_paused: String) -> HashMap<String, String> {
+        let mut map = responses();
+        map.insert("eth_blockNumber".to_owned(), "0x2a".to_owned());
+        for slot in [EIP1967_IMPLEMENTATION_SLOT, EIP1967_ADMIN_SLOT, EIP1967_BEACON_SLOT] {
+            map.insert(storage_key(TOKEN0, slot), format!("0x{}", uint_word(0)));
+        }
+        put_selector(&mut map, TOKEN0, &function_selector("paused()"), paused);
+        put_selector(&mut map, TOKEN0, &function_selector("isPaused()"), is_paused);
+        let zero = address_word("0x0000000000000000000000000000000000000000");
+        for getter in ["owner()", "pauser()", "sanctionsList()"] {
+            put_selector(&mut map, TOKEN0, &function_selector(getter), zero.clone());
+        }
+        map
+    }
+
     fn function_selector(signature: &str) -> String {
         let hash = alloy::primitives::keccak256(signature.as_bytes());
         raw_hex(&hash[..4])
@@ -1484,8 +1546,20 @@ mod tests {
         put_selector(
             &mut map,
             TOKEN0,
+            &function_selector("isPaused()"),
+            format!("0x{}", uint_word(0)),
+        );
+        put_selector(
+            &mut map,
+            TOKEN0,
             &function_selector("owner()"),
             address_word(TOKEN1),
+        );
+        put_selector(
+            &mut map,
+            TOKEN0,
+            &function_selector("pauser()"),
+            TRANSPORT_FAILURE_FIXTURE.to_owned(),
         );
         put_selector(&mut map, TOKEN0, &function_selector("sanctionsList()"), "0x".to_owned());
         put_selector(
@@ -1526,7 +1600,155 @@ mod tests {
         assert_eq!(empty_decode.raw_result, Some(json!("0x")));
         assert!(empty_decode.block == Some(block));
     }
+    #[tokio::test]
+    async fn deterministic_paused_reverts_are_absent_with_or_without_revert_data() {
+        for data in [None, Some("0x")] {
+            let map = power_probe_responses(
+                rpc_error_fixture(3, "execution reverted", data),
+                format!("0x{}", uint_word(0)),
+            );
+            let (reader, task) = reader_for(map, Chain::Ethereum).await;
+            let (facts, log) = crate::attest::capture_reads(reader.power_facts(TOKEN0)).await;
+            task.abort();
+            let facts = facts.expect("token-power probes complete");
+            assert!(!facts.transient_failure, "revert data shape: {data:?}");
+            assert!(facts.unavailable.is_empty(), "revert data shape: {data:?}");
+            let pausable = facts
+                .can_block
+                .iter()
+                .find(|reason| reason.code == "pausable")
+                .expect("isPaused() provides a pause-state fact");
+            assert!(pausable.detail.contains("isPaused() is implemented"));
 
+            let paused_read = log
+                .reads
+                .iter()
+                .find(|read| {
+                    read.method == "eth_call"
+                        && read.params[0]["data"]
+                            .as_str()
+                            .is_some_and(|call| call.starts_with(&function_selector("paused()")))
+                })
+                .expect("paused() read captured");
+            assert_eq!(paused_read.raw_result, Some(json!("0x")));
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_getter_rpc_errors_are_classified_as_transient_or_absent() {
+        for (code, message, expected_unavailable, expected_raw) in [
+            (
+                -32005,
+                "rate limit exceeded",
+                Some("rate_limited"),
+                json!({"available": false}),
+            ),
+            (
+                -32000,
+                "header not found",
+                Some("rpc_unavailable"),
+                json!({"available": false}),
+            ),
+            (-32000, "execution reverted", None, json!("0x")),
+        ] {
+            let map = power_probe_responses(
+                rpc_error_fixture(code, message, None),
+                format!("0x{}", uint_word(0)),
+            );
+            let (reader, task) = reader_for(map, Chain::Ethereum).await;
+            let (facts, log) = crate::attest::capture_reads(reader.power_facts(TOKEN0)).await;
+            task.abort();
+            let facts = facts.expect("token-power probes complete");
+            assert_eq!(facts.transient_failure, expected_unavailable.is_some(), "{message}");
+            if let Some(expected) = expected_unavailable {
+                assert_eq!(
+                    facts.unavailable.iter().map(|reason| reason.code.as_str()).collect::<Vec<_>>(),
+                    [expected],
+                    "{message}"
+                );
+            } else {
+                assert!(facts.unavailable.is_empty(), "{message}");
+            }
+            let paused_read = log
+                .reads
+                .iter()
+                .find(|read| {
+                    read.method == "eth_call"
+                        && read.params[0]["data"]
+                            .as_str()
+                            .is_some_and(|call| call.starts_with(&function_selector("paused()")))
+                })
+                .expect("paused() read captured");
+            assert_eq!(paused_read.raw_result, Some(expected_raw), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn is_paused_getter_falls_back_when_paused_is_absent() {
+        for (is_paused, expected_detail) in [
+            (true, "currently paused"),
+            (false, "currently not paused"),
+        ] {
+            let expected_raw = format!("0x{}", uint_word(if is_paused { 1 } else { 0 }));
+            let map = power_probe_responses(
+                rpc_error_fixture(-32000, "execution reverted", None),
+                expected_raw.clone(),
+            );
+            let (reader, task) = reader_for(map, Chain::Ethereum).await;
+            let (facts, log) = crate::attest::capture_reads(reader.power_facts(TOKEN0)).await;
+            task.abort();
+            let facts = facts.expect("token-power probes complete");
+            assert!(!facts.transient_failure);
+            assert!(facts.unavailable.is_empty());
+            let pausable = facts
+                .can_block
+                .iter()
+                .find(|reason| reason.code == "pausable")
+                .expect("isPaused() provides a pause-state fact");
+            assert!(pausable.detail.contains("isPaused() is implemented"));
+            assert!(pausable.detail.contains(expected_detail));
+
+            let is_paused_read = log
+                .reads
+                .iter()
+                .find(|read| {
+                    read.method == "eth_call"
+                        && read.params[0]["data"]
+                            .as_str()
+                            .is_some_and(|call| call.starts_with(&function_selector("isPaused()")))
+                })
+                .expect("isPaused() read captured");
+            assert_eq!(is_paused_read.raw_result, Some(json!(expected_raw)));
+            assert_eq!(is_paused_read.block, Some(42));
+
+            let paused_read = log
+                .reads
+                .iter()
+                .find(|read| {
+                    read.method == "eth_call"
+                        && read.params[0]["data"]
+                            .as_str()
+                            .is_some_and(|call| call.starts_with(&function_selector("paused()")))
+                })
+                .expect("paused() read captured");
+            assert_eq!(paused_read.raw_result, Some(json!("0x")));
+        }
+    }
+ 
+
+
+    #[tokio::test]
+    async fn absent_pause_getters_produce_no_pausable_fact() {
+        let absent = rpc_error_fixture(-32000, "execution reverted", None);
+        let map = power_probe_responses(absent.clone(), absent);
+        let (reader, task) = reader_for(map, Chain::Ethereum).await;
+        let facts = reader.power_facts(TOKEN0).await.expect("token-power probes complete");
+        task.abort();
+
+        assert!(!facts.transient_failure);
+        assert!(facts.unavailable.is_empty());
+        assert!(!facts.can_block.iter().any(|reason| reason.code == "pausable"));
+    }
     #[tokio::test]
     async fn decodes_v2_pool_and_quote_candidate() {
         let mut map = responses();

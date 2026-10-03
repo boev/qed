@@ -1141,6 +1141,47 @@ mod tests {
         assert!(!body.contains("Signals unavailable (transient)"));
     }
 
+    #[tokio::test]
+    async fn complete_power_facts_use_the_full_ttl_cache() {
+        let address = "11111111111111111111111111111111";
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut state = token_page_state(
+            Box::new(CountingPowerReader { calls: calls.clone() }),
+            registry::Entry {
+                issuer: "Issuer".to_owned(),
+                ticker: "NVDA".to_owned(),
+                name: "Issuer NVDA".to_owned(),
+                chain: Chain::Solana,
+                contract: address.to_owned(),
+                decimals: Some(9),
+                source: "test".to_owned(),
+                source_url: "https://issuer.example/nvda".to_owned(),
+                last_checked: registry::now_rfc3339(),
+                removed_at: None,
+                stale_since: None,
+            },
+        );
+        state.powers_cache = moka::future::Cache::builder()
+            .time_to_live(crate::powers::POWERS_CACHE_TTL)
+            .build();
+        let key = (Chain::Solana, address.to_owned(), crate::state::current_registry_version());
+
+        let record = crate::powers::inspect(&state, Chain::Solana, address)
+            .await
+            .expect("complete observation");
+        assert!(record.unavailable.is_empty());
+        assert_eq!(record.source_verified, crate::powers::SourceVerified::Unavailable);
+        assert!(state.powers_cache.get(&key).await.is_some());
+        assert!(state.powers_retry_cache.get(&key).await.is_none());
+        assert_eq!(crate::powers::POWERS_CACHE_TTL, Duration::from_secs(30 * 60));
+
+        let cached = crate::powers::inspect(&state, Chain::Solana, address)
+            .await
+            .expect("cached complete observation");
+        assert_eq!(cached.observed_at, record.observed_at);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
 
     #[tokio::test]
     async fn queued_power_prefetch_does_not_occupy_user_check_capacity() {

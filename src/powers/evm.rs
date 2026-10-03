@@ -12,6 +12,7 @@ pub(crate) struct ProbeSnapshot {
     #[serde(default)]
     pub beacon_implementation: Option<String>,
     pub paused: Option<bool>,
+    pub is_paused: Option<bool>,
     pub owner: Option<String>,
     pub pauser: Option<String>,
     #[serde(rename = "sanctionsList")]
@@ -26,7 +27,8 @@ pub(crate) fn analyze(snapshot: ProbeSnapshot) -> PowerFacts {
         snapshot.implementation.is_some() || snapshot.admin.is_some() || snapshot.beacon.is_some();
     facts.source_target =
         snapshot.implementation.clone().or_else(|| snapshot.beacon_implementation.clone());
-    let pausable = snapshot.paused.map(|paused| pausable_detail(&snapshot, paused));
+    let pausable = effective_paused(&snapshot)
+        .map(|(paused, getter)| pausable_detail(&snapshot, paused, getter));
     facts.unavailable = snapshot.unavailable;
     if let Some(implementation) = snapshot.implementation {
         facts.can_change_rules.push(Reason::new(
@@ -71,21 +73,33 @@ pub(crate) fn analyze(snapshot: ProbeSnapshot) -> PowerFacts {
     }
     facts
 }
-fn pausable_detail(snapshot: &ProbeSnapshot, paused: bool) -> String {
+fn effective_paused(snapshot: &ProbeSnapshot) -> Option<(bool, &'static str)> {
+    if snapshot.paused == Some(true) {
+        Some((true, "paused()"))
+    } else if snapshot.is_paused == Some(true) {
+        Some((true, "isPaused()"))
+    } else if snapshot.paused.is_some() {
+        Some((false, "paused()"))
+    } else {
+        snapshot.is_paused.map(|paused| (paused, "isPaused()"))
+    }
+}
+
+fn pausable_detail(snapshot: &ProbeSnapshot, paused: bool, getter: &str) -> String {
     let state = if paused { "currently paused" } else { "currently not paused" };
     match (snapshot.pauser.as_deref(), snapshot.owner.as_deref()) {
         (Some(pauser), Some(owner)) => format!(
-            "paused() is implemented; {state}; pauser() returned {pauser}; owner() returned {owner}."
+            "{getter} is implemented; {state}; pauser() returned {pauser}; owner() returned {owner}."
         ),
         (Some(pauser), None) => format!(
-            "paused() is implemented; {state}; pauser() returned {pauser}; owner not identified by this read."
+            "{getter} is implemented; {state}; pauser() returned {pauser}; owner not identified by this read."
         ),
         (None, Some(owner)) => format!(
-            "paused() is implemented; {state}; pauser not identified by this read; owner() returned {owner}."
+            "{getter} is implemented; {state}; pauser not identified by this read; owner() returned {owner}."
         ),
-        (None, None) => format!(
-            "paused() is implemented; {state} (pauser not identified by this read)."
-        ),
+        (None, None) => {
+            format!("{getter} is implemented; {state} (pauser not identified by this read).")
+        }
     }
 }
 
