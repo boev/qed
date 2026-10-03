@@ -365,14 +365,20 @@ async fn main() -> Result<()> {
 
     let discovery_state = state.clone();
     let discovery_dir = config.data_dir.clone();
+    let discovery_warm_notify = Arc::clone(&powers_warm_notify);
     tokio::spawn(async move {
         if let Some(delay) = first_discovery_delay {
             tokio::time::sleep(delay).await;
         }
         let mut first_refresh = true;
         loop {
-            let retry_soon =
-                discovery::refresh_discovery(&discovery_state, &discovery_dir, first_refresh).await;
+            let retry_soon = discovery::refresh_discovery(
+                &discovery_state,
+                &discovery_dir,
+                first_refresh,
+                &discovery_warm_notify,
+            )
+            .await;
             if !retry_soon {
                 first_refresh = false;
             }

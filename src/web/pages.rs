@@ -947,6 +947,29 @@ mod tests {
         }
     }
 
+    struct TransientPowerReader;
+
+    #[async_trait::async_trait]
+    impl crate::pool::PoolReader for TransientPowerReader {
+        fn chain(&self) -> Chain {
+            Chain::Solana
+        }
+
+        async fn read_pool(&self, _address: &str) -> Result<crate::pool::PoolInfo, PoolError> {
+            Err(PoolError::Reader("unused token-page test reader".to_owned()))
+        }
+
+        async fn power_facts(
+            &self,
+            _address: &str,
+        ) -> Result<crate::powers::PowerFacts, PoolError> {
+            let mut facts = crate::powers::PowerFacts::default();
+            facts.transient_failure = true;
+            facts.unavailable.push(crate::powers::Reason::new("rpc_timeout", "RPC timed out."));
+            Ok(facts)
+        }
+    }
+
     fn token_page_state(reader: Box<dyn crate::pool::PoolReader>, entry: registry::Entry) -> AppState {
         AppState {
             registry: std::sync::Arc::new(tokio::sync::RwLock::new(vec![entry])),
@@ -1053,14 +1076,14 @@ mod tests {
         let key = (Chain::Solana, address.to_owned(), crate::state::current_registry_version());
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
-                if state.powers_retry_cache.get(&key).await.is_some() {
+                if state.powers_cache.get(&key).await.is_some() {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("background observation enters short retry cache");
+        .expect("background observation enters complete powers cache");
     }
     #[tokio::test]
     async fn token_page_renders_power_badges_when_read_finishes_before_deadline() {
@@ -1240,12 +1263,19 @@ mod tests {
         state.powers_cache.insert((Chain::Solana, tsla.to_owned(), version), stale_cached).await;
 
         let summary = crate::powers::warm_current_pool_powers(&state).await;
+        assert!(summary.warmed);
+        assert_eq!(summary.target_count, 2);
+        assert_eq!(summary.tickers_covered, 2);
+        assert!(!summary.cap_hit);
         assert_eq!(summary.skipped, 1);
-        assert_eq!(summary.transient, 1);
-        assert_eq!(summary.ok, 0);
+        assert_eq!(summary.transient, 0);
+        assert_eq!(summary.ok, 1);
+        assert_eq!(summary.by_chain[0].ok, 1);
+        assert_eq!(summary.by_chain[0].transient, 0);
+        assert_eq!(summary.by_chain[0].source_unavailable, 1);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
         let refreshed = state
-            .powers_retry_cache
+            .powers_cache
             .get(&(Chain::Solana, tsla.to_owned(), version))
             .await
             .expect("stale cached record was re-inspected");
@@ -1258,6 +1288,154 @@ mod tests {
         assert!(
             state.powers_cache.get(&(Chain::Solana, gme.to_owned(), version)).await.is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn transient_warm_refresh_keeps_cached_facts_visible_on_token_page() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let address = "11111111111111111111111111111111";
+        let state = token_page_state(
+            Box::new(TransientPowerReader),
+            registry::Entry {
+                issuer: "Issuer".to_owned(),
+                ticker: "NVDA".to_owned(),
+                name: "Issuer NVDA".to_owned(),
+                chain: Chain::Solana,
+                contract: address.to_owned(),
+                decimals: Some(9),
+                source: "test".to_owned(),
+                source_url: "https://issuer.example/nvda".to_owned(),
+                last_checked: registry::now_rfc3339(),
+                removed_at: None,
+                stale_since: None,
+            },
+        );
+        *state.featured.write().await = vec![crate::discovery::FeaturedPool {
+            chain: Chain::Solana,
+            dex: "raydium".to_owned(),
+            pool: "featured-pool".to_owned(),
+            base_symbol: "NVDA".to_owned(),
+            base_address: address.to_owned(),
+            quote_symbol: "USDC".to_owned(),
+            quote_address: "So11111111111111111111111111111111111111112".to_owned(),
+            issuer: Some("Issuer".to_owned()),
+            ticker: Some("NVDA".to_owned()),
+            verdict: "verified".to_owned(),
+            quote_balance: None,
+            quote_share_of_supply: None,
+            volume_24h_usd: None,
+            liquidity_usd: None,
+            curated: false,
+            note: None,
+            updated_at: registry::now_rfc3339(),
+        }];
+
+        let version = crate::state::current_registry_version();
+        let mut cached = powers_record(crate::powers::SourceVerified::Match);
+        cached.chain = Chain::Solana;
+        cached.contract = address.to_owned();
+        cached.source_verified_subject = crate::powers::SourceVerifiedSubject::TokenProgram;
+        cached.can_seize.push(crate::powers::Reason::new(
+            "permanent_delegate",
+            "Permanent delegate can transfer or burn tokens.",
+        ));
+        cached.observed_at =
+            (chrono::Utc::now() - chrono::Duration::minutes(6)).to_rfc3339();
+        let cached_time = cached.observed_at.clone();
+        let key = (Chain::Solana, address.to_owned(), version);
+        state.powers_cache.insert(key.clone(), cached).await;
+
+        let summary = crate::powers::warm_current_pool_powers(&state).await;
+        assert_eq!(summary.transient, 1);
+        assert_eq!(summary.skipped, 0);
+        assert_eq!(summary.ok, 0);
+        let retained = state.powers_cache.get(&key).await.expect("prior complete observation remains cached");
+        assert_eq!(retained.observed_at, cached_time);
+        assert_eq!(retained.can_seize[0].code, "permanent_delegate");
+
+        let response = crate::web::router(state)
+            .oneshot(Request::get("/tokens/NVDA").body(Body::empty()).unwrap())
+            .await
+            .expect("token page response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("token page body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("Can seize"));
+        assert!(body.contains("Permanent delegate can transfer or burn tokens."));
+        assert!(!body.contains("Signals unavailable (transient)"));
+    }
+
+
+    #[tokio::test]
+    async fn warm_notification_triggers_when_first_leaderboard_ticker_loads() {
+        let address = "11111111111111111111111111111111";
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = token_page_state(
+            Box::new(CountingPowerReader { calls: calls.clone() }),
+            registry::Entry {
+                issuer: "Issuer".to_owned(),
+                ticker: "NVDA".to_owned(),
+                name: "NVIDIA".to_owned(),
+                chain: Chain::Solana,
+                contract: address.to_owned(),
+                decimals: Some(9),
+                source: "test".to_owned(),
+                source_url: "https://issuer.example/nvda".to_owned(),
+                last_checked: registry::now_rfc3339(),
+                removed_at: None,
+                stale_since: None,
+            },
+        );
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        assert!(!crate::powers::notify_powers_warm_if_targets(&state, &notify).await);
+        let empty_summary = crate::powers::warm_current_pool_powers(&state).await;
+        assert!(!empty_summary.warmed);
+        assert_eq!(empty_summary.target_count, 0);
+
+        let warm_state = state.clone();
+        let warm_notify = notify.clone();
+        let warm_task = tokio::spawn(async move {
+            warm_notify.notified().await;
+            crate::powers::warm_current_pool_powers(&warm_state).await
+        });
+        let mut leaderboard = crate::discovery::Leaderboard::default();
+        leaderboard.entries.push(crate::discovery::LeaderboardEntry {
+            rank: 1,
+            chain: "solana".to_owned(),
+            chain_label: "Solana".to_owned(),
+            dex: "raydium".to_owned(),
+            pool: "leaderboard-pool".to_owned(),
+            base_symbol: "NVDA".to_owned(),
+            quote_symbol: "USDC".to_owned(),
+            issuer: Some("Issuer".to_owned()),
+            ticker: Some("NVDA".to_owned()),
+            verdict: "verified".to_owned(),
+            price_usd: None,
+            change_24h_pct: None,
+            volume_24h_usd: None,
+            liquidity_usd: None,
+            txns_24h: None,
+            detail_url: "/validated/solana/pool".to_owned(),
+            trade_url: "https://dexscreener.com/solana/pool".to_owned(),
+            explorer_url: "https://solscan.io/account/pool".to_owned(),
+            attestation_id: None,
+            checked_at: None,
+        });
+        *state.leaderboard.write().await = leaderboard;
+        assert!(crate::powers::notify_powers_warm_if_targets(&state, &notify).await);
+
+        let summary = tokio::time::timeout(Duration::from_secs(1), warm_task)
+            .await
+            .expect("first-board notification starts warm pass")
+            .expect("warm task");
+        assert!(summary.warmed);
+        assert_eq!(summary.target_count, 1);
+        assert_eq!(summary.ok, 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]

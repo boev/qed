@@ -174,7 +174,7 @@ fn record_power_call<T>(
             );
             let unavailable = (!absent).then(|| {
                 crate::powers::Reason::new(
-                    "rpc_unavailable",
+                    contract_error_reason_code(&error),
                     format!("{method} read did not complete; this observation is unavailable."),
                 )
             });
@@ -425,6 +425,38 @@ fn retryable_error(error: &TransportError) -> bool {
             error.as_http_error().is_some_and(|error| error.status == 429)
         }
         _ => false,
+    }
+}
+
+pub(crate) fn transient_reason_code(error: &TransportError) -> &'static str {
+    if retryable_error(error) {
+        return "rate_limited";
+    }
+    match error {
+        RpcError::DeserError { .. } => "parse_error",
+        RpcError::Transport(error)
+            if error
+                .as_http_error()
+                .is_some_and(|error| matches!(error.status, 408 | 504)) =>
+        {
+            "rpc_timeout"
+        }
+        RpcError::Transport(error)
+            if error
+                .as_custom()
+                .and_then(|error| error.downcast_ref::<reqwest::Error>())
+                .is_some_and(reqwest::Error::is_timeout) =>
+        {
+            "rpc_timeout"
+        }
+        _ => "rpc_unavailable",
+    }
+}
+
+pub(crate) fn contract_error_reason_code(error: &alloy::contract::Error) -> &'static str {
+    match error {
+        alloy::contract::Error::TransportError(error) => transient_reason_code(error),
+        _ => "rpc_unavailable",
     }
 }
 
@@ -967,7 +999,7 @@ impl EvmReader {
         let params = json!([canonical(contract), slot, format!("0x{block:x}")]);
         let value = match self.provider.get_storage_at(contract, key).block_id(block_id).await {
             Ok(value) => value,
-            Err(_) => {
+            Err(error) => {
                 crate::attest::record_read(
                     "eth_getStorageAt",
                     params,
@@ -979,7 +1011,7 @@ impl EvmReader {
                 return (
                     None,
                     Some(crate::powers::Reason::new(
-                        "rpc_unavailable",
+                        transient_reason_code(&error),
                         "EIP-1967 storage read did not complete; this observation is unavailable.",
                     )),
                 );
@@ -1034,7 +1066,9 @@ impl PoolReader for EvmReader {
             .provider
             .get_block_number()
             .await
-            .map_err(|_| PoolError::Reader("reading current block number failed".to_owned()))?;
+            .map_err(|error| {
+                PoolError::Reader(format!("reading current block number failed: {error}"))
+            })?;
         let block_result = Value::String(format!("0x{block:x}"));
         crate::attest::record_read(
             "eth_blockNumber",
@@ -1614,4 +1648,23 @@ mod tests {
         );
         assert_eq!(decoded.tick.as_i32(), 49_740);
     }
+    #[test]
+    fn transient_reason_codes_use_typed_transport_errors() {
+        let rate_limited = TransportErrorKind::http_error(429, String::new());
+        assert_eq!(transient_reason_code(&rate_limited), "rate_limited");
+
+        let timeout = TransportErrorKind::http_error(504, String::new());
+        assert_eq!(transient_reason_code(&timeout), "rpc_timeout");
+        let contract_timeout =
+            alloy::contract::Error::TransportError(TransportErrorKind::http_error(
+                504,
+                String::new(),
+            ));
+        assert_eq!(contract_error_reason_code(&contract_timeout), "rpc_timeout");
+
+        let url_timeout =
+            TransportErrorKind::custom_str("request https://rpc.example/?timeout=5000 failed");
+        assert_eq!(transient_reason_code(&url_timeout), "rpc_unavailable");
+    }
+
 }

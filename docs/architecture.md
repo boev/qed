@@ -38,7 +38,12 @@ flowchart TB
     S --> OBJ[Attestation store and bounded index]
 ```
 
-Ordinary page and API reads use prepared in-memory snapshots. They do not trigger pool discovery or blockchain reads unless the route explicitly performs a check, wallet scan, token-power observation, re-check, or verification operation. Token pages wait up to 2.5 seconds for concurrent token-power observations, then render completed cached results and mark unresolved observations unavailable while deduplicated background reads continue. A low-priority warm pass covers active registry contracts represented by current leaderboard or featured tickers at startup, after registry refresh changes, and every 25 minutes; it re-inspects cached observations at least five minutes before the 30-minute TTL and shares the bounded powers-prefetch semaphore. Complete observations use the 30-minute cache, while incomplete reads and hard failures are retained for 30 seconds before retry.
+Ordinary page and API reads use prepared in-memory snapshots. They do not trigger pool discovery or blockchain reads unless the route explicitly performs a check, wallet scan, token-power observation, re-check, or verification operation. Token pages wait up to 2.5 seconds for concurrent token-power observations, then render completed cached results and mark unresolved observations unavailable while deduplicated background reads continue.
+
+The powers warm pass is low priority and reports `warmed=false` when there are no targets, so an empty startup pass does not suppress later discovery-triggered work. It covers featured tickers first, then leaderboard tickers by rank, admitting whole ticker groups up to 160 contracts. Eligible passes run at startup, after registry changes and discovery refreshes, and every 25 minutes; records at least five minutes old are refreshed before the 30-minute cache TTL. Summaries include covered ticker count, cap status, per-chain results, source-unavailable counts, and the top transient reason codes. A Sourcify/source-unavailable result does not discard successfully read on-chain powers.
+Complete on-chain records remain cached for 30 minutes even when `source_verified: unavailable`; warm refreshes revisit them before expiry.
+
+Complete observations use the 30-minute cache, while incomplete RPC reads and hard failures are retained for 30 seconds before retry.
 
 The shared discovery pass fetches candidate pairs once and derives both the leaderboard and featured-pool candidates from that response. Results common to both lists reuse the same on-chain check result. A failed refresh preserves the previous valid snapshot.
 

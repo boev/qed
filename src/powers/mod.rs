@@ -10,10 +10,11 @@ use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     time::{Duration, Instant},
 };
 use tracing::info;
+use tokio::sync::Notify;
 
 pub(crate) mod evm;
 pub(crate) mod solana;
@@ -24,6 +25,7 @@ pub(crate) const POWERS_WARM_INTERVAL: Duration = Duration::from_secs(25 * 60);
 const POWERS_CACHE_REFRESH_AGE: Duration = Duration::from_secs(
     POWERS_CACHE_TTL.as_secs() - POWERS_WARM_INTERVAL.as_secs(),
 );
+pub(crate) const POWERS_WARM_MAX_CONTRACTS: usize = 160;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Reason {
@@ -149,13 +151,38 @@ pub(crate) async fn inspect(
     chain: Chain,
     contract: &str,
 ) -> Result<PowersRecord, PoolError> {
+    inspect_with_refresh(state, chain, contract, false).await
+}
+
+async fn inspect_for_warm_refresh(
+    state: &AppState,
+    chain: Chain,
+    contract: &str,
+) -> Result<PowersRecord, PoolError> {
+    inspect_with_refresh(state, chain, contract, true).await
+}
+
+async fn inspect_with_refresh(
+    state: &AppState,
+    chain: Chain,
+    contract: &str,
+    refresh_stale: bool,
+) -> Result<PowersRecord, PoolError> {
     let contract = canonical_contract(chain, contract)?;
     let version = crate::state::current_registry_version();
     let cache_key = (chain, contract.clone(), version);
-    if let Some(record) = state.powers_cache.get(&cache_key).await {
+    if !refresh_stale {
+        if let Some(record) = state.powers_cache.get(&cache_key).await {
+            return Ok(record);
+        }
+        if let Some(record) = state.powers_retry_cache.get(&cache_key).await {
+            return Ok(record);
+        }
+    } else if let Some(record) = state.powers_cache.get(&cache_key).await
+        && !powers_record_needs_warm_refresh(&record, &Utc::now())
+    {
         return Ok(record);
-    }
-    if let Some(record) = state.powers_retry_cache.get(&cache_key).await {
+    } else if let Some(record) = state.powers_retry_cache.get(&cache_key).await {
         return Ok(record);
     }
     if state.powers_failure_cache.get(&cache_key).await.is_some() {
@@ -168,10 +195,18 @@ pub(crate) async fn inspect(
         })
         .await;
     let _guard = lock.lock().await;
-    if let Some(record) = state.powers_cache.get(&cache_key).await {
+    if !refresh_stale {
+        if let Some(record) = state.powers_cache.get(&cache_key).await {
+            return Ok(record);
+        }
+        if let Some(record) = state.powers_retry_cache.get(&cache_key).await {
+            return Ok(record);
+        }
+    } else if let Some(record) = state.powers_cache.get(&cache_key).await
+        && !powers_record_needs_warm_refresh(&record, &Utc::now())
+    {
         return Ok(record);
-    }
-    if let Some(record) = state.powers_retry_cache.get(&cache_key).await {
+    } else if let Some(record) = state.powers_retry_cache.get(&cache_key).await {
         return Ok(record);
     }
     if state.powers_failure_cache.get(&cache_key).await.is_some() {
@@ -213,9 +248,7 @@ pub(crate) async fn inspect(
             return Err(error);
         }
     };
-    let is_transient = facts.transient_failure
-        || source_verified == SourceVerified::Unavailable
-        || source_verified_proxy == Some(SourceVerified::Unavailable);
+    let is_transient = facts.transient_failure;
     let record = PowersRecord {
         chain,
         contract,
@@ -232,12 +265,12 @@ pub(crate) async fn inspect(
         reads: read_log.reads,
     };
 
-    if version == crate::state::current_registry_version() {
-        if is_transient {
-            state.powers_retry_cache.insert(cache_key, record.clone()).await;
-        } else {
-            state.powers_cache.insert(cache_key, record.clone()).await;
-        }
+    state.powers_failure_cache.invalidate(&cache_key).await;
+    if is_transient {
+        state.powers_retry_cache.insert(cache_key, record.clone()).await;
+    } else {
+        state.powers_retry_cache.invalidate(&cache_key).await;
+        state.powers_cache.insert(cache_key, record.clone()).await;
     }
     Ok(record)
 }
@@ -307,10 +340,30 @@ pub(crate) async fn schedule_prefetch(state: &AppState, chain: Chain, address: &
     });
 }
 #[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct WarmChainSummary {
+    pub(crate) ok: usize,
+    pub(crate) transient: usize,
+    pub(crate) source_unavailable: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct WarmPassSummary {
+    pub(crate) warmed: bool,
+    pub(crate) target_count: usize,
+    pub(crate) tickers_covered: usize,
+    pub(crate) cap_hit: bool,
     pub(crate) ok: usize,
     pub(crate) transient: usize,
     pub(crate) skipped: usize,
+    pub(crate) by_chain: [WarmChainSummary; 5],
+    pub(crate) transient_reasons: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Default)]
+struct WarmTargetSelection {
+    targets: Vec<(Chain, String)>,
+    tickers_covered: usize,
+    cap_hit: bool,
 }
 
 fn powers_record_needs_warm_refresh(
@@ -325,50 +378,160 @@ fn powers_record_needs_warm_refresh(
         .unwrap_or(true)
 }
 
-pub(crate) async fn warm_current_pool_powers(state: &AppState) -> WarmPassSummary {
-    let started = Instant::now();
-    let mut tickers = HashSet::new();
-    {
-        let leaderboard = state.leaderboard.read().await;
-        tickers.extend(
-            leaderboard
-                .entries
-                .iter()
-                .filter_map(|entry| entry.ticker.as_deref())
-                .map(|ticker| ticker.to_ascii_uppercase()),
-        );
+fn append_warm_ticker(ticker: &str, seen: &mut HashSet<String>, ordered: &mut Vec<String>) {
+    let ticker = ticker.trim().to_ascii_uppercase();
+    if !ticker.is_empty() && seen.insert(ticker.clone()) {
+        ordered.push(ticker);
     }
-    {
-        let featured = state.featured.read().await;
-        tickers.extend(
-            featured
-                .iter()
-                .filter_map(|pool| pool.ticker.as_deref())
-                .map(|ticker| ticker.to_ascii_uppercase()),
-        );
-    }
+}
 
-    let targets = {
-        let registry = state.registry.read().await;
-        let mut seen = HashSet::new();
-        let mut targets = Vec::new();
-        for entry in registry.iter().filter(|entry| registry::matchable(entry)) {
-            if !tickers.contains(&entry.ticker.to_ascii_uppercase()) {
-                continue;
-            }
+fn ordered_warm_tickers(
+    featured: &[crate::discovery::FeaturedPool],
+    leaderboard: &crate::discovery::Leaderboard,
+) -> Vec<String> {
+    let mut ordered = Vec::new();
+    let mut seen = HashSet::new();
+    for ticker in featured.iter().filter_map(|pool| pool.ticker.as_deref()) {
+        append_warm_ticker(ticker, &mut seen, &mut ordered);
+    }
+    let mut entries = leaderboard.entries.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.rank);
+    for ticker in entries.iter().filter_map(|entry| entry.ticker.as_deref()) {
+        append_warm_ticker(ticker, &mut seen, &mut ordered);
+    }
+    ordered
+}
+
+fn select_warm_targets(
+    registry: &registry::Registry,
+    tickers: &[String],
+    max_contracts: usize,
+) -> WarmTargetSelection {
+    let mut selection = WarmTargetSelection::default();
+    let mut seen_contracts = HashSet::new();
+    for ticker in tickers {
+        let mut ticker_targets = Vec::new();
+        let mut ticker_contracts = HashSet::new();
+        for entry in registry.iter().filter(|entry| {
+            registry::matchable(entry) && entry.ticker.eq_ignore_ascii_case(ticker)
+        }) {
             let Ok(contract) = canonical_contract(entry.chain, &entry.contract) else {
                 continue;
             };
-            if seen.insert((entry.chain, contract.clone())) {
-                targets.push((entry.chain, contract));
+            let key = (entry.chain, contract.clone());
+            if !seen_contracts.contains(&key) && ticker_contracts.insert(key) {
+                ticker_targets.push((entry.chain, contract));
             }
         }
-        targets
-    };
+        if ticker_targets.is_empty() {
+            continue;
+        }
+        if selection.targets.len().saturating_add(ticker_targets.len()) > max_contracts {
+            selection.cap_hit = true;
+            break;
+        }
+        for (chain, contract) in ticker_targets {
+            seen_contracts.insert((chain, contract.clone()));
+            selection.targets.push((chain, contract));
+        }
+        selection.tickers_covered += 1;
+    }
+    selection
+}
 
-    let mut summary = WarmPassSummary::default();
+async fn current_warm_targets(state: &AppState) -> WarmTargetSelection {
+    let featured = state.featured.read().await;
+    let leaderboard = state.leaderboard.read().await;
+    let tickers = ordered_warm_tickers(&featured, &leaderboard);
+    drop(leaderboard);
+    drop(featured);
+    let registry = state.registry.read().await;
+    select_warm_targets(&registry, &tickers, POWERS_WARM_MAX_CONTRACTS)
+}
+
+pub(crate) async fn notify_powers_warm_if_targets(state: &AppState, notify: &Notify) -> bool {
+    if current_warm_targets(state).await.targets.is_empty() {
+        return false;
+    }
+    notify.notify_one();
+    true
+}
+
+fn warm_chain_counts_mut(
+    summary: &mut WarmPassSummary,
+    chain: Chain,
+) -> &mut WarmChainSummary {
+    &mut summary.by_chain[match chain {
+        Chain::Solana => 0,
+        Chain::RobinhoodChain => 1,
+        Chain::Base => 2,
+        Chain::Ethereum => 3,
+        Chain::Bnb => 4,
+    }]
+}
+
+fn record_warm_success(summary: &mut WarmPassSummary, chain: Chain, record: &PowersRecord) {
+    summary.ok += 1;
+    let counts = warm_chain_counts_mut(summary, chain);
+    counts.ok += 1;
+    if record.source_verified == SourceVerified::Unavailable
+        || record.source_verified_proxy == Some(SourceVerified::Unavailable)
+    {
+        counts.source_unavailable += 1;
+    }
+}
+
+fn record_transient_reason(summary: &mut WarmPassSummary, reason: &str) {
+    *summary.transient_reasons.entry(reason.to_owned()).or_default() += 1;
+}
+
+fn record_warm_transient(summary: &mut WarmPassSummary, chain: Chain, reason: &str) {
+    summary.transient += 1;
+    warm_chain_counts_mut(summary, chain).transient += 1;
+    record_transient_reason(summary, reason);
+}
+
+fn record_transient_record(summary: &mut WarmPassSummary, chain: Chain, record: &PowersRecord) {
+    let mut found_reason = false;
+    let mut seen = HashSet::new();
+    for reason in &record.unavailable {
+        if !reason.code.is_empty() && seen.insert(reason.code.as_str()) {
+            if found_reason {
+                record_transient_reason(summary, &reason.code);
+            } else {
+                record_warm_transient(summary, chain, &reason.code);
+                found_reason = true;
+            }
+        }
+    }
+    if !found_reason {
+        record_warm_transient(summary, chain, "rpc_unavailable");
+    }
+}
+
+fn transient_pool_error_code(error: &PoolError) -> &'static str {
+    match error {
+        PoolError::InvalidAddress => "invalid_address",
+        PoolError::Unknown(_) => "not_found",
+        PoolError::CodeLookupUnsupported => "unsupported",
+        PoolError::BudgetExceeded("deadline") => "rpc_deadline",
+        PoolError::BudgetExceeded(_) => "budget_exceeded",
+        PoolError::Reader(_) => "rpc_unavailable",
+    }
+}
+
+pub(crate) async fn warm_current_pool_powers(state: &AppState) -> WarmPassSummary {
+    let started = Instant::now();
+    let selection = current_warm_targets(state).await;
+    let mut summary = WarmPassSummary {
+        warmed: !selection.targets.is_empty(),
+        target_count: selection.targets.len(),
+        tickers_covered: selection.tickers_covered,
+        cap_hit: selection.cap_hit,
+        ..WarmPassSummary::default()
+    };
     let version = crate::state::current_registry_version();
-    for (chain, contract) in targets {
+    for (chain, contract) in selection.targets {
         let key = (chain, contract.clone(), version);
         let cached_record = state.powers_cache.get(&key).await;
         let refresh_cached = cached_record
@@ -386,39 +549,79 @@ pub(crate) async fn warm_current_pool_powers(state: &AppState) -> WarmPassSummar
         }
 
         let Some(_permit) = warm_permit(state).await else {
-            summary.transient += 1;
+            record_warm_transient(&mut summary, chain, "prefetch_semaphore_closed");
             continue;
         };
-        if refresh_cached {
-            if state
+        if refresh_cached
+            && state
                 .powers_cache
                 .get(&key)
                 .await
                 .is_some_and(|record| !powers_record_needs_warm_refresh(&record, &Utc::now()))
-            {
-                summary.skipped += 1;
-                continue;
-            }
-            state.powers_cache.invalidate(&key).await;
+        {
+            summary.skipped += 1;
+            continue;
         }
-        match inspect(state, chain, &contract).await {
-            Ok(_) => {
-                let current_key = (chain, contract, crate::state::current_registry_version());
-                if state.powers_cache.get(&current_key).await.is_some() {
-                    summary.ok += 1;
+        match inspect_for_warm_refresh(state, chain, &contract).await {
+            Ok(record) => {
+                let current_key =
+                    (chain, contract.clone(), crate::state::current_registry_version());
+                if let Some(record) = state.powers_retry_cache.get(&current_key).await {
+                    record_transient_record(&mut summary, chain, &record);
+                } else if let Some(record) = state.powers_cache.get(&current_key).await {
+                    record_warm_success(&mut summary, chain, &record);
                 } else {
-                    summary.transient += 1;
+                    let reason = if crate::state::current_registry_version() != version {
+                        "registry_changed"
+                    } else if record.source_verified == SourceVerified::Unavailable
+                        || record.source_verified_proxy == Some(SourceVerified::Unavailable)
+                    {
+                        "source_unavailable"
+                    } else {
+                        "rpc_unavailable"
+                    };
+                    record_warm_transient(&mut summary, chain, reason);
                 }
             }
-            Err(_) => summary.transient += 1,
+            Err(error) => record_warm_transient(
+                &mut summary,
+                chain,
+                transient_pool_error_code(&error),
+            ),
         }
-
     }
 
+    let mut top_reasons = summary
+        .transient_reasons
+        .iter()
+        .map(|(reason, count)| (reason.as_str(), *count))
+        .collect::<Vec<_>>();
+    top_reasons.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    top_reasons.truncate(5);
     info!(
+        warmed = summary.warmed,
+        targets = summary.target_count,
+        tickers_covered = summary.tickers_covered,
+        cap_hit = summary.cap_hit,
         ok = summary.ok,
         transient = summary.transient,
         skipped = summary.skipped,
+        solana_ok = summary.by_chain[0].ok,
+        solana_transient = summary.by_chain[0].transient,
+        solana_source_unavailable = summary.by_chain[0].source_unavailable,
+        robinhood_ok = summary.by_chain[1].ok,
+        robinhood_transient = summary.by_chain[1].transient,
+        robinhood_source_unavailable = summary.by_chain[1].source_unavailable,
+        base_ok = summary.by_chain[2].ok,
+        base_transient = summary.by_chain[2].transient,
+        base_source_unavailable = summary.by_chain[2].source_unavailable,
+        ethereum_ok = summary.by_chain[3].ok,
+        ethereum_transient = summary.by_chain[3].transient,
+        ethereum_source_unavailable = summary.by_chain[3].source_unavailable,
+        bnb_ok = summary.by_chain[4].ok,
+        bnb_transient = summary.by_chain[4].transient,
+        bnb_source_unavailable = summary.by_chain[4].source_unavailable,
+        top_transient_reasons = ?top_reasons,
         elapsed_ms = started.elapsed().as_millis(),
         "powers warm pass completed"
     );
@@ -518,6 +721,133 @@ mod tests {
         assert_eq!(
             serde_json::to_value(SourceVerifiedSubject::Implementation).unwrap(),
             "implementation"
+        );
+    }
+
+    fn warm_registry_entry(chain: Chain, ticker: &str, contract: &str) -> registry::Entry {
+        registry::Entry {
+            issuer: "Issuer".to_owned(),
+            ticker: ticker.to_owned(),
+            name: ticker.to_owned(),
+            chain,
+            contract: contract.to_owned(),
+            decimals: None,
+            source: "test".to_owned(),
+            source_url: "https://issuer.example/token".to_owned(),
+            last_checked: registry::now_rfc3339(),
+            removed_at: None,
+            stale_since: None,
+        }
+    }
+
+    fn warm_featured_pool(ticker: &str) -> crate::discovery::FeaturedPool {
+        crate::discovery::FeaturedPool {
+            chain: Chain::Solana,
+            dex: "raydium".to_owned(),
+            pool: format!("pool-{ticker}"),
+            base_symbol: ticker.to_owned(),
+            base_address: "11111111111111111111111111111111".to_owned(),
+            quote_symbol: "USDC".to_owned(),
+            quote_address: "So11111111111111111111111111111111111111112".to_owned(),
+            issuer: Some("Issuer".to_owned()),
+            ticker: Some(ticker.to_owned()),
+            verdict: "verified".to_owned(),
+            quote_balance: None,
+            quote_share_of_supply: None,
+            volume_24h_usd: None,
+            liquidity_usd: None,
+            curated: false,
+            note: None,
+            updated_at: registry::now_rfc3339(),
+        }
+    }
+
+    fn warm_leaderboard_entry(rank: usize, ticker: &str) -> crate::discovery::LeaderboardEntry {
+        crate::discovery::LeaderboardEntry {
+            rank,
+            chain: "base".to_owned(),
+            chain_label: "Base".to_owned(),
+            dex: "uniswap-v3".to_owned(),
+            pool: format!("pool-{ticker}"),
+            base_symbol: ticker.to_owned(),
+            quote_symbol: "USDC".to_owned(),
+            issuer: Some("Issuer".to_owned()),
+            ticker: Some(ticker.to_owned()),
+            verdict: "verified".to_owned(),
+            price_usd: None,
+            change_24h_pct: None,
+            volume_24h_usd: None,
+            liquidity_usd: None,
+            txns_24h: None,
+            detail_url: "/validated/base/pool".to_owned(),
+            trade_url: "https://dexscreener.com/base/pool".to_owned(),
+            explorer_url: "https://basescan.org/address/pool".to_owned(),
+            attestation_id: None,
+            checked_at: None,
+        }
+    }
+
+    #[test]
+    fn warm_targets_prioritize_featured_then_rank_and_keep_ticker_groups() {
+        let featured = vec![warm_featured_pool("FEAT")];
+        let mut leaderboard = crate::discovery::Leaderboard::default();
+        leaderboard.entries = vec![
+            warm_leaderboard_entry(2, "LATER"),
+            warm_leaderboard_entry(1, "FIRST"),
+            warm_leaderboard_entry(3, "FEAT"),
+        ];
+        let tickers = ordered_warm_tickers(&featured, &leaderboard);
+        assert_eq!(tickers, ["FEAT", "FIRST", "LATER"]);
+
+        let registry = vec![
+            warm_registry_entry(
+                Chain::Base,
+                "LATER",
+                "0x0000000000000000000000000000000000000003",
+            ),
+            warm_registry_entry(
+                Chain::Base,
+                "FIRST",
+                "0x0000000000000000000000000000000000000001",
+            ),
+            warm_registry_entry(
+                Chain::Ethereum,
+                "FIRST",
+                "0x0000000000000000000000000000000000000002",
+            ),
+            warm_registry_entry(
+                Chain::Solana,
+                "FEAT",
+                "11111111111111111111111111111111",
+            ),
+        ];
+        let selection = select_warm_targets(&registry, &tickers, 3);
+        assert_eq!(
+            selection.targets,
+            [
+                (Chain::Solana, "11111111111111111111111111111111".to_owned()),
+                (Chain::Base, "0x0000000000000000000000000000000000000001".to_owned()),
+                (Chain::Ethereum, "0x0000000000000000000000000000000000000002".to_owned()),
+            ]
+        );
+        assert_eq!(selection.tickers_covered, 2);
+        let exact_fill = select_warm_targets(&registry, &tickers[..2], 3);
+        assert_eq!(exact_fill.targets.len(), 3);
+        assert!(!exact_fill.cap_hit);
+        assert!(selection.cap_hit);
+    }
+
+    #[test]
+    fn transient_reason_codes_use_typed_pool_errors() {
+        assert_eq!(
+            transient_pool_error_code(&PoolError::BudgetExceeded("deadline")),
+            "rpc_deadline"
+        );
+        assert_eq!(
+            transient_pool_error_code(&PoolError::Reader(
+                "request https://rpc.example/?timeout=5000 returned error".to_owned()
+            )),
+            "rpc_unavailable"
         );
     }
 }

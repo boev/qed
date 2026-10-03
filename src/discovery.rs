@@ -1709,7 +1709,12 @@ fn startup_discovery_waits_for_registry(first_refresh: bool, registry: &Registry
     first_refresh && registry::active_count(registry) == 0
 }
 
-pub async fn refresh_discovery(state: &AppState, data_dir: &Path, first_refresh: bool) -> bool {
+pub async fn refresh_discovery(
+    state: &AppState,
+    data_dir: &Path,
+    first_refresh: bool,
+    warm_notify: &tokio::sync::Notify,
+) -> bool {
     {
         let mut board = state.leaderboard.write().await;
         board.next_refresh_at = timestamp_after(DISCOVERY_REFRESH_SECS);
@@ -1767,6 +1772,7 @@ pub async fn refresh_discovery(state: &AppState, data_dir: &Path, first_refresh:
     };
     let shared_checks = refresh_leaderboard(state, data_dir, &registry, batch.leaderboard).await;
     refresh_featured(state, data_dir, batch.featured, &shared_checks).await;
+    crate::powers::notify_powers_warm_if_targets(state, warm_notify).await;
     false
 }
 
