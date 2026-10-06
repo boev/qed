@@ -152,6 +152,7 @@ done <<ROUTES
 /	home
 /wallet	wallet
 /check	check
+/guard	guard
 /registry	registry
 /validated	validated
 /tokens/NVDA	token-directory
@@ -254,8 +255,15 @@ verify_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type:
 printf 'status %s POST /verify\n' "$verify_code"
 mcp_body="$(curl -fsS -X POST -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' --data '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' "$BASE/mcp")"
 mcp_names="$(jq -c '[.result.tools[].name] | sort' <<<"$mcp_body")"
-[[ "$mcp_names" == '["qed_check","qed_powers","qed_registry_lookup","qed_verify","qed_wallet"]' ]] || { printf 'FAIL /mcp: unexpected tool list %s\n' "$mcp_names" >&2; exit 1; }
-printf 'status 200 POST /mcp; five MCP tools listed\n'
+[[ "$mcp_names" == '["qed_check","qed_guard","qed_powers","qed_registry_lookup","qed_statement","qed_verify","qed_wallet"]' ]] || { printf 'FAIL /mcp: unexpected tool list %s\n' "$mcp_names" >&2; exit 1; }
+printf 'status 200 POST /mcp; seven MCP tools listed\n'
+guard_document="$(curl -fsS -X POST -H 'content-type: application/json' --data '{"address":"0xc845b2894dBddd03858fd2D643B4eF725fE0849d","chain":"ethereum"}' "$BASE/api/guard")"
+guard_verification="$(curl -fsS -X POST -H 'content-type: application/json' --data-binary "$guard_document" "$BASE/verify")"
+jq -e '.ok == true and .kind == "guard"' <<<"$guard_verification" >/dev/null || {
+  printf 'FAIL Guard POST /api/guard -> POST /verify round-trip\n' >&2
+  exit 1
+}
+printf 'signed Guard POST /api/guard -> POST /verify round-trip passed\n'
 for removed_path in /seal /badge; do
   code="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE$removed_path")"
   [[ "$code" == "404" ]] || { printf 'FAIL %s: HTTP %s\n' "$removed_path" "$code" >&2; exit 1; }

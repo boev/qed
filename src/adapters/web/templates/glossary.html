@@ -1,0 +1,21 @@
+{% extends "docs.html" %}
+{% block title %}QED | {{ page_title }}{% endblock %}
+{% block meta_description %}{{ meta_description }}{% endblock %}
+{% block og_title %}QED | {{ page_title }}{% endblock %}
+{% block og_description %}{{ meta_description }}{% endblock %}
+{% block twitter_title %}QED | {{ page_title }}{% endblock %}
+{% block twitter_description %}{{ meta_description }}{% endblock %}
+{% block canonical_url %}{{ public_url }}{{ canonical_path }}{% endblock %}
+{% block canonical_link %}{{ public_url }}{{ canonical_path }}{% endblock %}
+{% block docs_body %}
+<section class="glossary-list" aria-label="Glossary terms">
+  <article><h2>Stock-paired pool</h2><p>A liquidity pool whose token pair claims one side represents a stock or stock-like asset. The claim is not evidence that the token contract is genuine.</p></article>
+  <article><h2>Quote asset</h2><p>The token side QED reads as the quote in a pool. QED compares its contract and metadata with the issuer registry when the pool makes a stock claim.</p></article>
+  <article><h2>Issuer registry</h2><p>A versioned list of issuer, ticker, chain, and contract records that QED uses as comparison data. Registry membership is a reference, not a guarantee of solvency or custody.</p></article>
+  <article><h2>Tokenized stock</h2><p>A blockchain token marketed as exposure to a stock or stock-linked instrument. Different issuers can use different contracts for the same ticker.</p></article>
+  <article><h2>xStocks</h2><p>An issuer family and registry source for tokenized assets. QED records the contract published by the source and checks the observed pool contract against it.</p></article>
+  <article><h2>Robinhood stock token</h2><p>A stock-linked asset published on Robinhood Chain. The chain and contract address are part of the identity; a ticker by itself is insufficient.</p></article>
+  <article><h2>Verdict</h2><p>QED's result for a check. <strong>Verified</strong> means the observed contract matches a registry entry. <strong>Mismatch</strong> means the claim and observed contract disagree. <strong>No match</strong> means no registry entry was found. <strong>Unknown</strong> means QED could not complete a reliable read.</p></article>
+  <article><h2>Record</h2><p>A signed QED attestation containing the observed reads, verdict, registry hash, timestamps, signer, and signature. Anyone can fetch the JSON and verify it independently.</p></article>
+</section>
+{% endblock %}

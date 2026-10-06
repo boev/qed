@@ -1,0 +1,47 @@
+{% extends "layout.html" %}
+{% block title %}QED | Guard review{% endblock %}
+{% block meta_description %}A signed, read-only review of a token or pool's issuer identity, token powers, source status, and known pools.{% endblock %}
+{% block og_title %}QED | Guard review{% endblock %}
+{% block og_description %}A signed, read-only review of a token or pool on a supported chain.{% endblock %}
+{% block twitter_title %}QED | Guard review{% endblock %}
+{% block twitter_description %}A signed, read-only review of a token or pool on a supported chain.{% endblock %}
+{% block canonical_url %}{{ public_url }}/guard{% endblock %}
+{% block canonical_link %}{{ public_url }}/guard{% endblock %}
+{% block content %}
+<section class="page-intro">
+  <p class="eyebrow">Guard</p>
+  <h1 class="page-title">Review a token or pool.</h1>
+  <p>QED checks tokens that claim to be something against the contract their issuer publishes.</p>
+  <p class="muted">QED is read-only by design: it never holds keys, never submits transactions, and never recommends; that is why anyone can integrate it.</p>
+  <p class="muted">It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.</p>
+</section>
+<section class="lookup" aria-labelledby="guard-form-title">
+  <h2 id="guard-form-title">Run a Guard review</h2>
+  <form class="guard-form" action="/guard" method="post">
+    {% if !error.is_empty() %}<p class="guard-form-error" role="alert">{{ error }}</p>{% endif %}
+    <div class="guard-field">
+      <label for="guard-address">Token contract or supported pool address</label>
+      <input id="guard-address" name="address" type="text" inputmode="text" autocomplete="off" spellcheck="false" placeholder="Paste a contract or pool address" value="{{ address }}" required>
+    </div>
+    <div class="guard-field">
+      <label for="guard-chain">Chain</label>
+      <select id="guard-chain" name="chain" required>
+        <option value="solana" {% if chain == "solana" %}selected{% endif %}>Solana</option>
+        <option value="robinhood" {% if chain == "robinhood" %}selected{% endif %}>Robinhood Chain</option>
+        <option value="base" {% if chain == "base" %}selected{% endif %}>Base</option>
+        <option value="ethereum" {% if chain == "ethereum" %}selected{% endif %}>Ethereum</option>
+        <option value="bnb" {% if chain == "bnb" %}selected{% endif %}>BNB Chain</option>
+      </select>
+    </div>
+    <div class="guard-field">
+      <label for="guard-wallet">Optional wallet address</label>
+      <input id="guard-wallet" name="wallet" type="text" inputmode="text" autocomplete="off" spellcheck="false" placeholder="Leave blank to omit wallet-specific checks" value="{{ wallet }}">
+    </div>
+    <button class="button primary-button" type="submit">Review <span aria-hidden="true">→</span></button>
+  </form>
+</section>
+<section class="lookup lookup-secondary">
+  <h2>Use the API or an agent</h2>
+  <p>Call <code>GET /api/guard/{address}?chain={chain}</code>, or prefer <code>POST /api/guard</code> with the wallet in a JSON body to keep it out of the URL. MCP agents can use <code>qed_guard</code>. The signed document can be checked with <code>POST /verify</code>.</p>
+</section>
+{% endblock %}

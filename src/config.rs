@@ -1,4 +1,6 @@
 use std::env;
+
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -29,6 +31,7 @@ pub struct Config {
     pub attest_bucket: Option<String>,
     pub admin_username: Option<String>,
     pub admin_password: Option<String>,
+    pub trusted_signers: HashSet<String>,
 }
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -50,11 +53,19 @@ impl Config {
         let rpc_base = value("QED_RPC_BASE", DEFAULT_BASE_RPC);
         let rpc_ethereum = value("QED_RPC_ETHEREUM", DEFAULT_ETHEREUM_RPC);
         let rpc_bnb = value("QED_RPC_BNB", DEFAULT_BNB_RPC);
-        let registry_xstocks_url = value("QED_REGISTRY_XSTOCKS_URL", crate::registry::XSTOCKS_URL);
-        let registry_ondo_url = value("QED_REGISTRY_ONDO_URL", crate::registry::ONDO_URL);
+        let registry_xstocks_url =
+            value("QED_REGISTRY_XSTOCKS_URL", crate::adapters::registry::XSTOCKS_URL);
+        let registry_ondo_url = value("QED_REGISTRY_ONDO_URL", crate::adapters::registry::ONDO_URL);
         let registry_ondo_api_key = optional_secret("QED_REGISTRY_ONDO_API_KEY");
         let registry_robinhood_url =
-            value("QED_REGISTRY_ROBINHOOD_URL", crate::registry::ROBINHOOD_URL);
+            value("QED_REGISTRY_ROBINHOOD_URL", crate::adapters::registry::ROBINHOOD_URL);
+        let trusted_signers = env::var("QED_PREVIOUS_KEYS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+            .collect();
         if env::var("QED_ENV").is_ok_and(|value| value.eq_ignore_ascii_case("production")) {
             require_private_rpc("QED_RPC_SOLANA", &rpc_solana, DEFAULT_SOLANA_RPC)?;
             require_private_rpc("QED_RPC_ROBINHOOD", &rpc_robinhood, DEFAULT_ROBINHOOD_RPC)?;
@@ -83,6 +94,7 @@ impl Config {
             attest_bucket: env::var("QED_ATTEST_BUCKET").ok().filter(|value| !value.is_empty()),
             admin_username: optional_secret("QED_ADMIN_USERNAME"),
             admin_password: optional_secret("QED_ADMIN_PASSWORD"),
+            trusted_signers,
         })
     }
 }

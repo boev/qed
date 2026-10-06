@@ -1,0 +1,61 @@
+{% extends "layout.html" %}
+{% block title %}QED | {{ page_title }}{% endblock %}
+{% block meta_description %}{{ meta_description }}{% endblock %}
+{% block og_title %}QED | {{ page_title }}{% endblock %}
+{% block og_description %}{{ meta_description }}{% endblock %}
+{% block twitter_title %}QED | {{ page_title }}{% endblock %}
+{% block twitter_description %}{{ meta_description }}{% endblock %}
+{% block canonical_url %}{{ public_url }}{{ canonical_path }}{% endblock %}
+{% block canonical_link %}{{ public_url }}{{ canonical_path }}{% endblock %}
+{% block content %}
+<section class="docs-layout">
+  <aside class="docs-sidebar">
+    <nav class="docs-tree" aria-label="Documentation navigation">
+      <div class="docs-nav-group">
+        <h2>Guides</h2>
+        <a href="/docs" {% if active_sidebar == "overview" %}aria-current="page"{% endif %}>Documentation overview</a>
+        <a href="/guide/verify-a-stock-token" {% if active_sidebar == "verify" %}aria-current="page"{% endif %}>Verify a stock token</a>
+        <a href="/docs/llm" {% if active_sidebar == "llm" %}aria-current="page"{% endif %}>Use QED with an LLM / MCP</a>
+        <a href="/docs/api-quick-start" {% if active_sidebar == "api-quick-start" %}aria-current="page"{% endif %}>API quick start</a>
+      </div>
+      <div class="docs-nav-group">
+        <h2>For developers &amp; AI agents</h2>
+        <a href="/api" {% if active_sidebar == "api" %}aria-current="page"{% endif %}>API reference</a>
+        <a href="/docs/llm">MCP setup</a>
+        <a href="/llms.txt">llms.txt</a>
+      </div>
+      <div class="docs-nav-group">
+        <h2>Reference</h2>
+        <a href="/openapi.json">OpenAPI JSON</a>
+        <a href="/.well-known/mcp/server-card.json">MCP server card</a>
+      </div>
+      <div class="docs-nav-group">
+        <h2>Project</h2>
+        <a href="/changelog" {% if active_sidebar == "changelog" %}aria-current="page"{% endif %}>Changelog</a>
+        <a href="/blog" {% if active_sidebar == "blog" %}aria-current="page"{% endif %}>Blog</a>
+        <a href="/about" {% if active_sidebar == "about" %}aria-current="page"{% endif %}>About</a>
+        <a href="/security" {% if active_sidebar == "security" %}aria-current="page"{% endif %}>Security</a>
+      </div>
+    </nav>
+  </aside>
+  <div class="docs-main">
+      {% if whats_new.available %}
+      <p class="release-whats-new"><strong>New in {{ whats_new.release_label }}: {{ whats_new.headline }}</strong> <a href="{{ whats_new.changelog_href }}">→ Changelog</a>{% if whats_new.has_latest_blog %} <span class="latest-blog-link">· Latest post: <a href="{{ whats_new.latest_blog_href }}">{{ whats_new.latest_blog_title }}</a></span>{% endif %}</p>
+      {% endif %}
+    <header class="page-intro">
+      <p class="eyebrow">{{ eyebrow }}</p>
+      <h1 class="page-title">{{ heading }}</h1>
+      <p>{{ intro }}</p>
+      {% if active_sidebar == "api" %}
+      <nav class="api-reference-actions" aria-label="API document links">
+        <a href="/openapi.json">OpenAPI JSON</a>
+        <a href="/openapi.json" download>Download</a>
+      </nav>
+      {% endif %}
+    </header>
+    <div class="docs-body">
+      {% block docs_body %}{{ body_html|safe }}{% endblock %}
+    </div>
+  </div>
+</section>
+{% endblock %}

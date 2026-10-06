@@ -175,7 +175,10 @@
     const toggle = event.target.closest('#theme-toggle');
     if (toggle) {
       const root = document.documentElement;
-      const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+      const followsDarkSystem =
+        root.dataset.theme === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      const isDark = root.dataset.theme === 'dark' || followsDarkSystem;
+      const next = isDark ? 'light' : 'dark';
       root.dataset.theme = next;
       root.classList.add('theme-switching');
       window.clearTimeout(themeSwitchTimer);

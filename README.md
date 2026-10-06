@@ -1,17 +1,21 @@
 # QED
 
-QED is a read-only contract-to-issuer-registry checker and directory for stock-paired pools. It checks whether a pool uses the stock-token contract published by its issuer. It does not prove backing or custody, and it does not verify reserves, solvency, safety, price, liquidity, or endorsement.
+QED is a read-only contract-to-issuer-registry checker and directory for stock-paired pools, plus a signed Guard reviewer for supported-chain tokens and pools. Its pool check reports whether the quote contract matches an issuer's published stock-token contract. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.
 
 Source repository: [github.com/boev/qed](https://github.com/boev/qed). Live website: [qed.web3-energy.com](https://qed.web3-energy.com).
 
 ## What QED can do
+
+QED checks tokens that claim to be something against the contract their issuer publishes.
 
 - **Check a pool or token address** on Solana, Robinhood Chain, Base, Ethereum, or BNB Chain and report whether the quote token is the contract the issuer published. Verdicts: Verified, Mismatch, No match, or Unknown with the reason. Every check lists its evidence: chain detection, the pool and its sides, token metadata, supply share, and the registry entries compared.
 - **Issue a signed certificate** for a check: canonical JSON, SHA-256 identifier, Ed25519 signature, registry hash and expiry, chain position of each read. Anyone can verify it with `POST /verify` and the published key at `/.well-known/qed.json`, or re-run the reads with **Re-check**.
 - **Keep an issuer registry** merged from xStocks, Ondo Global Markets, and Robinhood Chain sources (seeded, refreshed at runtime), browsable by ticker, chain, and issuer.
 - **List current contract matches**: a directory, per-pool summaries, featured pools, a ranked leaderboard with prices, and an RSS feed, with exact venue and explorer deep links.
 - **Scan a wallet** for stock-token holdings and show which contracts match the registry, without putting the address in a URL.
-- **Serve machines**: JSON API, OpenAPI 3.1, `llms.txt`/`llms-full.txt`, and a stateless MCP endpoint (`POST /mcp`) with check, token-power, wallet, registry-lookup, and attestation-verification tools. `/.well-known/mcp/server-card.json` advertises the read-only server to agent clients.
+- **Create a signed wallet statement** for selected wallets and chains, with registry-token balances, observed chain positions, issuer-match rows, and token-power summaries. Balances are point-in-time on-chain facts, not proof of ownership or issuer solvency.
+- **Review a token or pool with Guard** across supported chains: return a signed document with issuer identity, token-power observations, source-verification status, known pools and quote-side facts, and an overall allow/deny/unknown verdict. Pool identity must be established through QED's known-pool index or on-chain factory/derivation checks; an unindexed Solana account is reviewed as a token. An optional wallet check reports only observed active restrictions; no authority capability alone is a denial.
+- **Serve machines**: JSON API, OpenAPI 3.1, `llms.txt`/`llms-full.txt`, and a stateless MCP endpoint (`POST /mcp`) with check, Guard, token-power, wallet, signed-statement, registry-lookup, and document-verification tools. `/.well-known/mcp/server-card.json` advertises the read-only server to agent clients.
 
 What QED does **not** do: it does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement, and it does not give investment advice. A certificate proves what QED read and signed at one point in time.
 
@@ -90,7 +94,11 @@ writes reduced-motion Firefox screenshots to `/tmp/qed-crawl/`.
 
 ## API and routes
 
-The machine-readable entry points are `/llms.txt`, `/llms-full.txt`, `/openapi.json`, `/api`, `/mcp`, and `/.well-known/mcp/server-card.json`. `/mcp` is a stateless Streamable HTTP endpoint for `qed_check`, `qed_powers`, `qed_wallet`, `qed_registry_lookup`, and `qed_verify`; it supports MCP versions `2026-07-28`, `2025-11-25`, `2025-06-18`, and `2025-03-26` (legacy initialization). The deployed service serves those paths directly. The public source repository is [github.com/boev/qed](https://github.com/boev/qed).
+The machine-readable entry points are `/llms.txt`, `/llms-full.txt`, `/openapi.json`, `/api`, `/mcp`, and `/.well-known/mcp/server-card.json`. `/mcp` is a stateless Streamable HTTP endpoint for `qed_check`, `qed_guard`, `qed_powers`, `qed_wallet`, `qed_statement`, `qed_registry_lookup`, and `qed_verify`; verification accepts signed attestations, wallet statements, and Guard documents. It supports MCP versions `2026-07-28`, `2025-11-25`, `2025-06-18`, and `2025-03-26` (legacy initialization). The public documentation pages include `/docs`, `/docs/llm`, `/docs/api-quick-start`, `/about`, `/security`, `/changelog`, and `/blog`; `/api` is generated from the OpenAPI document, and `/statements` creates a signed wallet statement through the existing statement API.
+
+`POST /api/guard` accepts `{ "address": "…", "chain": "base", "wallet": "…" }`; prefer it over the legacy `GET /api/guard/{address}?chain=…&wallet=…` because query-string wallets may be exposed in browser history or request URLs. The Guard `reasons[].code` enum is `publisher_contract_match`, `publisher_contract_mismatch`, `name_resembles_registry_entry`, `publisher_metadata_unavailable`, `no_publisher`, `registry_stale`, `registry_removed`, `token_paused`, `powers_incomplete`, `powers_unavailable`, `wallet_check_not_applicable`, `wallet_check_unavailable`, `wallet_frozen`, `wallet_blocked`, `wallet_sanctioned`, `source_unverified`, `source_unavailable`, and `pool_unavailable`.
+
+`publisher_metadata_unavailable` means QED could not read complete current publisher metadata for a resembling registry candidate; it is not a mismatch.
 
 | Method | Route | Result |
 | --- | --- | --- |
@@ -98,24 +106,37 @@ The machine-readable entry points are `/llms.txt`, `/llms-full.txt`, `/openapi.j
 | GET, POST | `/check` | Check form and result fragment. |
 | GET | `/registry`, `/registry/table` | Registry directory and table fragment. |
 | GET, POST | `/wallet` | Wallet holdings form and read-only holdings result. |
+| GET, POST | `/guard` | Signed Guard review form and submission. |
+| GET | `/guard/{chain}/{address}` | Human-readable signed Guard review result. |
 | GET | `/tokens?ticker={ticker}`, `/tokens/{ticker}`, `/chains/{chain_name}` | Canonical ticker lookup plus token and chain directories. |
-| GET | `/glossary`, `/guide/verify-a-stock-token` | Glossary and contract verification guide. |
+| GET | `/glossary`, `/guide/verify-a-stock-token` | Glossary and contract-first verification guide. |
+| GET | `/docs`, `/docs/llm`, `/docs/api-quick-start` | Documentation hub and guides for verification, MCP clients, and the API. |
+| GET | `/about`, `/security` | QED scope and operator, and security policy. |
+| GET | `/changelog`, `/blog`, `/blog/{slug}` | Release history, blog index, and article pages; drafts are not listed, served, or fed. |
+| GET | `/changelog.xml`, `/blog.xml` | Atom feeds for the changelog and published blog posts. |
 | GET | `/llms.txt`, `/llms-full.txt` | Machine-readable product and API guides. |
+| GET | `/statements` | Signed wallet statement form. |
+| POST | `/statements` | Create a statement through the existing statement API and redirect to its page. |
 | GET | `/validated`, `/validated/{chain}/{subject}` | Current contract-match directory and pool summary; records are time-bounded and should be re-checked after expiry. |
 | GET | `/validated.xml` | RSS feed of current contract matches. |
 | GET | `/v/{id}` | Signed certificate page with nerd mode. |
 | POST | `/v/{id}/recheck` | Re-run the recorded reads. |
-| GET | `/api` | HTML API guide. |
+| GET | `/api` | Server-rendered API reference generated from the OpenAPI document. |
 | GET | `/openapi.json` | OpenAPI 3.1 route document. |
-| POST | `/mcp` | Stateless MCP Streamable HTTP tools for checks, token-power signals, wallet holdings, issuer-registry lookup, and attestation verification. |
+| POST | `/mcp` | Stateless MCP Streamable HTTP tools for checks, signed Guard reviews, token-power signals, wallet holdings, signed wallet statements, issuer-registry lookup, and document verification. |
 | GET | `/pools/featured` | Featured-pool HTML fragment/page. |
 | GET | `/api/check/{address}` | JSON check result with token-power observations for the issuer-registry-matched pool side when available. |
-| GET | `/api/powers/{address}?chain={chain}` | Observed control signals and source status; optional `chain` filters matching registry entries, otherwise multiple chain records are returned as an array. Proxy records report implementation source verification plus the proxy's separate status. |
+| GET | `/api/powers/{address}?chain={chain}` | Observed control signals and source status for any supported-chain contract; optional `chain` filters, otherwise active registry matches or the detected EVM chain are used. Proxy records report implementation source verification plus the proxy's separate status. |
+| GET | `/api/guard/{address}?chain={chain}&wallet={wallet}` | Signed Guard document; `chain` is required and `wallet` is optional. Wallet query values may be exposed in browser history or request URLs; prefer `POST /api/guard`. |
+| POST | `/api/guard` | JSON body `{ "address": "…", "chain": "base", "wallet": "…" }`; signed Guard review without a wallet in the URL. |
 | POST | `/api/wallet` | JSON body `{ "address": "…" }`; check stock-token holdings without putting the address in the URL. |
+| POST | `/api/statement` | JSON `{ "wallets": ["…"], "chains": ["base"], "block": 123 }`; signs active-registry token balances and observed chain positions as a `kind: "statement"` payload, with per-asset observation slots. EVM `block` is exact; for Solana it is a minimum context slot. |
+| GET | `/api/statement/{id}` | Signed statement JSON held in process memory for up to 24 hours; statement IDs are content hashes, not access controls. |
+| GET | `/statements/{id}` | Human-readable statement page, public to anyone with its link, held in process memory for up to 24 hours. |
 | GET | `/api/attest/{id}` | Signed attestation JSON. |
 | GET | `/api/registry`, `/api/pools/featured` | Registry and featured pool JSON. |
 | GET | `/api/leaderboard`, `/api/prices`, `/api/status` | Ranked pools, prices, and freshness state. |
-| POST | `/verify` | Verify an attestation payload and signature. |
+| POST | `/verify` | Verify a signed attestation, statement, or Guard document and report its kind, cryptographic validity, signer trust, and environment; freshness applies to attestations only.
 | GET | `/.well-known/qed.json` | Public signer metadata and key. |
 | GET | `/.well-known/mcp/server-card.json` | Read-only MCP server card with remote endpoint and tool summaries. |
 | GET | `/healthz` | Service health. |
@@ -158,27 +179,22 @@ See [Runtime architecture and request flow](docs/architecture.md) for the
 single-process diagram, background refresh cadence, user-check sequence, and
 request boundaries.
 
-- `src/main.rs`: configuration, startup, refresh loops, and HTTP listener.
+- `src/main.rs`: configuration, application composition, refresh loops, and HTTP listener.
 - `src/config.rs`: environment configuration and defaults.
-- `src/state.rs`: shared application state and request limiter.
-- `src/chain.rs`: address detection and chain identity.
-- `src/registry/`: issuer adapters, canonical registry loading, merging, and lookup.
-- `src/pool/`: chain readers for Solana and EVM JSON-RPC.
-- `src/check.rs`: pool reads, registry comparison, and verdict construction.
-- `src/attest.rs`: canonical payloads, signatures, stores, and re-checks.
-- `src/discovery.rs`: shared pool discovery, featured-pool curation, leaderboard ranking, and price refresh.
-- `src/web/mod.rs`: router, middleware, cache headers, robots, and sitemap.
-- `src/web/discoverability.rs`: LLM guide, API guide, RSS feed, and crawler output.
-- `src/web/openapi.rs`: hand-written OpenAPI 3.1 route document.
-- `src/web/pages.rs`: HTML route handlers and certificate pages.
-- `src/web/api.rs`: JSON routes, verification, and public-key metadata.
-- `src/web/views.rs`: Askama view models and display formatting.
+- `src/ports.rs`: chain, registry, signer, cache, storage, and source-verification boundaries.
+- `src/domain/`: chain and data models plus pure matching, power, Guard, attestation, and statement rules.
+- `src/app/`: check, wallet, powers, Guard, attestation, statement, and warm-up flows.
+- `src/adapters/`: chain readers, issuer registry refresh, discovery, signing/storage, and runtime state.
+- `src/adapters/web.rs`: router, middleware, cache headers, robots, and sitemap.
+- `src/adapters/web/api.rs`, `pages.rs`, and `mcp.rs`: JSON, HTML, and Streamable HTTP MCP request adapters.
+- `src/adapters/web/views.rs` and `src/adapters/web/templates/`: Askama view models, display formatting, and templates.
+- `src/adapters/web/docs.rs`: discoverability pages, the API guide, and the OpenAPI route document.
 - `static/`: CSS, JavaScript, icons, logo, favicon, and OpenGraph PNG.
 - `release/llms-full.md`: source Markdown included in `/llms-full.txt`.
 
 ## Registry sources
 
-The seed is `registry/registry.json`. Runtime refresh adapters read xStocks, Ondo, and Robinhood sources, merge entries by chain and contract, and write the refreshed copy below `QED_DATA_DIR`. Current issuer coverage is limited to entries actually present in those registry sources; configured readers for Solana, Robinhood Chain, Base, Ethereum, and BNB Chain do not imply that every issuer has a contract on every chain. To add an issuer, add an adapter under `src/registry/`, map its response to every `Entry` field, add a focused fixture and test, then regenerate and sort the seed by issuer, chain, and ticker. Never edit the seed from the running service.
+The seed is `registry/registry.json`. Runtime refresh adapters read xStocks, Ondo, and Robinhood sources, merge entries by chain and contract, and write the refreshed copy below `QED_DATA_DIR`. Current issuer coverage is limited to entries actually present in those registry sources; configured readers for Solana, Robinhood Chain, Base, Ethereum, and BNB Chain do not imply that every issuer has a contract on every chain. To add an issuer, add an adapter in `src/adapters/registry.rs`, map its response to every `Entry` field, add a focused fixture and test, then regenerate and sort the seed by issuer, chain, and ticker. Never edit the seed from the running service.
 
 ## Licence
 

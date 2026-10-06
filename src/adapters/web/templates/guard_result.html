@@ -1,0 +1,87 @@
+{% extends "layout.html" %}
+{% block title %}QED | Guard review result{% endblock %}
+{% block meta_description %}A signed QED Guard result for a token or pool address on a supported chain.{% endblock %}
+{% block og_title %}QED | Guard review result{% endblock %}
+{% block og_description %}A signed, point-in-time review of issuer identity, token powers, source status, and known pools.{% endblock %}
+{% block twitter_title %}QED | Guard review result{% endblock %}
+{% block twitter_description %}A signed, point-in-time review of issuer identity, token powers, source status, and known pools.{% endblock %}
+{% block canonical_url %}{{ result_url }}{% endblock %}
+{% block canonical_link %}{{ result_url }}{% endblock %}
+{% block content %}
+<section class="page-intro">
+  <p class="eyebrow">Guard · {{ chain }}</p>
+  <h1 class="page-title guard-verdict {{ verdict_class }}">{{ headline }}</h1>
+  <p class="guard-facts">{{ identity_sentence }}</p>
+  <p class="guard-facts">{{ powers_sentence }}</p>
+  <p class="guard-facts">{{ source_sentence }}</p>
+  <p class="muted">QED is read-only by design: it never holds keys, never submits transactions, and never recommends; that is why anyone can integrate it.</p>
+  <p class="muted">This point-in-time review does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Re-check before relying on changed chain or issuer facts.</p>
+</section>
+<section class="lookup" aria-labelledby="guard-identity-title">
+  <h2 id="guard-identity-title">Issuer identity</h2>
+  <p>Status: <strong>{{ identity_status }}</strong></p>
+  <dl>
+    <dt>Publisher</dt><dd>{{ publisher }}</dd>
+    <dt>Reviewed address</dt><dd><code>{{ address }}</code></dd>
+    <dt>Ticker</dt><dd>{{ ticker }}</dd>
+    <dt>Published contract</dt><dd><code>{{ matched_contract }}</code></dd>
+  </dl>
+</section>
+<section class="lookup lookup-secondary" aria-labelledby="guard-powers-title">
+  <h2 id="guard-powers-title">Powers and source</h2>
+  <p>Source status: <strong>{{ source_status }}</strong> via {{ source_provider }}.</p>
+  <div class="powers-summary" role="group" aria-label="Token control signals">
+    {% for badge in powers.summary_badges %}<span class="count-badge">{{ badge }}</span>{% endfor %}
+    <span class="count-badge">{{ powers.source_badge }}</span>
+  </div>
+  {% if powers.available %}
+  <ul class="guard-power-summaries">
+    <li>{{ seizure_summary }}</li>
+    <li>{{ blocking_summary }}</li>
+    <li>{{ rule_change_summary }}</li>
+  </ul>
+  <details class="guard-technical-details">
+    <summary>Technical details</summary>
+    {% if powers.can_seize.len() > 0 %}<h3>Seizure signals</h3><ul>{% for reason in powers.can_seize %}<li>{{ reason }}</li>{% endfor %}</ul>{% endif %}
+    {% if powers.can_block.len() > 0 %}<h3>Transfer-blocking signals</h3><ul>{% for reason in powers.can_block %}<li>{{ reason }}</li>{% endfor %}</ul>{% endif %}
+    {% if powers.can_change_rules.len() > 0 %}<h3>Rule-change signals</h3><ul>{% for reason in powers.can_change_rules %}<li>{{ reason }}</li>{% endfor %}</ul>{% endif %}
+    {% if powers.unavailable.len() > 0 %}<h3>Unavailable reads</h3><ul>{% for reason in powers.unavailable %}<li>{{ reason }}</li>{% endfor %}</ul>{% endif %}
+  </details>
+  <p>{{ powers.source_verified_subject }}: {{ powers.source_verified }}{% if powers.source_verified_proxy.len() > 0 %}; proxy: {{ powers.source_verified_proxy }}{% endif %}. Observed at <time>{{ powers.observed_at }}</time>.</p>
+  {% else %}
+  <p>Power evidence is unavailable for this review.</p>
+  {% endif %}
+  <p>Absence of observed signals is not proof that no authority exists.</p>
+</section>
+<section class="lookup" aria-labelledby="guard-wallet-title">
+  <h2 id="guard-wallet-title">Wallet transfer restrictions</h2>
+  <p>Check status: <strong>{{ wallet_check_status }}</strong></p>
+  {% if !wallet_check_restrictions.is_empty() %}
+  <ul>{% for restriction in wallet_check_restrictions %}<li>{{ restriction.detail }} <small><code>{{ restriction.code }}</code></small></li>{% endfor %}</ul>
+  {% endif %}
+</section>
+<section class="lookup" aria-labelledby="guard-reasons-title">
+  <h2 id="guard-reasons-title">Reasons</h2>
+  {% if reasons.is_empty() %}<p>No additional reasons were recorded.</p>{% else %}
+  <ul>{% for reason in reasons %}<li>{{ reason.detail }} <small><code>{{ reason.code }}</code></small></li>{% endfor %}</ul>
+  {% endif %}
+</section>
+<section class="lookup lookup-secondary" aria-labelledby="guard-pools-title">
+  <h2 id="guard-pools-title">Known pools</h2>
+  {% if pools.is_empty() %}<p>No matching pool facts are currently indexed.</p>{% else %}
+  <div class="table-scroll"><table><thead><tr><th>Pool</th><th>Venue</th><th>Quote side</th><th>Check</th><th>Observed</th></tr></thead><tbody>
+  {% for pool in pools %}<tr><td><code>{{ pool.address }}</code></td><td>{{ pool.venue }}</td><td>{{ pool.quote }}</td><td>{{ pool.verdict }}</td><td>{{ pool.observed_at }}</td></tr>{% endfor %}
+  </tbody></table></div>
+  {% endif %}
+</section>
+<section class="lookup">
+  <details class="guard-document">
+    <summary>Signed document (JSON)</summary>
+    <p>Verify this payload with <code>POST /verify</code>. <a href="/guide/verify-a-stock-token">Read the verification guide</a>.</p>
+    <pre><code>{{ document_json }}</code></pre>
+  </details>
+</section>
+<section class="lookup lookup-secondary">
+  <a class="button primary-button" href="/guard">Run another review <span aria-hidden="true">→</span></a>
+</section>
+{% endblock %}

@@ -1,0 +1,17 @@
+{% extends "layout.html" %}
+{% block title %}QED | {{ page_title }}{% endblock %}
+{% block meta_description %}{{ meta_description }}{% endblock %}
+{% block og_title %}QED | {{ page_title }}{% endblock %}
+{% block og_description %}{{ meta_description }}{% endblock %}
+{% block twitter_title %}QED | {{ page_title }}{% endblock %}
+{% block twitter_description %}{{ meta_description }}{% endblock %}
+{% block canonical_url %}{{ public_url }}{{ canonical_path }}{% endblock %}
+{% block canonical_link %}{{ public_url }}{{ canonical_path }}{% endblock %}
+{% block content %}
+<section class="page-intro content-page-intro">
+  <p class="eyebrow">{{ eyebrow }}</p>
+  <h1 class="page-title">{{ heading }}</h1>
+  <p>{{ intro }}</p>
+</section>
+<div class="content-page-body">{{ body_html|safe }}</div>
+{% endblock %}

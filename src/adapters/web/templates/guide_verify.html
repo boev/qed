@@ -1,0 +1,117 @@
+{% extends "docs.html" %}
+{% block title %}QED | {{ page_title }}{% endblock %}
+{% block meta_description %}{{ meta_description }}{% endblock %}
+{% block og_title %}QED | {{ page_title }}{% endblock %}
+{% block og_description %}{{ meta_description }}{% endblock %}
+{% block twitter_title %}QED | {{ page_title }}{% endblock %}
+{% block twitter_description %}{{ meta_description }}{% endblock %}
+{% block canonical_url %}{{ public_url }}{{ canonical_path }}{% endblock %}
+{% block canonical_link %}{{ public_url }}{{ canonical_path }}{% endblock %}
+{% block docs_body %}
+{% if canonical_path == "/docs" %}
+<section class="docs-overview">
+  <section aria-labelledby="docs-tools-title">
+    <h2 id="docs-tools-title">Start with a question</h2>
+    <div class="docs-table-scroll">
+      <table class="docs-tool-table">
+        <thead><tr><th scope="col">Tool</th><th scope="col">Question it answers</th><th scope="col">One-click example</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Guard</th><td>Is this token what it claims to be, and what can its issuer do to it?</td><td><a href="/guard/ethereum/0xc845b2894dBddd03858fd2D643B4eF725fE0849d">Open a Guard result</a></td></tr>
+          <tr><th scope="row">Check</th><td>Does this pool use the issuer's published contract?</td><td><a href="/guard/robinhood/0xeE6F200063a53Fe9450578d99c0F8eAD4952c97a">Review a real NVDA pool with Guard</a></td></tr>
+          <tr><th scope="row">Powers</th><td>What can the issuer do to this token?</td><td><a href="/tokens/NVDA">Browse NVDA's observed controls</a></td></tr>
+          <tr><th scope="row">Statement</th><td>What did these wallets hold, provably?</td><td><a href="/statements">Create a wallet statement</a></td></tr>
+          <tr><th scope="row">Registry</th><td>Which contracts did each issuer publish?</td><td><a href="/tokens/NVDA">Browse NVDA registry entries</a></td></tr>
+          <tr><th scope="row">Verify</th><td>Is this QED record genuine and still fresh?</td><td><a href="/validated">Browse signed records to re-check</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>Pool:</strong> a contract where two tokens are traded against each other. <strong>Registry:</strong> the list of contract addresses each issuer has published.</p>
+  </section>
+  <section class="docs-paths" aria-labelledby="docs-paths-title">
+    <h2 id="docs-paths-title">Three two-minute paths</h2>
+    <div class="docs-path-grid">
+      <article class="docs-path-card">
+        <h3>AI agent: connect MCP</h3>
+        <p>In Claude Code, run:</p>
+        <pre><code>claude mcp add --transport http qed https://qed.web3-energy.com/mcp</code></pre>
+        <p>Claude Desktop and Cursor can use this HTTP server config:</p>
+        <pre class="docs-config"><code>{
+  "mcpServers": {
+    "qed": {
+      "type": "http",
+      "url": "https://qed.web3-energy.com/mcp"
+    }
+  }
+}</code></pre>
+        <p>Try asking: <q>Before I swap, check whether NVDA on Ethereum matches its issuer’s published contract and report any observed token controls. Do not call it safe.</q></p>
+      </article>
+      <article class="docs-path-card">
+        <h3>App: call the API</h3>
+        <p>Send a pool address to Guard for an issuer match and observed controls:</p>
+        <pre><code>curl --request POST https://qed.web3-energy.com/api/guard \
+  --header 'Content-Type: application/json' \
+  --data '{"address":"0xeE6F200063a53Fe9450578d99c0F8eAD4952c97a","chain":"ethereum"}'</code></pre>
+        <p>See the <a href="/api">API reference</a> for response fields and the distinction between unknown and mismatch.</p>
+      </article>
+      <article class="docs-path-card">
+        <h3>Auditor: keep a Statement</h3>
+        <ol>
+          <li><a href="/statements">Create a Statement</a> for the wallet and chain.</li>
+          <li>Download the resulting JSON record.</li>
+          <li>POST that JSON to <code>/verify</code> to check its signature and freshness.</li>
+        </ol>
+        <p>See <a href="/api">API reference → Verify</a> for the request and response shape.</p>
+      </article>
+    </div>
+  </section>
+</section>
+{% else %}
+{% if canonical_path == "/guide/verify-a-stock-token" %}
+<div class="guide-flow-scroll">
+<svg class="guide-flow" viewBox="0 0 1060 220" role="img" aria-labelledby="verify-flow-title verify-flow-desc">
+  <title id="verify-flow-title">Contract-first verification flow</title>
+  <desc id="verify-flow-desc">A wallet address is checked by QED against the issuer registry and chain, producing a signed certificate.</desc>
+  <defs>
+    <marker id="verify-flow-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0 0 L8 4 L0 8 Z" fill="var(--accent)"/>
+    </marker>
+  </defs>
+  <g class="flow-text">
+    <rect class="flow-node" x="28" y="64" width="174" height="64" rx="12"/>
+    <rect class="flow-node flow-node-emphasis" x="250" y="64" width="150" height="64" rx="12"/>
+    <rect class="flow-node" x="448" y="64" width="174" height="64" rx="12"/>
+    <rect class="flow-node" x="688" y="64" width="140" height="64" rx="12"/>
+    <rect class="flow-node flow-node-emphasis" x="872" y="64" width="160" height="64" rx="12"/>
+    <text class="flow-node-label" x="115" y="93" text-anchor="middle">Wallet address</text>
+    <text class="flow-detail" x="115" y="112" text-anchor="middle">supplied by you</text>
+    <text class="flow-node-label" x="325" y="93" text-anchor="middle">QED check</text>
+    <text class="flow-detail" x="325" y="112" text-anchor="middle">compare contract</text>
+    <text class="flow-node-label" x="535" y="93" text-anchor="middle">Issuer registry</text>
+    <text class="flow-detail" x="535" y="112" text-anchor="middle">published contract</text>
+    <text class="flow-node-label" x="758" y="93" text-anchor="middle">Chain</text>
+    <text class="flow-detail" x="758" y="112" text-anchor="middle">RPC read</text>
+    <text class="flow-node-label" x="952" y="93" text-anchor="middle">Certificate</text>
+    <text class="flow-detail" x="952" y="112" text-anchor="middle">signed record</text>
+  </g>
+  <path class="flow-path" d="M202 96 H250" marker-end="url(#verify-flow-arrow)"/>
+  <path class="flow-path" d="M400 96 H448" marker-end="url(#verify-flow-arrow)"/>
+  <path class="flow-path" d="M622 88 H688" marker-end="url(#verify-flow-arrow)"/>
+  <path class="flow-path" d="M688 104 H622" marker-end="url(#verify-flow-arrow)"/>
+  <path class="flow-path" d="M828 96 H872" marker-end="url(#verify-flow-arrow)"/>
+  <circle class="flow-dot flow-dot-static" cx="202" cy="96" r="5"/>
+  <circle class="flow-dot flow-dot-moving" r="5">
+    <animateMotion dur="4s" repeatCount="indefinite" path="M202 96 H250"/>
+  </circle>
+</svg>
+</div>
+{% endif %}
+<section class="guide-content">
+  <article class="guide-step"><p class="eyebrow">01</p><h2>Find the exact contract</h2><p>Use the issuer's official registry or documentation. Record the chain, contract address, decimals, and the time you checked it. Do not copy an address from a social post or an unlabeled search result.</p></article>
+  <article class="guide-step"><p class="eyebrow">02</p><h2>Open the chain explorer</h2><p>Compare the exact address on the relevant chain explorer. Check that the token metadata, supply, and holder activity are consistent with the issuer's published information. Similar tickers on another chain are different assets.</p></article>
+  <article class="guide-step"><p class="eyebrow">03</p><h2>Inspect the pool</h2><p>For a pool, identify both token contracts, the pool address, and the venue. Confirm which side is the claimed stock-linked token. Liquidity, price, and volume describe the venue; they do not prove an issuer contract match, backing, custody, or endorsement.</p></article>
+  <article class="guide-step"><p class="eyebrow">04</p><h2>Re-check with QED</h2><p>Paste the pool or token address into <a href="/check">QED</a>. QED reads the configured chain RPC, compares the observed contract with the issuer's published contract in the registry, and labels uncertainty instead of treating a failed read as a match.</p></article>
+  <article class="guide-step"><p class="eyebrow">05</p><h2>Keep the record</h2><p>When QED can produce a certificate, use its public record and API JSON. Verify the Ed25519 signature with the published key, compare the registry hash and timestamps, and remember that the record has an expiry. A verified contract match does not prove backing, custody, price, liquidity, or solvency.</p></article>
+</section>
+<section class="guide-callout"><h2>What QED automates</h2><p>QED makes the contract comparison reproducible: it records the reads, canonicalizes the payload, signs the result, and exposes the evidence for independent re-checking. It does not replace the issuer's legal disclosures, a chain explorer, or your own risk assessment.</p><a class="button primary-button" href="/check">Check a pool <span aria-hidden="true">→</span></a></section>
+{% endif %}
+{% endblock %}

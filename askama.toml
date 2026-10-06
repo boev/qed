@@ -1,2 +1,2 @@
 [general]
-dirs = ["src/web/templates"]
+dirs = ["src/adapters/web/templates"]

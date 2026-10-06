@@ -16,7 +16,7 @@ QED application hosting is in Amazon Web Services, region eu-central-1 (Frankfur
 
 ## Third-party lookups
 
-To answer a check, our server sends the address you pasted to the operator-configured blockchain RPC endpoint for the relevant chain (Solana, Robinhood Chain, Base, Ethereum, or BNB Chain) and to the DexScreener public API when it needs pool data. In production, QED rejects its built-in public RPC defaults and uses only configured RPC endpoints. These requests carry only that on-chain address as lookup data, not your IP address, browser data, or any personal identifier from QED; the providers may still process the server's network metadata under their own policies. Wallet checks are submitted in a POST request body; results are not cached by address.
+To answer a check, our server sends the address you pasted to the operator-configured blockchain RPC endpoint for the relevant chain (Solana, Robinhood Chain, Base, Ethereum, or BNB Chain) and to the DexScreener public API when it needs pool data. In production, QED rejects its built-in public RPC defaults and uses only configured RPC endpoints. These requests carry only that on-chain address as lookup data, not your IP address, browser data, or any personal identifier from QED; the providers may still process the server's network metadata under their own policies. Wallet checks through the `/guard` form, `POST /api/guard`, `/api/wallet`, or MCP use POST request bodies. The legacy `GET /api/guard/{address}?chain=...&wallet=...` places the wallet in the request URL, where it may be exposed in browser history or other URL handling; prefer `POST /api/guard`. Results are not cached by address.
 
 ## No analytics, no advertising
 
@@ -25,6 +25,9 @@ QED runs no Google Analytics, advertising networks, or comparable trackers.
 ## Retention
 
 Operational logs are retained for 14 days. No routine access-log request content is retained. Exceptional application errors may include public on-chain pool or record identifiers, but logs must not contain secrets, request bodies, or client IP addresses. Client IP addresses used only for in-memory abuse prevention are discarded within a maximum of 70 seconds and are never sent to analytics. Published attestations describe public on-chain facts used to evidence a contract check. Public blockchain addresses and transaction facts may constitute personal data if they can be linked to an individual. QED stores attestations in encrypted, versioned storage until about 30 days after each record's stated expiry, when expiration pruning deletes them.
+
+Wallet statement pages are public to anyone with the link; QED keeps them in an in-process memory cache for up to 24 hours. Statement IDs are content hashes, not access controls.
+
 
 ## Your rights
 

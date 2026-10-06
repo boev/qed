@@ -20,6 +20,8 @@ RUN dnf install -y \
     && rm -f /tmp/rustup-init
 
 COPY Cargo.toml Cargo.lock askama.toml rustfmt.toml ./
+COPY CHANGELOG.md SECURITY.md ./
+COPY docs ./docs
 COPY src ./src
 COPY static ./static
 COPY registry ./registry
@@ -55,6 +57,7 @@ COPY --from=builder /src/target/release/qed-healthcheck /usr/local/bin/qed-healt
 COPY --from=builder /src/static ./static
 COPY --from=builder /src/registry ./registry
 COPY --from=builder /src/release ./release
+COPY --from=builder /src/CHANGELOG.md ./CHANGELOG.md
 RUN mkdir -p /data && chown -R 10001:0 /app /data
 RUN rm -rf /var/cache/dnf \
         /var/lib/dnf \

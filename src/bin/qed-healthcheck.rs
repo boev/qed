@@ -3,11 +3,11 @@ use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::process::ExitCode;
 use std::time::Duration;
 
-const ADDRESS: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 8080);
+const ADDRESS: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 8080);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
-const REQUEST: &[u8] =
-    b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+const REQUEST: &[u8] = b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
 
 fn healthy() -> std::io::Result<bool> {
     let mut stream = TcpStream::connect_timeout(&ADDRESS, CONNECT_TIMEOUT)?;
