@@ -1132,7 +1132,14 @@ mod tests {
         assert!(!llms.contains("[MCP endpoint]"));
 
         for body in [&home, &docs] {
-            assert!(body.contains(&expected_news));
+            let banner_start =
+                body.find("<p class=\"release-whats-new\">").expect("release banner");
+            let banner_end =
+                body[banner_start..].find("</p>").expect("release banner end") + banner_start;
+            let banner = &body[banner_start..banner_end];
+            assert!(banner.contains(&expected_news));
+            assert!(!banner.contains("Navigation"));
+            assert!(!banner.contains("Release notes"));
             assert!(body.contains(&format!("/changelog#{}", entry.anchor)));
             assert!(!body.contains("Unreleased"));
             match latest_blog {

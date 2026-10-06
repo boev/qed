@@ -2,63 +2,82 @@
 
 Notable QED changes, in reverse chronological order. Entries describe shipped behavior; QED does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.
 
+## [Release 8.1] - 2026-10-06
+
+**Pages open at the top; changelog gets shorter.**
+
+- **Navigation** — page links open at the top; Back and Forward restore saved scroll positions.
+- **Release notes** — concise bullets lead each entry, with longer context tucked into native disclosures.
+- **Blog** — screenshot steps stay compact, open full-size in a new tab, and match light or dark theme.
+
 ## [Release 8] - 2026-10-06
 
-**QED Guard and Statement make issuer checks usable as signed evidence.**
+**Signed reviews and wallet statements**
 
-- Guard gives a signed, read-only review of issuer identity, observed token controls, source status, optional wallet restrictions, and known pool facts. It denies only when evidence contradicts the issuer's published contract.
-- Guard compares likely publisher candidates with fresh on-chain metadata inside each request deadline (up to eight candidates); incomplete reads cannot deny by themselves and leave identity unknown unless another candidate contradicts.
-- A Statement records registry-token balances for chosen wallets at one point in time. Download its JSON to share the evidence and check the signature separately.
-- The Docs hub explains each tool in plain words and offers three short paths: an AI agent, an app, or an auditor. API, MCP, and LLM links are available from the footer and docs sidebar.
-- The home page and Docs hub show the newest released headline and, when present, the newest published blog post.
-- Blog images fit inside the article frame in light and dark themes.
+- **Guard** — one signed review covers issuer identity, observed powers, source status, optional wallet restrictions, and known pools.
+- **Statement** — sign registry-token balances for a chosen wallet set at one point in time.
+- **Publisher checks** — compare likely clones with fresh on-chain metadata; incomplete reads cannot deny alone.
+- **Docs** — the hub links short paths for agents, apps, and auditors.
+
+### Details
+
+Guard reviews supported-chain tokens and recognized pools with a signed verdict and machine-readable reasons. An unindexed Solana account is reviewed as a token.
+
+Statements record observed balances at a block height and can be downloaded and verified; balances do not prove ownership or solvency. Blog images fit their article frame in light and dark themes.
 
 ## [Release 7] - 2026-10-03
 
-**Powers stop guessing: a reverted getter is now 'absent', and pause state is probed both ways.**
+**Power reads distinguish absence from uncertainty**
 
-- A contract that reverts on a capability query is reported as "no such getter", not as a transient error.
-- Pause state is read via both `paused()` and `isPaused()`; whichever answers wins.
-- Rate limits and missing headers from RPC providers are retried as transient instead of being recorded as facts.
+- **Fallbacks** — reverted capability getters report absence rather than a transient read error.
+- **Pause state** — probe both `paused()` and `isPaused()` before reporting a token's pause status.
+- **Provider faults** — retry rate limits and missing headers as transient, not token facts.
 
 ## [Release 6] - 2026-10-03
 
-**Hot tokens stay warm, and flaky re-reads keep the last good facts.**
+**Warm reads preserve their last good observations**
 
-- The warm pass starts as soon as the leaderboard loads and is capped so it never starves live requests.
-- When a re-read fails, the last good observation stays on the page with its original timestamp.
+- **Warm-up** — start prefetching with leaderboard loads without starving live requests.
+- **Refreshes** — keep the last successful observation and timestamp after a failed re-read.
 
 ## [Release 5] - 2026-10-03
 
-**Token pages answer within a fixed deadline.**
+**Token pages answer within a fixed deadline**
 
-- Powers for every contract on a token page are filled within a 2.5 s budget; slower reads continue in the background and appear on the next load.
-- Frequently viewed tokens are kept warm so the badges are usually ready before you ask.
+- **Deadline** — resolve powers for every token contract within 2.5 seconds.
+- **Slow reads** — continue in the background and appear on a later page visit.
+- **Warm cache** — prepare frequently viewed tokens before visitors open their pages.
 
 ## [Release 4] - 2026-10-03
 
-**Issuer powers at a glance on every token page.**
+**Issuer powers appear on every token page**
 
-- Four badges per contract: can seize, can block, can change rules, source verified — open by default, details below.
-- The homepage now says what QED shows about each token; the two protected statements stay exactly as they were.
+- **Badges** — show seize, block, rule-change, and source-verification signals by default.
+- **Homepage** — explain issuer powers while preserving both protected statements verbatim.
 
 ## [Release 3] - 2026-10-02
 
-**QED Powers: see what the issuer can do to a token.**
+**See token powers across supported chains**
 
-- `/api/powers/{address}` and the `qed_powers` MCP tool read freeze, seize and rule-change authority straight from the chain, on Solana (Token-2022 extensions) and EVM (proxy admin, pauser, blocklist).
-- Source verification status comes from Sourcify, so "verified" means the published code matches the deployed bytecode.
+- **Solana** — report Token-2022 controls, including freeze, seize, and rule changes.
+- **EVM** — inspect proxy administration, pause state, and blocklist controls.
+- **Source** — compare deployed contract code with Sourcify's published verification.
 
 ## [Release 2] - 2026-10-02
 
-**Certificates verify reliably for every number format.**
+**Certificates verify across number formats**
 
-- Canonical JSON now handles floating-point fields the same way on signing and verification, so a certificate with awkward numbers no longer fails to verify.
+- **Signing** — canonical JSON encodes floating-point fields consistently for verification.
+- **Compatibility** — certificates with awkward decimal numbers now verify without payload changes.
+
+### Details
+
+Canonical JSON now handles floating-point fields identically while signing and verifying certificates.
 
 ## [Release 1] - 2026-10-02
 
-**QED speaks MCP: any AI agent can ask whether a pool is the real token.**
+**Ask QED issuer checks over MCP**
 
-- `POST /mcp` with the tools `qed_check`, `qed_wallet`, `qed_registry_lookup` and `qed_verify`; server card at `/.well-known/mcp/server-card.json`.
-- Ondo added as an issuer registry source next to xStocks and Robinhood.
-- Every contract links to its chain explorer.
+- **MCP** — call `qed_check`, `qed_wallet`, `qed_registry_lookup`, or `qed_verify` at `POST /mcp`.
+- **Registry** — add Ondo beside xStocks and Robinhood issuer sources.
+- **Explorers** — link every contract to its chain explorer.
