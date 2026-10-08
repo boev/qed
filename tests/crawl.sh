@@ -253,7 +253,7 @@ done
 verify_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' --data '{}' "$BASE/verify")"
 [[ "$verify_code" != "404" ]] || { printf 'FAIL /verify: endpoint missing\n' >&2; exit 1; }
 printf 'status %s POST /verify\n' "$verify_code"
-mcp_body="$(curl -fsS -X POST -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' --data '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' "$BASE/mcp")"
+mcp_body="$(curl -fsS -X POST -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -H 'MCP-Protocol-Version: 2026-07-28' --data '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' "$BASE/mcp")"
 mcp_names="$(jq -c '[.result.tools[].name] | sort' <<<"$mcp_body")"
 [[ "$mcp_names" == '["qed_check","qed_guard","qed_powers","qed_registry_lookup","qed_statement","qed_verify","qed_wallet"]' ]] || { printf 'FAIL /mcp: unexpected tool list %s\n' "$mcp_names" >&2; exit 1; }
 printf 'status 200 POST /mcp; seven MCP tools listed\n'

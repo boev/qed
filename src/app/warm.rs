@@ -171,6 +171,8 @@ fn transient_pool_error_code(error: &PoolError) -> &'static str {
         PoolError::CodeLookupUnsupported => "unsupported",
         PoolError::BudgetExceeded("deadline") => "rpc_deadline",
         PoolError::BudgetExceeded(_) => "budget_exceeded",
+        PoolError::UnsupportedVenue(_) => "unsupported_venue",
+        PoolError::RpcLimit(_) => "rpc_limit",
         PoolError::Reader(_) => "rpc_unavailable",
     }
 }
@@ -318,6 +320,7 @@ mod tests {
             last_checked: "2026-10-01T00:00:00Z".to_owned(),
             removed_at: None,
             stale_since: None,
+            official_deployments: Vec::new(),
         }
     }
 
@@ -363,5 +366,10 @@ mod tests {
             )),
             "rpc_unavailable"
         );
+        assert_eq!(
+            transient_pool_error_code(&PoolError::UnsupportedVenue("unknown factory".to_owned())),
+            "unsupported_venue"
+        );
+        assert_eq!(transient_pool_error_code(&PoolError::RpcLimit("bounded logs")), "rpc_limit");
     }
 }

@@ -23,6 +23,8 @@ const MAX_WALLETS: usize = 32;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct StatementRequest {
+    #[serde(default)]
+    pub label: String,
     pub wallets: Vec<String>,
     pub chains: Vec<String>,
     pub block: Option<u64>,
@@ -62,6 +64,7 @@ pub(crate) async fn create(
     let mut statement = Statement {
         id: String::new(),
         kind: "statement".to_owned(),
+        label: request.label.trim().to_owned(),
         version: 1,
         wallets,
         assets,
@@ -376,6 +379,7 @@ mod tests {
             last_checked: "2026-10-04T00:00:00Z".to_owned(),
             removed_at: None,
             stale_since: None,
+            official_deployments: Vec::new(),
         }
     }
 
@@ -398,7 +402,12 @@ mod tests {
     }
 
     fn request(wallets: Vec<String>) -> StatementRequest {
-        StatementRequest { wallets, chains: vec!["base".to_owned()], block: Some(100) }
+        StatementRequest {
+            label: String::new(),
+            wallets,
+            chains: vec!["base".to_owned()],
+            block: Some(100),
+        }
     }
 
     #[tokio::test]

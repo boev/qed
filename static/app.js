@@ -158,6 +158,11 @@
 
   const handleClick = (event) => {
     if (!(event.target instanceof Element)) return;
+    const printStatement = event.target.closest('[data-print-statement]');
+    if (printStatement) {
+      window.print();
+      return;
+    }
     const suggestion = event.target.closest('.ticker-suggestion');
     if (suggestion) {
       event.preventDefault();

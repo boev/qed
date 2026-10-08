@@ -19,7 +19,7 @@ const SUPPORTED_PROTOCOL_VERSIONS: [&str; 4] =
 const INSTRUCTIONS: &str = "QED checks tokens that claim to be something against the contract their issuer publishes. Re-check certificates after expiry or when the issuer registry changes. QED is read-only by design: it never holds keys, never submits transactions, and never recommends. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.";
 #[cfg(test)]
 const NON_CLAIMS: &str = "It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.";
-pub(crate) const SERVER_CARD_DESCRIPTION: &str = "QED is read-only by design: it never holds keys, never submits transactions, and never recommends. It compares token and pool facts with issuer publications. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.";
+pub(crate) const SERVER_CARD_DESCRIPTION: &str = "QED checks issuer-published contracts, observes token powers, reads wallet holdings, creates signed wallet statements, looks up registry entries, verifies QED documents, and signs Guard reviews. QED is read-only by design: it never holds keys, submits transactions, or recommends. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.";
 pub(crate) const READ_ONLY_STATEMENT: &str = "QED is read-only by design: it never holds keys, never submits transactions, and never recommends.";
 const LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
 
@@ -256,7 +256,7 @@ pub(crate) fn tool_table() -> Value {
         {
             "name": "qed_check",
             "title": "Check issuer contract match",
-            "description": "Check whether a pool or token address matches an issuer's published stock-token contract, for tokens that claim to be something. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
+            "description": "Does this pool or token use the stock-token contract published by its issuer? It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
             "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
             "inputSchema": {
                 "type": "object",
@@ -267,30 +267,15 @@ pub(crate) fn tool_table() -> Value {
             },
         },
         {
-            "name": "qed_guard",
-            "title": "Review a token or pool",
-            "description": "Create a signed QED Guard review for supported-chain tokens and pool addresses validated by the known-pool index or on-chain factory/derivation checks; unindexed Solana accounts are reviewed as tokens. The review includes issuer identity, token powers, source status, and known pool facts. QED never holds keys, submits transactions, or recommends. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
-            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "address": { "type": "string", "description": "Token contract or supported pool address." },
-                    "chain": { "type": "string", "enum": ["solana", "robinhood", "base", "ethereum", "bnb"], "description": "Supported chain on which to review the address." },
-                    "wallet": { "type": "string", "description": "Optional wallet address to check against active transfer restrictions." }
-                },
-                "required": ["address", "chain"]
-            }
-        },
-        {
             "name": "qed_powers",
             "title": "Read token powers",
-            "description": "Read token authority settings and source-verification status for any supported-chain token contract; an optional chain selects one network, otherwise QED detects the chain or reads matching registry entries. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
+            "description": "What can an issuer or authority holder do to this token? QED reports observed control signals and source-verification status for supported-chain token contracts. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
             "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "address": { "type": "string", "description": "Any supported token contract address." },
-                    "chain": { "type": "string", "enum": ["solana", "robinhood", "base", "ethereum", "bnb"], "description": "Optional chain selector; by default QED uses matching registry entries or detects the EVM chain." }
+                    "address": { "type": "string", "description": "Supported token contract address." },
+                    "chain": { "type": "string", "enum": ["solana", "robinhood", "base", "ethereum", "bnb"], "description": "Optional chain selector; without it QED uses matching registry entries or detects the EVM chain." }
                 },
                 "required": ["address"],
             },
@@ -298,7 +283,7 @@ pub(crate) fn tool_table() -> Value {
         {
             "name": "qed_wallet",
             "title": "Read wallet holdings",
-            "description": "Read stock-token holdings for a wallet address. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
+            "description": "Which issuer-published stock-token balances are visible in this wallet? It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
             "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
             "inputSchema": {
                 "type": "object",
@@ -309,35 +294,9 @@ pub(crate) fn tool_table() -> Value {
             },
         },
         {
-            "name": "qed_registry_lookup",
-            "title": "Look up issuer contracts",
-            "description": "Look up active issuer registry contracts for a ticker. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
-            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "ticker": { "type": "string", "description": "Ticker to look up." }
-                },
-                "required": ["ticker"],
-            },
-        },
-        {
-            "name": "qed_verify",
-            "title": "Verify QED certificate",
-            "description": "Verify a signed attestation, wallet statement, or Guard document, including signature, trusted signer, environment and freshness where applicable. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
-            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "attestation": { "type": "object", "description": "QED attestation, signed wallet statement, or Guard document payload." }
-                },
-                "required": ["attestation"],
-            },
-        },
-        {
             "name": "qed_statement",
             "title": "Create a signed wallet statement",
-            "description": "Sign registry-token balances observed for a selected wallet set and chain set. Balances are on-chain facts at a height, not ownership, solvency or reserves. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
+            "description": "What did these wallets hold, provably? QED signs registry-token balances observed for a selected wallet set and chains. Balances are on-chain facts at a height, not ownership, solvency or reserves. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
             "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
             "inputSchema": {
                 "type": "object",
@@ -349,6 +308,47 @@ pub(crate) fn tool_table() -> Value {
                 "required": ["wallets", "chains"]
             }
         },
+        {
+            "name": "qed_registry_lookup",
+            "title": "Look up issuer contracts",
+            "description": "Which contracts did this issuer publish for this ticker? It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ticker": { "type": "string", "description": "Ticker to look up." }
+                },
+                "required": ["ticker"],
+            },
+        },
+        {
+            "name": "qed_verify",
+            "title": "Verify QED document",
+            "description": "Is this QED document genuine, and is it fresh where freshness applies? This tool checks payload shape, cryptographic signature, trusted signer, and environment. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "attestation": { "type": "object", "description": "Signed QED attestation, wallet statement, Guard document, or stats snapshot payload." }
+                },
+                "required": ["attestation"],
+            },
+        },
+        {
+            "name": "qed_guard",
+            "title": "Review a token or pool",
+            "description": "Is this token what it claims to be, and what can its issuer do to it? QED signs a supported-chain review of issuer identity, token powers, source status, known pool facts, and an allow, deny, or unknown verdict with machine-readable reasons. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
+            "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true },
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Token contract or supported pool address." },
+                    "chain": { "type": "string", "enum": ["solana", "robinhood", "base", "ethereum", "bnb"], "description": "Supported chain on which to review the address." },
+                    "wallet": { "type": "string", "description": "Optional wallet address to check against active transfer restrictions." }
+                },
+                "required": ["address", "chain"]
+            }
+        }
     ])
 }
 
@@ -482,8 +482,7 @@ async fn run_tool(state: &AppState, name: &str, arguments: &Value) -> Value {
                             records.len()
                         )
                     };
-                    let payload = powers_structured_content(records);
-                    tool_result(payload, text, false)
+                    tool_result(powers_structured_content(records), text, false)
                 }
                 Err(crate::app::powers::LookupError::InvalidAddress) => {
                     tool_error("Address is not a supported token contract.")
@@ -519,6 +518,40 @@ async fn run_tool(state: &AppState, name: &str, arguments: &Value) -> Value {
                 )),
             }
         }
+        "qed_statement" => {
+            let Some(wallets) = arguments
+                .get("wallets")
+                .and_then(Value::as_array)
+                .and_then(|values| values.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+            else {
+                return tool_error("wallets must be an array of wallet addresses");
+            };
+            let Some(chains) = arguments
+                .get("chains")
+                .and_then(Value::as_array)
+                .and_then(|values| values.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+            else {
+                return tool_error("chains must be an array of supported chain names");
+            };
+            let request = crate::app::statement::StatementRequest {
+                label: String::new(),
+                wallets: wallets.into_iter().map(str::to_owned).collect(),
+                chains: chains.into_iter().map(str::to_owned).collect(),
+                block: arguments.get("block").and_then(Value::as_u64),
+            };
+            match crate::app::statement::create(&state.app, request).await {
+                Ok(statement) => {
+                    let text = format!(
+                        "Signed statement {} for {} wallet(s) and {} registered-token holding(s). Balances are on-chain facts at a height, not ownership, solvency or reserves.",
+                        statement.id,
+                        statement.wallets.len(),
+                        statement.assets.len()
+                    );
+                    tool_result(json!(statement), text, false)
+                }
+                Err(error) => tool_error(&format!("QED could not create the statement: {error}")),
+            }
+        }
         "qed_registry_lookup" => {
             let Some(ticker) = string_argument(arguments, "ticker") else {
                 return tool_error("ticker must be a string");
@@ -536,39 +569,6 @@ async fn run_tool(state: &AppState, name: &str, arguments: &Value) -> Value {
             let text =
                 format!("Found {count} active issuer registry entries for {canonical_ticker}.");
             tool_result(json!({ "ticker": canonical_ticker, "entries": entries }), text, false)
-        }
-        "qed_statement" => {
-            let Some(wallets) = arguments
-                .get("wallets")
-                .and_then(Value::as_array)
-                .and_then(|values| values.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
-            else {
-                return tool_error("wallets must be an array of wallet addresses");
-            };
-            let Some(chains) = arguments
-                .get("chains")
-                .and_then(Value::as_array)
-                .and_then(|values| values.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
-            else {
-                return tool_error("chains must be an array of supported chain names");
-            };
-            let request = crate::app::statement::StatementRequest {
-                wallets: wallets.into_iter().map(str::to_owned).collect(),
-                chains: chains.into_iter().map(str::to_owned).collect(),
-                block: arguments.get("block").and_then(Value::as_u64),
-            };
-            match crate::app::statement::create(&state.app, request).await {
-                Ok(statement) => {
-                    let text = format!(
-                        "Signed statement {} for {} wallet(s) and {} registered-token holding(s). Balances are on-chain facts at a height, not ownership, solvency or reserves.",
-                        statement.id,
-                        statement.wallets.len(),
-                        statement.assets.len()
-                    );
-                    tool_result(json!(statement), text, false)
-                }
-                Err(error) => tool_error(&format!("QED could not create the statement: {error}")),
-            }
         }
         "qed_verify" => {
             let Some(document) = arguments.get("attestation").filter(|value| value.is_object())
@@ -763,64 +763,8 @@ mod tests {
             last_checked: "2026-01-01T00:00:00Z".to_owned(),
             removed_at: None,
             stale_since: None,
+            official_deployments: Vec::new(),
         }
-    }
-
-    fn powers_record(
-        chain: crate::domain::chain::Chain,
-        contract: &str,
-    ) -> crate::domain::powers::PowersRecord {
-        crate::domain::powers::PowersRecord {
-            chain,
-            contract: contract.to_owned(),
-            can_seize: Vec::new(),
-            can_block: Vec::new(),
-            can_change_rules: Vec::new(),
-            token_paused: None,
-            unavailable: Vec::new(),
-            sanctions_list: None,
-            source_verified_subject: crate::domain::powers::SourceVerifiedSubject::Contract,
-            source_verified: crate::domain::powers::SourceVerified::None,
-            source_verified_proxy: None,
-            observed_at: "2026-10-02T00:00:00Z".to_owned(),
-            block: None,
-            slot: None,
-            reads: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn powers_tool_wraps_multi_chain_records_in_an_object() {
-        let single = tool_result(
-            powers_structured_content(vec![powers_record(
-                crate::domain::chain::Chain::Base,
-                "0x0000000000000000000000000000000000000001",
-            )]),
-            "single".to_owned(),
-            false,
-        );
-        assert_eq!(
-            single["structuredContent"]["contract"],
-            "0x0000000000000000000000000000000000000001"
-        );
-        assert!(single["structuredContent"]["records"].is_null());
-
-        let multiple = tool_result(
-            powers_structured_content(vec![
-                powers_record(
-                    crate::domain::chain::Chain::Base,
-                    "0x0000000000000000000000000000000000000001",
-                ),
-                powers_record(
-                    crate::domain::chain::Chain::RobinhoodChain,
-                    "0x0000000000000000000000000000000000000001",
-                ),
-            ]),
-            "multiple".to_owned(),
-            false,
-        );
-        assert!(multiple["structuredContent"].is_object());
-        assert_eq!(multiple["structuredContent"]["records"].as_array().unwrap().len(), 2);
     }
 
     async fn post_rpc(method: &str, params: Value) -> Response {
@@ -972,174 +916,131 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_has_seven_complete_read_only_schemas() {
+    async fn tools_list_has_exactly_seven_complete_read_only_schemas() {
         let value = response_json(post_rpc("tools/list", json!({})).await).await;
         let tools = value["result"]["tools"].as_array().expect("tools array");
-        let names: Vec<_> = tools.iter().filter_map(|tool| tool["name"].as_str()).collect();
+        let names = tools.iter().filter_map(|tool| tool["name"].as_str()).collect::<Vec<_>>();
         assert_eq!(
             names,
             [
                 "qed_check",
-                "qed_guard",
                 "qed_powers",
                 "qed_wallet",
+                "qed_statement",
                 "qed_registry_lookup",
                 "qed_verify",
-                "qed_statement"
+                "qed_guard"
             ]
         );
-        for (tool, field) in tools.iter().zip([
-            "address",
-            "address",
-            "address",
-            "address",
-            "ticker",
-            "attestation",
-            "wallets",
-        ]) {
+        let schemas = [
+            ("qed_check", "address", json!(["address"]), "string", true),
+            ("qed_powers", "address", json!(["address"]), "string", true),
+            ("qed_wallet", "address", json!(["address"]), "string", true),
+            ("qed_statement", "wallets", json!(["wallets", "chains"]), "array", false),
+            ("qed_registry_lookup", "ticker", json!(["ticker"]), "string", true),
+            ("qed_verify", "attestation", json!(["attestation"]), "object", true),
+            ("qed_guard", "address", json!(["address", "chain"]), "string", true),
+        ];
+        for (tool, (name, field, required, field_type, idempotent)) in tools.iter().zip(schemas) {
+            assert_eq!(tool["name"], name);
             assert_eq!(tool["inputSchema"]["type"], "object");
-            assert_eq!(tool["inputSchema"]["required"][0], field);
-            assert!(tool["title"].as_str().is_some_and(|title| !title.is_empty()));
+            assert_eq!(tool["inputSchema"]["required"], required);
+            assert_eq!(tool["inputSchema"]["properties"][field]["type"], field_type);
             assert_eq!(tool["annotations"]["readOnlyHint"], true);
             assert_eq!(tool["annotations"]["destructiveHint"], false);
-            assert_eq!(tool["annotations"]["idempotentHint"], tool["name"] != "qed_statement");
+            assert_eq!(tool["annotations"]["idempotentHint"], idempotent);
             assert_eq!(tool["annotations"]["openWorldHint"], true);
-            assert!(tool["description"].as_str().unwrap().contains(NON_CLAIMS));
+            assert!(tool["title"].as_str().is_some_and(|title| !title.is_empty()));
+            let description = tool["description"].as_str().unwrap();
+            assert!(description.contains(NON_CLAIMS));
+            assert!(description.split_once("? ").is_some_and(|(question, remainder)| {
+                !question.is_empty() && remainder.contains(NON_CLAIMS)
+            }));
         }
-        assert_eq!(
-            tools[2]["inputSchema"]["properties"]["chain"]["enum"],
-            json!(["solana", "robinhood", "base", "ethereum", "bnb"])
-        );
-        assert_eq!(tools[2]["inputSchema"]["required"], json!(["address"]));
-        assert_eq!(tools[1]["inputSchema"]["required"], json!(["address", "chain"]));
         assert_eq!(
             tools[1]["inputSchema"]["properties"]["chain"]["enum"],
             json!(["solana", "robinhood", "base", "ethereum", "bnb"])
         );
-        assert_eq!(tools[6]["inputSchema"]["required"], json!(["wallets", "chains"]));
+        assert_eq!(tools[1]["inputSchema"]["required"], json!(["address"]));
         assert_eq!(
-            tools[6]["inputSchema"]["properties"]["chains"]["items"]["enum"],
+            tools[3]["inputSchema"]["properties"]["chains"]["items"]["enum"],
             json!(["solana", "robinhood", "base", "ethereum", "bnb"])
         );
-        assert_eq!(tools[6]["inputSchema"]["properties"]["block"]["minimum"], 0);
-    }
-
-    #[tokio::test]
-    async fn guard_tool_rejects_missing_chain_as_params_and_invalid_address_as_tool_error() {
-        let missing_chain = response_json(
-            post_rpc(
-                "tools/call",
-                json!({
-                    "name": "qed_guard",
-                    "arguments": { "address": "0x0000000000000000000000000000000000000001" }
-                }),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(missing_chain["error"]["code"], -32602);
-
-        let invalid_address = response_json(
-            post_rpc(
-                "tools/call",
-                json!({
-                    "name": "qed_guard",
-                    "arguments": { "address": "not-an-address", "chain": "base" }
-                }),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(invalid_address["result"]["isError"], true);
-        assert_eq!(invalid_address["result"]["content"][0]["type"], "text");
-        assert!(
-            invalid_address["result"]["content"][0]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("invalid for the selected chain"))
+        assert_eq!(tools[3]["inputSchema"]["properties"]["wallets"]["maxItems"], 32);
+        assert_eq!(tools[3]["inputSchema"]["properties"]["block"]["minimum"], 0);
+        assert_eq!(tools[6]["inputSchema"]["required"], json!(["address", "chain"]));
+        assert_eq!(
+            tools[6]["inputSchema"]["properties"]["chain"]["enum"],
+            json!(["solana", "robinhood", "base", "ethereum", "bnb"])
         );
     }
-
     #[tokio::test]
-    async fn statement_tool_execution_failures_are_tool_errors() {
-        let response = post_rpc(
-            "tools/call",
-            json!({
-                "name": "qed_statement",
-                "arguments": { "wallets": ["not-a-wallet"], "chains": ["solana"] }
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let value = response_json(response).await;
-        assert_eq!(value["result"]["isError"], true);
-        assert!(value["result"]["content"][0]["text"].as_str().unwrap().contains("statement"));
-    }
-    #[tokio::test]
-    async fn statement_tool_rejects_wallet_and_block_boundaries_before_reader_access() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        };
-
-        struct CountingReader(Arc<AtomicUsize>);
-
-        #[async_trait::async_trait]
-        impl crate::ports::ChainReader for CountingReader {
-            fn chain(&self) -> crate::domain::chain::Chain {
-                crate::domain::chain::Chain::Base
-            }
-
-            async fn read_pool(
-                &self,
-                _address: &str,
-            ) -> Result<crate::domain::pool::PoolInfo, crate::domain::pool::PoolError> {
-                Err(crate::domain::pool::PoolError::Reader("unused test reader".to_owned()))
-            }
-
-            async fn statement_holdings(
-                &self,
-                _owner: &str,
-                _entries: &[crate::domain::registry::Entry],
-                _block: Option<u64>,
-            ) -> Result<
-                (
-                    Vec<crate::domain::statement::StatementHolding>,
-                    crate::domain::statement::StatementPosition,
-                ),
-                crate::domain::pool::PoolError,
-            > {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Err(crate::domain::pool::PoolError::Reader("unexpected read".to_owned()))
-            }
-        }
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let state = AppState::for_tests(
-            vec![test_registry_entry()],
-            vec![Box::new(CountingReader(Arc::clone(&calls)))],
-            true,
-        );
+    async fn restored_tool_arguments_reject_invalid_boundaries() {
         let wallets = (0..33).map(|index| format!("0x{index:040x}")).collect::<Vec<_>>();
-        for arguments in [
-            json!({ "wallets": wallets, "chains": ["base"] }),
-            json!({
-                "wallets": ["0x0000000000000000000000000000000000000001"],
-                "chains": ["base"],
-                "block": 1.5
-            }),
-        ] {
-            let response = post_modern_version_with_state(
-                state.clone(),
-                "tools/call",
-                json!({ "name": "qed_statement", "arguments": arguments }),
-                MODERN_PROTOCOL_VERSION,
+        let invalid_arguments = [
+            (
+                "qed_powers",
+                json!({ "address": "0x0000000000000000000000000000000000000001", "chain": "avalanche" }),
+            ),
+            ("qed_guard", json!({ "address": "0x0000000000000000000000000000000000000001" })),
+            ("qed_statement", json!({ "wallets": [], "chains": ["base"] })),
+            (
+                "qed_statement",
+                json!({ "wallets": ["0x0000000000000000000000000000000000000001"], "chains": ["base", "base"] }),
+            ),
+            (
+                "qed_statement",
+                json!({ "wallets": ["0x0000000000000000000000000000000000000001"], "chains": ["base"], "block": 1.5 }),
+            ),
+            ("qed_statement", json!({ "wallets": wallets, "chains": ["base"] })),
+        ];
+        for (name, arguments) in invalid_arguments {
+            let value = response_json(
+                post_rpc("tools/call", json!({ "name": name, "arguments": arguments })).await,
             )
             .await;
-            let value = response_json(response).await;
-            assert_eq!(value["error"]["code"], -32602);
+            assert_eq!(value["error"]["code"], -32602, "{name}: {arguments}");
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
+
+    #[tokio::test]
+    async fn powers_and_guard_invalid_addresses_are_tool_errors() {
+        for (name, arguments) in [
+            ("qed_powers", json!({ "address": "not-an-address" })),
+            ("qed_guard", json!({ "address": "not-an-address", "chain": "base" })),
+        ] {
+            let value = response_json(
+                post_modern_rpc("tools/call", json!({ "name": name, "arguments": arguments }))
+                    .await,
+            )
+            .await;
+            assert_eq!(value["result"]["isError"], true, "{name}");
+            assert!(value["result"]["structuredContent"]["error"].is_string());
+            assert_eq!(value["result"]["content"][0]["type"], "text");
+        }
+    }
+
+    #[tokio::test]
+    async fn statement_tool_reports_invalid_wallet_as_a_tool_error() {
+        let value = response_json(
+            post_modern_rpc(
+                "tools/call",
+                json!({
+                    "name": "qed_statement",
+                    "arguments": { "wallets": ["not-a-wallet"], "chains": ["solana"] }
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(value["result"]["isError"], true);
+        assert!(
+            value["result"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("statement"))
+        );
+    }
+
     #[tokio::test]
     async fn static_server_card_describes_the_public_read_only_remote() {
         let response = crate::adapters::web::router(test_state())
@@ -1163,38 +1064,23 @@ mod tests {
         let manifest: Value =
             serde_json::from_str(include_str!("../../../server.json")).expect("manifest JSON");
         assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(value["tools"].as_array().unwrap().len(), 7);
-    }
-
-    #[tokio::test]
-    async fn powers_tool_invalid_address_returns_a_tool_error() {
-        let response = post_modern_rpc(
-            "tools/call",
-            json!({ "name": "qed_powers", "arguments": { "address": "not-an-address" } }),
-        )
-        .await;
-        let value = response_json(response).await;
-        assert_eq!(value["result"]["isError"], true);
-        assert!(
-            value["result"]["content"][0]["text"].as_str().unwrap().contains("not a supported")
+        assert_eq!(
+            value["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "qed_check",
+                "qed_powers",
+                "qed_wallet",
+                "qed_statement",
+                "qed_registry_lookup",
+                "qed_verify",
+                "qed_guard"
+            ]
         );
-    }
-
-    #[tokio::test]
-    async fn powers_tool_rejects_unknown_chain_as_invalid_params() {
-        let response = post_modern_rpc(
-            "tools/call",
-            json!({
-                "name": "qed_powers",
-                "arguments": {
-                    "address": "0x0000000000000000000000000000000000000001",
-                    "chain": "avalanche"
-                }
-            }),
-        )
-        .await;
-        let value = response_json(response).await;
-        assert_eq!(value["error"]["code"], -32602);
     }
 
     #[tokio::test]
@@ -1235,20 +1121,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_lookup_uses_canonical_ticker_and_active_entries() {
+    async fn registry_lookup_works_for_modern_and_legacy_requests() {
         let state = test_state();
         *state.registry.write().await = std::sync::Arc::new(vec![test_registry_entry()]);
         let response = post_modern_version_with_state(
-            state,
+            state.clone(),
             "tools/call",
             json!({ "name": "qed_registry_lookup", "arguments": { "ticker": " nvda " } }),
             MODERN_PROTOCOL_VERSION,
         )
         .await;
-        let value = response_json(response).await;
-        assert_eq!(value["result"]["isError"], false);
-        assert_eq!(value["result"]["structuredContent"]["ticker"], "NVDA");
-        assert_eq!(value["result"]["structuredContent"]["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(response.status(), StatusCode::OK);
+        let modern = response_json(response).await;
+        assert_eq!(modern["result"]["isError"], false);
+        assert_eq!(modern["result"]["structuredContent"]["ticker"], "NVDA");
+        assert_eq!(modern["result"]["structuredContent"]["entries"].as_array().unwrap().len(), 1);
+
+        let response = crate::adapters::web::router(state)
+            .oneshot(
+                Request::post("/mcp")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header("MCP-Protocol-Version", LEGACY_PROTOCOL_VERSION)
+                    .body(axum::body::Body::from(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 9,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "qed_registry_lookup",
+                                "arguments": { "ticker": "NVDA" }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("legacy registry lookup request"),
+            )
+            .await
+            .expect("legacy MCP response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let legacy = response_json(response).await;
+        assert_eq!(legacy["result"]["isError"], false);
+        assert_eq!(legacy["result"]["structuredContent"]["ticker"], "NVDA");
+        assert_eq!(legacy["result"]["structuredContent"]["entries"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

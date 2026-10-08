@@ -113,17 +113,17 @@ pub enum VerifyError {
 }
 
 pub fn verify(attestation: &Attestation) -> Result<(), VerifyError> {
-    let payload = canonical_json(&attestation.payload())?;
-    let mut hasher = Sha256::new();
-    hasher.update(&payload);
-    let digest = hasher.finalize();
-
-    let expected = hex_lower(&digest);
+    let mut payload = canonical_json(&attestation.payload())?;
     if attestation.id.len() != 64 || !attestation.id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(VerifyError::Id);
     }
+    let expected = hex_lower(&Sha256::digest(&payload));
     if !attestation.id.eq_ignore_ascii_case(&expected) {
-        return Err(VerifyError::IdMismatch);
+        payload = canonical_json_legacy_chains(&attestation.payload())?;
+        let legacy_expected = hex_lower(&Sha256::digest(&payload));
+        if !attestation.id.eq_ignore_ascii_case(&legacy_expected) {
+            return Err(VerifyError::IdMismatch);
+        }
     }
     if attestation.signer.len() > Chain::MAX_SOLANA_ADDRESS_CHARS {
         return Err(VerifyError::SignerKey);
@@ -159,6 +159,42 @@ pub fn canonical_payload_json(attestation: &Attestation) -> Result<String, serde
 pub(crate) fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
     let value = serde_json::to_value(value)?;
     serde_json::to_vec(&canonical_value(value))
+}
+pub(crate) fn canonical_json_legacy_chains<T: Serialize>(
+    value: &T,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut value = serde_json::to_value(value)?;
+    restore_legacy_chain_names(&mut value);
+    serde_json::to_vec(&canonical_value(value))
+}
+
+pub(crate) fn restore_legacy_chain_names(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            if let Some(Value::String(chain)) = object.get_mut("chain") {
+                let legacy_name = match chain.as_str() {
+                    "solana" => Some("Solana"),
+                    "robinhood" => Some("RobinhoodChain"),
+                    "base" => Some("Base"),
+                    "ethereum" => Some("Ethereum"),
+                    "bnb" => Some("Bnb"),
+                    _ => None,
+                };
+                if let Some(legacy_name) = legacy_name {
+                    *chain = legacy_name.to_owned();
+                }
+            }
+            for nested in object.values_mut() {
+                restore_legacy_chain_names(nested);
+            }
+        }
+        Value::Array(values) => {
+            for nested in values {
+                restore_legacy_chain_names(nested);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn canonical_value(value: Value) -> Value {

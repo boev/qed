@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.boev/qed",
   "title": "QED",
-  "description": "Read-only stock-token issuer contract checks and observed token-power signals.",
-  "version": "0.1.0",
+  "description": "Read-only issuer checks, observed token powers, wallet holdings and statements, registry lookup, document verification, and signed Guard reviews.",
+  "version": "1.0.0",
   "websiteUrl": "https://qed.web3-energy.com",
   "repository": {
     "url": "https://github.com/boev/qed",

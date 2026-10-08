@@ -88,7 +88,7 @@ async fn create_inner(
     .await;
     let ((publisher_metadata, publisher_metadata_unavailable), publisher_metadata_log) =
         capture_reads(load_publisher_metadata(
-            reader.as_ref(),
+            state.readers.as_slice(),
             chain,
             &subject,
             metadata.as_ref(),
@@ -208,7 +208,7 @@ async fn create_inner(
     Ok(document)
 }
 async fn load_publisher_metadata(
-    reader: &dyn ChainReader,
+    readers: &[Box<dyn ChainReader>],
     chain: Chain,
     target: &str,
     metadata: Option<&TokenMeta>,
@@ -232,14 +232,14 @@ async fn load_publisher_metadata(
     'priority: for exact_ticker in [true, false] {
         for (index, entry) in entries.iter().enumerate() {
             if !registry::matchable(entry)
-                || entry.chain != chain
-                || same_address(chain, target, &entry.contract)
-                || !crate::domain::guard::metadata_resembles_entry(metadata, entry)
+                || (entry.chain == chain && same_address(chain, target, &entry.contract))
+                || (!crate::domain::guard::metadata_resembles_entry(metadata, entry)
+                    && !crate::domain::guard::metadata_claims_product_symbol(metadata, entry))
                 || crate::domain::guard::exact_ticker_candidate(metadata, entry) != exact_ticker
             {
                 continue;
             }
-            let key = crate::domain::guard::issuer_metadata_key(chain, &entry.contract);
+            let key = crate::domain::guard::issuer_metadata_key(entry.chain, &entry.contract);
             if candidates.iter().any(|(candidate_key, _)| candidate_key == &key) {
                 continue;
             }
@@ -261,7 +261,10 @@ async fn load_publisher_metadata(
         let entries = std::sync::Arc::clone(&entries);
         async move {
             let entry = &entries[index];
-            let result = reader.token_meta(&entry.contract).await;
+            let result = match readers.iter().find(|reader| reader.chain() == entry.chain) {
+                Some(reader) => reader.token_meta(&entry.contract).await.ok(),
+                None => None,
+            };
             (key, index, result)
         }
     }))
@@ -272,9 +275,13 @@ async fn load_publisher_metadata(
     let mut unavailable = truncated;
     for (key, index, result) in results {
         match result {
-            Ok(metadata)
+            Some(metadata)
                 if crate::domain::guard::metadata_complete(&metadata)
-                    && same_address(chain, &metadata.address, &entries[index].contract) =>
+                    && same_address(
+                        entries[index].chain,
+                        &metadata.address,
+                        &entries[index].contract,
+                    ) =>
             {
                 publisher_metadata.insert(key, metadata);
             }
@@ -679,6 +686,7 @@ mod tests {
             last_checked: "2026-10-01T00:00:00Z".to_owned(),
             removed_at: None,
             stale_since: None,
+            official_deployments: Vec::new(),
         }
     }
 
@@ -913,6 +921,81 @@ mod tests {
         assert_eq!(second.identity.status, IdentityStatus::Mismatch);
         assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 4);
         assert_eq!(second.reads.iter().filter(|read| read.method == "token_meta").count(), 2);
+    }
+    #[tokio::test]
+    async fn cross_chain_xstock_clone_is_denied_but_official_wrapper_matches() {
+        const CLONE: &str = "0x0000000000000000000000000000000000000005";
+        const BASE_WRAPPER: &str = "0x0000000000000000000000000000000000000011";
+        let mut backed = entry();
+        backed.official_deployments = vec![
+            crate::domain::registry::OfficialDeployment {
+                network: "Arbitrum".to_owned(),
+                address: "0x0000000000000000000000000000000000000101".to_owned(),
+                wrapper_address: None,
+                wrapper_address_v2: None,
+            },
+            crate::domain::registry::OfficialDeployment {
+                network: "Base".to_owned(),
+                address: TOKEN.to_owned(),
+                wrapper_address: Some(BASE_WRAPPER.to_owned()),
+                wrapper_address_v2: None,
+            },
+            crate::domain::registry::OfficialDeployment {
+                network: "Ethereum".to_owned(),
+                address: "0x0000000000000000000000000000000000000102".to_owned(),
+                wrapper_address: None,
+                wrapper_address_v2: None,
+            },
+        ];
+        let state = test_support::build(
+            vec![
+                Box::new(GuardReader {
+                    chain: Chain::Base,
+                    pool: None,
+                    metadata: HashMap::from([(
+                        TOKEN.to_ascii_lowercase(),
+                        meta(TOKEN, "NVDAx", "NVIDIA xStock"),
+                    )]),
+                    restrictions: Vec::new(),
+                    wallet_applicable: true,
+                    token_meta_reads: None,
+                }),
+                Box::new(GuardReader {
+                    chain: Chain::RobinhoodChain,
+                    pool: None,
+                    metadata: HashMap::from([(
+                        CLONE.to_ascii_lowercase(),
+                        meta(CLONE, "NVDAx", "NVIDIA xStock"),
+                    )]),
+                    restrictions: Vec::new(),
+                    wallet_applicable: true,
+                    token_meta_reads: None,
+                }),
+            ],
+            vec![backed],
+            false,
+        );
+
+        let clone = create(&state, CLONE, Chain::RobinhoodChain, None).await.expect("clone Guard");
+        assert_eq!(clone.identity.status, IdentityStatus::Mismatch);
+        assert_eq!(clone.verdict, GuardVerdict::Deny);
+        let reason = clone
+            .reasons
+            .iter()
+            .find(|reason| reason.code == "claims_unpublished_publisher_product")
+            .expect("specific cross-chain denial reason");
+        assert_eq!(
+            reason.detail,
+            "QED Guard found an exact on-chain symbol/name match for NVIDIA xStock (NVDA), but this address is absent from Example Publisher's published deployment catalog. The catalog lists deployments on Arbitrum, Base, Ethereum."
+        );
+        assert!(clone.reads.iter().any(|read| read.method == "token_meta"));
+        crate::domain::guard::verify(&clone).expect("cross-chain denial is signed");
+
+        let wrapper =
+            create(&state, BASE_WRAPPER, Chain::Base, None).await.expect("official wrapper Guard");
+        assert_eq!(wrapper.identity.status, IdentityStatus::Match);
+        assert_eq!(wrapper.identity.matched_contract.as_deref(), Some(BASE_WRAPPER));
+        assert_ne!(wrapper.verdict, GuardVerdict::Deny);
     }
 
     #[tokio::test]

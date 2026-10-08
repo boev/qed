@@ -74,7 +74,7 @@ const METEORA_DLMM_RESERVE_X_OFFSET: usize = 152;
 const METEORA_DLMM_RESERVE_Y_OFFSET: usize = 184;
 const METEORA_DLMM_DATA_SIZE: usize = 904;
 
-const METAPLEX_METADATA_PROGRAM: &str = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s";
+pub(crate) const METAPLEX_METADATA_PROGRAM: &str = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
@@ -2134,6 +2134,7 @@ mod tests {
             last_checked: "2026-09-23T00:00:00Z".to_owned(),
             removed_at: None,
             stale_since: None,
+            official_deployments: Vec::new(),
         }
     }
 

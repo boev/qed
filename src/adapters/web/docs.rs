@@ -30,7 +30,12 @@ QED checks tokens that claim to be something against the contract their issuer p
 - [API reference]({base}/api): server-rendered routes, parameters, and examples.
 - [OpenAPI 3.1]({base}/openapi.json): API schemas and routes.
 - [Use QED with an LLM]({base}/docs/llm): MCP connection details and tool descriptions.
-- MCP endpoint: POST `{base}/mcp`; stateless Streamable HTTP tools for issuer-match checks, signed Guard reviews, wallet holdings, statements, registry lookup, and verification. Use the [MCP guide]({base}/docs/llm) for connection setup.
+- [Leaderboard statistics]({base}/stats): leaderboard read counts, issuer-registry coverage, publisher-catalog observations, scan method/time, counts last seen within the last 7 days, and entries first seen this UTC week. Signed snapshots are available as JSON at `{base}/stats.json` and CSV at `{base}/stats.csv`.
+- GET `{base}/api/stats?page=N`: paginated machine-readable leaderboard and registry totals, plus the signed snapshot's reducer inputs. Summary counts distinguish unsupported venues from checks that have not run; pages contain up to 50 rows per input.
+- MCP endpoint: POST `{base}/mcp`; stateless Streamable HTTP with seven tools: `qed_check`, `qed_powers`, `qed_wallet`, `qed_statement`, `qed_registry_lookup`, `qed_verify`, and `qed_guard`. Use the [MCP guide]({base}/docs/llm) for setup.
+- Claude Code connection: `claude mcp add --transport http qed {base}/mcp`; Claude Desktop and Cursor HTTP settings are in the [MCP guide]({base}/docs/llm).
+- Statement records at `{base}/statements` support signed JSON and CSV downloads, a signature-verification page, browser Print/Save as PDF, and re-run with comparison; records are public to anyone with the link and retained for up to 24 hours.
+- Chain values use matching lowercase slugs in route paths, JSON, and OpenAPI: `solana`, `robinhood`, `base`, `ethereum`, and `bnb`. Existing signed records with previous variant names still verify.
 - [MCP server card]({base}/.well-known/mcp/server-card.json): endpoint and tool summary.
 - [Guard review]({base}/guard): signed review form for supported-chain tokens and pools.
 - [Guard API (GET)]({base}/api/guard/{{address}}?chain={{chain}}): signed issuer, powers, source, and known-pool review; pool identity requires the known-pool index or verified factory/derivation checks, and unindexed Solana accounts are reviewed as tokens. A wallet query may be exposed in browser history or request URLs.
@@ -65,7 +70,7 @@ QED checks tokens that claim to be something against the contract their issuer p
             &state,
             "API reference",
             "REFERENCE",
-            "API reference",
+            "How can software check an issuer-published token contract?",
             "QED checks tokens that claim to be something against the contract their issuer publishes. This API guide documents the machine-readable checks, signed reviews, and verification routes.",
             "QED API operations, parameters, and JSON examples generated from the OpenAPI document.",
             "/api",
@@ -270,7 +275,7 @@ mod openapi {
                     "issuer": "Backed xStocks",
                     "ticker": "NVDA",
                     "name": "NVIDIA",
-                    "chain": "Bnb",
+                    "chain": "bnb",
                     "contract": "0xc845b2894dBddd03858fd2D643B4eF725fE0849d",
                     "decimals": null,
                     "source": "xstocks-api",
@@ -281,7 +286,7 @@ mod openapi {
                     "issuer": "Backed xStocks",
                     "ticker": "NVDA",
                     "name": "NVIDIA",
-                    "chain": "Ethereum",
+                    "chain": "ethereum",
                     "contract": "0xc845b2894dBddd03858fd2D643B4eF725fE0849d",
                     "decimals": null,
                     "source": "xstocks-api",
@@ -306,7 +311,7 @@ mod openapi {
                 "schema": { "type": "array", "items": { "type": "object" } },
                 "example": [
                   {
-                    "chain": "Solana",
+                    "chain": "solana",
                     "dex": "raydium",
                     "pool": "featured-pool",
                     "base_symbol": "TSLA",
@@ -356,7 +361,7 @@ mod openapi {
                   "refreshing": false,
                   "empty_successful": false,
                   "prices_updated_at": "2026-10-04T12:00:00Z",
-                  "source": "DexScreener + on-chain reads",
+                  "source": "DexScreener / GeckoTerminal + on-chain reads",
                   "registry": {
                     "entries": 2,
                     "issuers": 1,
@@ -372,11 +377,14 @@ mod openapi {
                       "chain_label": "Solana",
                       "dex": "raydium",
                       "pool": "leaderboard-pool",
+                      "source": "dexscreener",
                       "base_symbol": "NVDA",
                       "quote_symbol": "USDC",
                       "issuer": "Backed xStocks",
                       "ticker": "NVDA",
                       "verdict": "verified",
+                      "read_status": "checked",
+                      "read_reason": null,
                       "price_usd": 132.5,
                       "change_24h_pct": 1.25,
                       "volume_24h_usd": 500000.0,
@@ -396,6 +404,136 @@ mod openapi {
         }
       }
     },
+    "/stats.json": {
+      "get": {
+        "summary": "Download signed statistics snapshot",
+        "responses": {
+          "200": {
+            "description": "Strict signed point-in-time statistics document",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatsDocument" },
+                "description": "Schematic document shape only; the illustrative ID and signature are not a verifiable signed snapshot.",
+                "example": {
+                  "id": "0000000000000000000000000000000000000000000000000000000000000000",
+                  "kind": "stats",
+                  "stats": {
+                    "generated_at": "2026-10-07T00:00:00Z",
+                    "headline": "QED checked 0 of 0 listed pools: 0 issuer matches, 0 mismatches, 0 unsupported venues, and 0 not read yet. 0 catalog observations are currently flagged (seen in the last 7 days); 0 were first seen this UTC week. 0 tokens on unsupported chains were seen but not judged. 0 supported observations and 0 unsupported candidates were evicted; 0 invalid supported and 0 invalid unsupported candidates were rejected.",
+                    "listed_pools": 0,
+                    "pools_checked": 0,
+                    "issuer_matches": 0,
+                    "mismatches": 0,
+                    "unsupported_venue": 0,
+                    "not_read_yet": { "count": 0, "rpc_limit": 0, "transient": 0, "unsupported": 0 },
+                    "by_chain": [],
+                    "registry": { "active_entries": 0, "by_issuer": [] },
+                    "publisher_catalog_watch": {
+                      "first_flagged_this_week": 0,
+                      "currently_flagged_last_7_days": 0,
+                      "unsupported_chain_candidates_seen": 0,
+                      "official_on_unsupported_chain": 0,
+                      "evicted_entries": 0,
+                      "evicted_unsupported_candidates": 0,
+                      "rejected_oversize_entries": 0,
+                      "rejected_oversize_unsupported_candidates": 0,
+                      "last_scanned_at": "",
+                      "method": "DexScreener is queried first; a cached USDC search returning no pairs marks it unavailable for five minutes. On DexScreener errors or canary unavailability, GeckoTerminal searches registry product names across supported and unsupported networks for the top 10 tickers, with 10 calls per minute.",
+                      "catalog_absent_tokens_truncated": false
+                    }
+                  },
+                  "observed_at": "2026-10-07T00:00:00Z",
+                  "public_key": "11111111111111111111111111111111",
+                  "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+                  "dev": true
+                }
+              }
+            }
+          },
+          "500": { "description": "Snapshot could not be signed" }
+        }
+      }
+    },
+    "/stats.csv": {
+      "get": {
+        "summary": "Download statistics CSV",
+        "responses": {
+          "200": {
+            "description": "CSV whose first record embeds the exact signed stats JSON document",
+            "content": {
+              "text/csv": {
+                "schema": { "type": "string" },
+                "example": "\"snapshot\",\"signed_stats_document_json\",\"{...}\""
+              }
+            }
+          },
+          "500": { "description": "Snapshot could not be signed or serialized" }
+        }
+      }
+    },
+    "/api/stats": {
+      "get": {
+        "summary": "Paginated leaderboard, impostor-watch, and active-registry statistics",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "description": "1-based page index; each page contains up to 50 rows from each full-history input.",
+            "schema": { "type": "integer", "minimum": 1, "default": 1 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Prepared point-in-time summary and one page of full leaderboard, catalog-watch, unsupported-candidate, and active-registry inputs",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatsApiPage" },
+                "example": {
+                  "stats": {
+                    "generated_at": "2026-10-06T12:00:00Z",
+                    "headline": "QED checked 1 of 1 listed pools: 1 issuer match, 0 mismatches, 0 unsupported venues, and 0 not read yet. 0 catalog observations are currently flagged (seen in the last 7 days); 0 were first seen this UTC week. 0 tokens on unsupported chains were seen but not judged. 0 supported observations and 0 unsupported candidates were evicted; 0 invalid supported and 0 invalid unsupported candidates were rejected.",
+                    "listed_pools": 1,
+                    "pools_checked": 1,
+                    "issuer_matches": 1,
+                    "mismatches": 0,
+                    "unsupported_venue": 0,
+                    "not_read_yet": { "count": 0, "rpc_limit": 0, "transient": 0, "unsupported": 0 },
+                    "by_chain": [{ "chain": "base", "chain_label": "Base", "counts": { "pools_checked": 1, "issuer_matches": 1, "mismatches": 0, "unsupported_venue": 0, "not_read_yet": { "count": 0, "rpc_limit": 0, "transient": 0, "unsupported": 0 } } }],
+                    "registry": { "active_entries": 1, "by_issuer": [{ "issuer": "Backed xStocks", "entries": 1, "chains": ["Base"] }] },
+                    "publisher_catalog_watch": {
+                      "first_flagged_this_week": 0,
+                      "currently_flagged_last_7_days": 0,
+                      "unsupported_chain_candidates_seen": 0,
+                      "official_on_unsupported_chain": 0,
+                      "evicted_entries": 0,
+                      "evicted_unsupported_candidates": 0,
+                      "rejected_oversize_entries": 0,
+                      "rejected_oversize_unsupported_candidates": 0,
+                      "last_scanned_at": "2026-10-06T11:30:00Z",
+                      "method": "DexScreener is queried first; a cached USDC search returning no pairs marks it unavailable for five minutes. On DexScreener errors or canary unavailability, GeckoTerminal searches registry product names across supported and unsupported networks for the top 10 tickers, with 10 calls per minute.",
+                      "catalog_absent_tokens_truncated": false
+                    }
+                  },
+                  "page": 1,
+                  "page_size": 50,
+                  "pages": 1,
+                  "leaderboard_total": 1,
+                  "impostor_candidates_total": 0,
+                  "unsupported_candidates_total": 0,
+                  "active_registry_total": 1,
+                  "hashes": { "registry_source": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "leaderboard": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "impostor_watch": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+                  "leaderboard": [],
+                  "impostor_candidates": [],
+                  "unsupported_candidates": [],
+                  "active_registry": []
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/prices": {
       "get": {
         "summary": "Pool prices",
@@ -407,7 +545,7 @@ mod openapi {
             "description": "Price snapshot",
             "content": {
               "application/json": {
-                "schema": { "type": "object" },
+                "schema": { "$ref": "#/components/schemas/PriceSnapshot" },
                 "example": {
                   "updated_at": "2026-10-04T12:00:00Z",
                   "prices": [
@@ -417,7 +555,8 @@ mod openapi {
                       "price_usd": 12.5,
                       "change_24h_pct": 1.5,
                       "volume_24h_usd": 100.0,
-                      "liquidity_usd": 200.0
+                      "liquidity_usd": 200.0,
+                      "source": "dexscreener"
                     }
                   ]
                 }
@@ -435,8 +574,13 @@ mod openapi {
             "description": "Service status",
             "content": {
               "application/json": {
-                "schema": { "type": "object" },
+                "schema": {
+                  "type": "object",
+                  "required": ["version"],
+                  "properties": { "version": { "type": "string", "example": "1.0.0" } }
+                },
                 "example": {
+                  "version": "1.0.0",
                   "registry": {
                     "entries": 120,
                     "issuers": 6,
@@ -481,9 +625,9 @@ mod openapi {
                 "schema": { "type": "object" },
                 "example": {
                   "input": "0x0000000000000000000000000000000000000001",
-                  "chain": "Base",
+                  "chain": "base",
                   "pool": {
-                    "chain": "Base",
+                    "chain": "base",
                     "pool": "0x0000000000000000000000000000000000000001",
                     "dex": "uniswap-v2",
                     "base": {
@@ -543,7 +687,7 @@ mod openapi {
                 "example": {
                   "id": "0000000000000000000000000000000000000000000000000000000000000000",
                   "kind": "guard",
-                  "chain": "Base",
+                  "chain": "base",
                   "address": "0x0000000000000000000000000000000000000001",
                   "subject_type": "token",
                   "subject_address": "0x0000000000000000000000000000000000000001",
@@ -588,7 +732,7 @@ mod openapi {
                 "example": {
                   "id": "0000000000000000000000000000000000000000000000000000000000000000",
                   "kind": "guard",
-                  "chain": "Base",
+                  "chain": "base",
                   "address": "0x0000000000000000000000000000000000000001",
                   "subject_type": "pool",
                   "subject_address": "0x0000000000000000000000000000000000000001",
@@ -641,7 +785,7 @@ mod openapi {
                   ]
                 },
                 "example": {
-                  "chain": "Base",
+                  "chain": "base",
                   "contract": "0x0000000000000000000000000000000000000002",
                   "can_seize": [],
                   "can_block": [],
@@ -694,7 +838,7 @@ mod openapi {
                       "amount": "1.25",
                       "verdict": "Contract matches issuer registry",
                       "verdict_class": "is-verified",
-                      "chain": "Base",
+                      "chain": "base",
                       "pool_url": null,
                       "trade_links": [],
                       "reason": null
@@ -723,13 +867,13 @@ mod openapi {
                 "example": {
                   "id": "0e9596ff7ba53868e82291934a69a14cc67b3f1cd8625b87013199e128533ffc",
                   "version": 1,
-                  "chain": "Base",
+                  "chain": "base",
                   "subject": "0x0000000000000000000000000000000000000001",
                   "verdict": "NoMatch",
                   "issuer": null,
                   "ticker": null,
                   "pool": {
-                    "chain": "Base",
+                    "chain": "base",
                     "pool": "0x0000000000000000000000000000000000000001",
                     "dex": "uniswap-v2",
                     "base": {
@@ -766,16 +910,18 @@ mod openapi {
     },
     "/verify": {
       "post": {
-        "summary": "Verify a signed attestation, statement, or Guard",
+        "summary": "Verify a signed attestation, statement, Guard, or stats snapshot",
         "requestBody": {
           "required": true,
+          "description": "Attestation, statement, and Guard request bodies must be under 2 MiB; signed stats payloads may be up to 16 MiB before their JSON envelope.",
           "content": {
             "application/json": {
               "schema": {
                 "oneOf": [
                   { "$ref": "#/components/schemas/Attestation" },
                   { "$ref": "#/components/schemas/Statement" },
-                  { "$ref": "#/components/schemas/GuardDocument" }
+                  { "$ref": "#/components/schemas/GuardDocument" },
+                  { "$ref": "#/components/schemas/StatsDocument" }
                 ]
               },
               "examples": {
@@ -784,13 +930,13 @@ mod openapi {
                   "value": {
                     "id": "0e9596ff7ba53868e82291934a69a14cc67b3f1cd8625b87013199e128533ffc",
                     "version": 1,
-                    "chain": "Base",
+                    "chain": "base",
                     "subject": "0x0000000000000000000000000000000000000001",
                     "verdict": "NoMatch",
                     "issuer": null,
                     "ticker": null,
                     "pool": {
-                      "chain": "Base",
+                      "chain": "base",
                       "pool": "0x0000000000000000000000000000000000000001",
                       "dex": "uniswap-v2",
                       "base": {
@@ -826,12 +972,12 @@ mod openapi {
                     "kind": "statement",
                     "version": 1,
                     "wallets": [
-                      { "chain": "Base", "address": "0x0000000000000000000000000000000000000001" }
+                    { "chain": "base", "address": "0x0000000000000000000000000000000000000001" }
                     ],
                     "assets": [
                       {
                         "wallet": "0x0000000000000000000000000000000000000001",
-                        "chain": "Base",
+                        "chain": "base",
                         "contract": "0x0000000000000000000000000000000000000002",
                         "ticker": "NVDA",
                         "issuer": "Backed xStocks",
@@ -853,7 +999,7 @@ mod openapi {
                     ],
                     "positions": [
                       {
-                        "chain": "Base",
+                        "chain": "base",
                         "wallet": "0x0000000000000000000000000000000000000001",
                         "block": 23000000,
                         "min_slot": null,
@@ -874,7 +1020,7 @@ mod openapi {
                   "value": {
                     "id": "0000000000000000000000000000000000000000000000000000000000000000",
                     "kind": "guard",
-                    "chain": "Base",
+                    "chain": "base",
                     "address": "0x0000000000000000000000000000000000000001",
                     "wallet": null,
                     "identity": {
@@ -892,6 +1038,42 @@ mod openapi {
                     "observed_at": "2026-10-05T12:00:00Z",
                     "reads": [],
                     "reads_truncated": false,
+                    "public_key": "base58-ed25519-public-key",
+                    "signature": "base64-signature",
+                    "dev": false
+                  }
+                },
+                "stats": {
+                  "summary": "Signed statistics snapshot (schematic signature placeholder)",
+                  "value": {
+                    "id": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "kind": "stats",
+                    "stats": {
+                      "generated_at": "2026-10-06T12:00:00Z",
+                      "headline": "QED checked 0 of 0 listed pools: 0 issuer matches, 0 mismatches, 0 unsupported venues, and 0 not read yet. 0 catalog observations are currently flagged (seen in the last 7 days); 0 were first seen this UTC week. 0 tokens on unsupported chains were seen but not judged. 0 supported observations and 0 unsupported candidates were evicted; 0 invalid supported and 0 invalid unsupported candidates were rejected.",
+                      "listed_pools": 0,
+                      "pools_checked": 0,
+                      "issuer_matches": 0,
+                      "mismatches": 0,
+                      "unsupported_venue": 0,
+                      "not_read_yet": { "count": 0, "rpc_limit": 0, "transient": 0, "unsupported": 0 },
+                      "by_chain": [],
+                      "registry": { "active_entries": 0, "by_issuer": [] },
+                      "publisher_catalog_watch": {
+                        "first_flagged_this_week": 0,
+                        "currently_flagged_last_7_days": 0,
+                        "unsupported_chain_candidates_seen": 0,
+                        "official_on_unsupported_chain": 0,
+                        "evicted_entries": 0,
+                        "evicted_unsupported_candidates": 0,
+                        "rejected_oversize_entries": 0,
+                        "rejected_oversize_unsupported_candidates": 0,
+                        "last_scanned_at": "",
+                        "catalog_absent_tokens_truncated": false,
+                        "method": "Reserves two searches for each of the 10 highest-volume tickers and rotates up to 30 remaining searches through the rest; at most 50 searches and 50 sequential Guard evaluations per six-hour refresh. Guard checks prioritize candidate tickers in the same highest-volume registry order, then higher-volume pairs within each ticker."
+                      }
+                    },
+                    "observed_at": "2026-10-06T12:00:00Z",
                     "public_key": "base58-ed25519-public-key",
                     "signature": "base64-signature",
                     "dev": false
@@ -943,6 +1125,18 @@ mod openapi {
                       "environment_match": true,
                       "fresh": null
                     }
+                  },
+                  "stats": {
+                    "summary": "Stats snapshot verification",
+                    "value": {
+                      "ok": true,
+                      "kind": "stats",
+                      "id": "0000000000000000000000000000000000000000000000000000000000000000",
+                      "cryptographic": true,
+                      "trusted_signer": true,
+                      "environment_match": true,
+                      "fresh": null
+                    }
                   }
                 }
               }
@@ -970,6 +1164,7 @@ mod openapi {
             "application/json": {
               "schema": { "$ref": "#/components/schemas/StatementRequest" },
               "example": {
+                "label": "Quarterly holdings report",
                 "wallets": ["0x0000000000000000000000000000000000000001"],
                 "chains": ["base"],
                 "block": 23000000
@@ -988,12 +1183,12 @@ mod openapi {
                   "kind": "statement",
                   "version": 1,
                   "wallets": [
-                    { "chain": "Base", "address": "0x0000000000000000000000000000000000000001" }
+                    { "chain": "base", "address": "0x0000000000000000000000000000000000000001" }
                   ],
                   "assets": [
                     {
                       "wallet": "0x0000000000000000000000000000000000000001",
-                      "chain": "Base",
+                      "chain": "base",
                       "contract": "0x0000000000000000000000000000000000000002",
                       "ticker": "NVDA",
                       "issuer": "Backed xStocks",
@@ -1015,7 +1210,7 @@ mod openapi {
                   ],
                   "positions": [
                     {
-                      "chain": "Base",
+                      "chain": "base",
                       "wallet": "0x0000000000000000000000000000000000000001",
                       "block": 23000000,
                       "min_slot": null,
@@ -1033,9 +1228,22 @@ mod openapi {
               }
             }
           },
-          "400": { "description": "Invalid wallet set or chain selection" },
-          "502": { "description": "Required chain balance read failed" },
-          "504": { "description": "Statement read deadline exceeded" }
+          "400": {
+            "description": "Invalid wallet set or chain selection",
+            "content": { "application/json": { "schema": { "type": "object", "required": ["error"], "properties": { "error": { "type": "string" } } }, "example": { "error": "A wallet address does not match the selected chain. Check the address and chain selection." } } }
+          },
+          "500": {
+            "description": "QED could not sign the statement",
+            "content": { "application/json": { "schema": { "type": "object", "required": ["error"], "properties": { "error": { "type": "string" } } }, "example": { "error": "QED could not sign the statement. No statement was saved." } } }
+          },
+          "502": {
+            "description": "Required chain balance read failed or no reader is configured",
+            "content": { "application/json": { "schema": { "type": "object", "required": ["error"], "properties": { "error": { "type": "string" } } }, "example": { "error": "The Base balance read failed. No statement was created." } } }
+          },
+          "504": {
+            "description": "Statement read deadline exceeded",
+            "content": { "application/json": { "schema": { "type": "object", "required": ["error"], "properties": { "error": { "type": "string" } } }, "example": { "error": "QED's 15-second balance-read deadline elapsed. No statement was created; retry the request." } } }
+          }
         }
       }
     },
@@ -1056,12 +1264,12 @@ mod openapi {
                   "kind": "statement",
                   "version": 1,
                   "wallets": [
-                    { "chain": "Base", "address": "0x0000000000000000000000000000000000000001" }
+                    { "chain": "base", "address": "0x0000000000000000000000000000000000000001" }
                   ],
                   "assets": [
                     {
                       "wallet": "0x0000000000000000000000000000000000000001",
-                      "chain": "Base",
+                      "chain": "base",
                       "contract": "0x0000000000000000000000000000000000000002",
                       "ticker": "NVDA",
                       "issuer": "Backed xStocks",
@@ -1083,7 +1291,7 @@ mod openapi {
                   ],
                   "positions": [
                     {
-                      "chain": "Base",
+                      "chain": "base",
                       "wallet": "0x0000000000000000000000000000000000000001",
                       "block": 23000000,
                       "min_slot": null,
@@ -1122,6 +1330,75 @@ mod openapi {
             }
           },
           "404": { "description": "Statement is not available in this process cache" }
+        }
+      }
+    },
+    "/statements/{id}/download.csv": {
+      "get": {
+        "summary": "Download a signed statement as CSV",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[0-9a-f]{64}$" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "CSV rows for the signed statement",
+            "content": {
+              "text/csv": {
+                "schema": { "type": "string" },
+                "example": "\"record_type\",\"statement_id\",\"label\",\"observed_at\",\"signer\",\"signature\",\"dev\",\"wallet\",\"chain\",\"block\",\"min_slot\",\"max_slot\",\"slot\",\"ticker\",\"issuer\",\"contract\",\"balance\",\"decimals\",\"issuer_match\"\r\n"
+              }
+            }
+          },
+          "404": { "description": "Statement is not available in this process cache" }
+        }
+      }
+    },
+    "/statements/{id}/verify": {
+      "get": {
+        "summary": "Verify a signed statement",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[0-9a-f]{64}$" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Human-readable signature, signer, and environment verification",
+            "content": { "text/html": { "schema": { "type": "string" } } }
+          },
+          "404": { "description": "Statement is not available in this process cache" }
+        }
+      }
+    },
+    "/statements/{id}/recheck": {
+      "post": {
+        "summary": "Re-run a signed statement",
+        "description": "Repeats the statement's wallet and chain selection and redirects to a new signed statement with a comparison to this record.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[0-9a-f]{64}$" } }
+        ],
+        "responses": {
+          "303": {
+            "description": "Redirect to the new statement page with a comparison",
+            "headers": {
+              "Location": { "schema": { "type": "string" }, "description": "New statement page with compare={id}." }
+            }
+          },
+          "404": { "description": "Statement is not available in this process cache" },
+          "502": { "description": "Required chain balance read failed" }
+        }
+      }
+    },
+    "/v/{id}/verify": {
+      "get": {
+        "summary": "Verify a certificate",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Human-readable certificate signature, signer, environment, and freshness verification",
+            "content": { "text/html": { "schema": { "type": "string" } } }
+          },
+          "404": { "description": "Certificate is not available in this process cache" }
         }
       }
     },
@@ -1171,7 +1448,7 @@ mod openapi {
                           "issuer": "Backed xStocks",
                           "ticker": "NVDA",
                           "name": "NVIDIA",
-                          "chain": "Bnb",
+                          "chain": "bnb",
                           "contract": "0xc845b2894dBddd03858fd2D643B4eF725fE0849d",
                           "decimals": null,
                           "source": "xstocks-api",
@@ -1182,7 +1459,7 @@ mod openapi {
                           "issuer": "Backed xStocks",
                           "ticker": "NVDA",
                           "name": "NVIDIA",
-                          "chain": "Ethereum",
+                          "chain": "ethereum",
                           "contract": "0xc845b2894dBddd03858fd2D643B4eF725fE0849d",
                           "decimals": null,
                           "source": "xstocks-api",
@@ -1193,7 +1470,7 @@ mod openapi {
                           "issuer": "Backed xStocks",
                           "ticker": "NVDA",
                           "name": "NVIDIA",
-                          "chain": "Solana",
+                          "chain": "solana",
                           "contract": "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh",
                           "decimals": null,
                           "source": "xstocks-api",
@@ -1204,7 +1481,7 @@ mod openapi {
                           "issuer": "Robinhood",
                           "ticker": "NVDA",
                           "name": "NVIDIA",
-                          "chain": "RobinhoodChain",
+                          "chain": "robinhood",
                           "contract": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
                           "decimals": 18,
                           "source": "robinhood-registry",
@@ -1287,47 +1564,11 @@ mod openapi {
                 "example": {
                   "name": "QED",
                   "description": "QED is read-only by design: it never holds keys, submits transactions, or recommends. It checks issuer publications and signs Guard reviews. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.",
-                  "serverInfo": { "name": "QED", "version": "0.1.0" },
+                  "serverInfo": { "name": "QED", "version": "1.0.0" },
                   "remotes": [
                     { "type": "streamable-http", "url": "https://qed.web3-energy.com/mcp" }
                   ],
-                  "tools": [
-                    {
-                      "name": "qed_check",
-                      "title": "Check issuer contract match",
-                      "description": "Check whether a pool or token address matches an issuer's published stock-token contract. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement."
-                    },
-                    {
-                      "name": "qed_guard",
-                      "title": "Review a token or pool",
-                      "description": "Create a signed read-only review of issuer identity, token powers, source status, and known pool facts. QED never holds keys, submits transactions, or recommends. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement."
-                    },
-                    {
-                      "name": "qed_powers",
-                      "title": "Read token powers",
-                      "description": "Read supported token authority settings and source-verification status for an active issuer registry contract. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement."
-                    },
-                    {
-                      "name": "qed_wallet",
-                      "title": "Read wallet holdings",
-                      "description": "Read stock-token holdings for a wallet address. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement."
-                    },
-                    {
-                      "name": "qed_registry_lookup",
-                      "title": "Look up issuer contracts",
-                      "description": "Look up active issuer registry contracts for a ticker. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement."
-                    },
-                    {
-                      "name": "qed_verify",
-                      "title": "Verify QED document",
-                      "description": "Verify an attestation, signed wallet statement, or Guard document, including signature, trusted signer, environment and freshness where applicable. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement."
-                    },
-                    {
-                      "name": "qed_statement",
-                      "title": "Create a signed wallet statement",
-                      "description": "Sign registry-token balances observed for a selected wallet set and chain set. Balances are on-chain facts at a height, not ownership, solvency or reserves. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement."
-                    }
-                  ],
+                  "tools": [],
                   "website": "https://qed.web3-energy.com",
                   "repository": "https://github.com/boev/qed",
                   "readOnly": true,
@@ -1342,6 +1583,302 @@ mod openapi {
   },
   "components": {
     "schemas": {
+      "MarketDataSource": {
+        "type": "string",
+        "enum": ["dexscreener", "geckoterminal"],
+        "description": "Provider that reported the market-data values; these are not independently validated."
+      },
+      "PricePoint": {
+        "type": "object",
+        "required": ["chain", "pool", "price_usd", "change_24h_pct", "volume_24h_usd", "liquidity_usd", "source"],
+        "properties": {
+          "chain": { "type": "string" },
+          "pool": { "type": "string" },
+          "price_usd": { "type": ["number", "null"] },
+          "change_24h_pct": { "type": ["number", "null"] },
+          "volume_24h_usd": { "type": ["number", "null"] },
+          "liquidity_usd": { "type": ["number", "null"] },
+          "source": { "$ref": "#/components/schemas/MarketDataSource" }
+        }
+      },
+      "PriceSnapshot": {
+        "type": "object",
+        "required": ["updated_at", "prices"],
+        "properties": {
+          "updated_at": { "type": "string", "format": "date-time" },
+          "prices": { "type": "array", "items": { "$ref": "#/components/schemas/PricePoint" } }
+        }
+      },
+      "ReadStatusCounts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["count", "rpc_limit", "transient", "unsupported"],
+        "properties": {
+          "count": { "type": "integer", "minimum": 0 },
+          "rpc_limit": { "type": "integer", "minimum": 0 },
+          "transient": { "type": "integer", "minimum": 0 },
+          "unsupported": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "LeaderboardCounts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pools_checked", "issuer_matches", "mismatches", "unsupported_venue", "not_read_yet"],
+        "properties": {
+          "pools_checked": { "type": "integer", "minimum": 0 },
+          "issuer_matches": { "type": "integer", "minimum": 0 },
+          "mismatches": { "type": "integer", "minimum": 0 },
+          "unsupported_venue": { "type": "integer", "minimum": 0, "description": "Leaderboard pool whose venue QED does not support; not counted as checked or unread." },
+          "not_read_yet": { "$ref": "#/components/schemas/ReadStatusCounts" }
+        }
+      },
+      "ChainLeaderboardCounts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["chain", "chain_label", "counts"],
+        "properties": {
+          "chain": { "type": "string" },
+          "chain_label": { "type": "string" },
+          "counts": { "$ref": "#/components/schemas/LeaderboardCounts" }
+        }
+      },
+      "IssuerRegistrySize": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["issuer", "entries", "chains"],
+        "properties": {
+          "issuer": { "type": "string" },
+          "entries": { "type": "integer", "minimum": 0 },
+          "chains": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "RegistrySizes": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["active_entries", "by_issuer"],
+        "properties": {
+          "active_entries": { "type": "integer", "minimum": 0 },
+          "by_issuer": { "type": "array", "items": { "$ref": "#/components/schemas/IssuerRegistrySize" } }
+        }
+      },
+      "CatalogAbsentToken": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["chain", "chain_label", "ticker", "publisher", "source", "symbol", "name", "address", "first_seen_at", "last_seen_at", "volume_24h_usd", "guard_url", "reason", "reads", "evidence_truncated"],
+        "properties": {
+          "chain": { "type": "string", "maxLength": 32 },
+          "chain_label": { "type": "string", "maxLength": 64 },
+          "ticker": { "type": "string", "maxLength": 64 },
+          "publisher": { "type": "string", "maxLength": 64 },
+          "source": { "$ref": "#/components/schemas/MarketDataSource" },
+          "symbol": { "type": "string", "maxLength": 64, "description": "Reported by the source named in source." },
+          "name": { "type": "string", "maxLength": 64, "description": "Reported by the source named in source." },
+          "address": { "type": "string", "maxLength": 128 },
+          "first_seen_at": { "type": "string", "format": "date-time", "maxLength": 64 },
+          "last_seen_at": { "type": "string", "format": "date-time", "maxLength": 64 },
+          "volume_24h_usd": { "type": ["number", "null"], "minimum": 0, "description": "Reported by the source named in source; not independently validated." },
+          "guard_url": { "type": "string", "maxLength": 200 },
+          "reason": { "type": "string", "maxLength": 256 },
+          "reads": { "type": "array", "maxItems": 4, "items": { "$ref": "#/components/schemas/ObservedRead" }, "description": "Identity-determining token symbol/name reads at the queried address (or Solana metadata reads tied to that mint). Each retained params and raw_result value is bounded to 512 serialized bytes. Other Guard reads are available from guard_url and are not duplicated here." },
+          "publisher_catalog_snapshot_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 hash of the publisher registry/catalog source snapshot used for this observation; absent on legacy restored observations." },
+          "evidence_truncated": { "type": "boolean", "description": "True when unrelated reads were omitted, a retained read was bounded, the original Guard read log was truncated, supported observation text was clipped, or no publisher catalog snapshot hash was available." },
+          "on_chain_symbol": { "type": ["string", "null"], "maxLength": 64, "description": "Symbol read from the candidate contract on chain, distinct from listing metadata." },
+          "on_chain_name": { "type": ["string", "null"], "maxLength": 64, "description": "Name read from the candidate contract on chain, distinct from listing metadata." }
+        }
+      },
+      "UnsupportedCatalogCandidate": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["dex_chain_id", "ticker", "publisher", "source", "symbol", "name", "address", "first_seen_at", "last_seen_at", "volume_24h_usd", "evidence_truncated"],
+        "properties": {
+          "dex_chain_id": { "type": "string", "maxLength": 32 },
+          "ticker": { "type": "string", "maxLength": 64 },
+          "publisher": { "type": "string", "maxLength": 64 },
+          "source": { "$ref": "#/components/schemas/MarketDataSource" },
+          "symbol": { "type": "string", "maxLength": 64, "description": "Reported by the source named in source." },
+          "name": { "type": "string", "maxLength": 64, "description": "Reported by the source named in source." },
+          "address": { "type": "string", "maxLength": 128 },
+          "first_seen_at": { "type": "string", "format": "date-time", "maxLength": 64 },
+          "last_seen_at": { "type": "string", "format": "date-time", "maxLength": 64 },
+          "volume_24h_usd": { "type": ["number", "null"], "minimum": 0 },
+          "evidence_truncated": { "type": "boolean", "description": "True when overlong candidate text or timestamps were clipped to their storage caps." }
+        }
+      },
+      "ImpostorSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["scanned_at", "next_ticker_offset", "next_entry_offset", "unsupported_seen", "official_on_unsupported_chain", "evicted_entries", "evicted_unsupported_candidates", "rejected_oversize_entries", "rejected_oversize_unsupported_candidates", "entries", "unsupported_candidates"],
+        "properties": {
+          "scanned_at": { "type": "string", "maxLength": 64 },
+          "source_unavailable_since": { "type": "string", "maxLength": 64, "description": "RFC 3339 start of the current search-source outage, when every search failed or returned no pairs; absent after a successful scan. Retained observations and scanned_at stay from the last successful scan." },
+          "next_ticker_offset": { "type": "integer", "minimum": 0 },
+          "next_entry_offset": { "type": "integer", "minimum": 0 },
+          "unsupported_seen": { "type": "integer", "minimum": 0 },
+          "official_on_unsupported_chain": { "type": "integer", "minimum": 0, "description": "Official deployments on unsupported networks matched by listed address or wrapper; counted separately from impostor candidates." },
+          "evicted_entries": { "type": "integer", "minimum": 0 },
+          "evicted_unsupported_candidates": { "type": "integer", "minimum": 0 },
+          "rejected_oversize_entries": { "type": "integer", "minimum": 0 },
+          "rejected_oversize_unsupported_candidates": { "type": "integer", "minimum": 0 },
+          "entries": { "type": "array", "maxItems": 128, "items": { "$ref": "#/components/schemas/CatalogAbsentToken" } },
+          "unsupported_candidates": { "type": "array", "maxItems": 256, "items": { "$ref": "#/components/schemas/UnsupportedCatalogCandidate" } }
+        }
+      },
+      "StatsInputHashes": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["registry_source", "leaderboard", "impostor_watch"],
+        "properties": {
+          "registry_source": { "type": "string", "description": "Registry publisher-source hash at snapshot time." },
+          "leaderboard": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "impostor_watch": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      },
+      "StatsReducerInputs": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["leaderboard", "impostor_watch", "active_registry", "hashes"],
+        "properties": {
+          "leaderboard": { "type": "array", "maxItems": 300, "items": { "$ref": "#/components/schemas/LeaderboardEntry" } },
+          "impostor_watch": { "$ref": "#/components/schemas/ImpostorSnapshot" },
+          "active_registry": { "type": "array", "items": { "$ref": "#/components/schemas/RegistryEntry" } },
+          "hashes": { "$ref": "#/components/schemas/StatsInputHashes" }
+        }
+      },
+      "LeaderboardEntry": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rank", "chain", "chain_label", "dex", "pool", "source", "base_symbol", "quote_symbol", "issuer", "ticker", "issuer_on_base", "verdict", "read_status", "read_reason", "price_usd", "change_24h_pct", "volume_24h_usd", "liquidity_usd", "txns_24h", "detail_url", "trade_url", "explorer_url", "attestation_id", "checked_at"],
+        "properties": {
+          "rank": { "type": "integer", "minimum": 1 },
+          "chain": { "type": "string", "maxLength": 32 },
+          "chain_label": { "type": "string", "maxLength": 64 },
+          "dex": { "type": "string", "maxLength": 64 },
+          "pool": { "type": "string", "maxLength": 128 },
+          "source": { "$ref": "#/components/schemas/MarketDataSource" },
+          "base_symbol": { "type": "string", "maxLength": 64 },
+          "quote_symbol": { "type": "string", "maxLength": 64 },
+          "issuer": { "type": ["string", "null"], "maxLength": 64 },
+          "ticker": { "type": ["string", "null"], "maxLength": 64 },
+          "issuer_on_base": { "type": ["boolean", "null"], "description": "True when the base-side token is the contract matched to the issuer registry." },
+          "verdict": { "type": "string" },
+          "read_status": { "type": "string", "enum": ["checked", "not_read_yet", "unsupported_venue"], "description": "unsupported_venue indicates QED intentionally skipped an unsupported DEX venue." },
+          "read_reason": { "type": ["string", "null"], "enum": ["rpc_limit", "transient", "unsupported", "unsupported_venue", null] },
+          "price_usd": { "type": ["number", "null"] },
+          "change_24h_pct": { "type": ["number", "null"] },
+          "volume_24h_usd": { "type": ["number", "null"] },
+          "liquidity_usd": { "type": ["number", "null"] },
+          "txns_24h": { "type": ["integer", "null"] },
+          "detail_url": { "type": "string", "maxLength": 200 },
+          "trade_url": { "type": "string", "maxLength": 200 },
+          "explorer_url": { "type": "string", "maxLength": 200 },
+          "attestation_id": { "type": ["string", "null"] },
+          "checked_at": { "type": ["string", "null"] }
+        }
+      },
+      "OfficialDeployment": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["network", "address"],
+        "properties": {
+          "network": { "type": "string" },
+          "address": { "type": "string" },
+          "wrapper_address": { "type": "string" },
+          "wrapper_address_v2": { "type": "string" }
+        }
+      },
+      "RegistryEntry": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["issuer", "ticker", "name", "chain", "contract", "decimals", "source", "source_url", "last_checked"],
+        "properties": {
+          "issuer": { "type": "string" },
+          "ticker": { "type": "string" },
+          "name": { "type": "string" },
+          "chain": { "type": "string" },
+          "contract": { "type": "string" },
+          "decimals": { "type": ["integer", "null"], "minimum": 0, "maximum": 255 },
+          "source": { "type": "string" },
+          "source_url": { "type": "string" },
+          "last_checked": { "type": "string", "format": "date-time" },
+          "removed_at": { "type": "string", "format": "date-time" },
+          "stale_since": { "type": "string", "format": "date-time" },
+          "official_deployments": { "type": "array", "items": { "$ref": "#/components/schemas/OfficialDeployment" } }
+        }
+      },
+      "StatsApiPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["stats", "page", "page_size", "pages", "leaderboard_total", "impostor_candidates_total", "unsupported_candidates_total", "active_registry_total", "hashes", "leaderboard", "impostor_candidates", "unsupported_candidates", "active_registry"],
+        "properties": {
+          "stats": { "$ref": "#/components/schemas/LeaderboardStats" },
+          "page": { "type": "integer", "minimum": 1 },
+          "page_size": { "type": "integer", "const": 50 },
+          "pages": { "type": "integer", "minimum": 1 },
+          "leaderboard_total": { "type": "integer", "minimum": 0 },
+          "impostor_candidates_total": { "type": "integer", "minimum": 0 },
+          "unsupported_candidates_total": { "type": "integer", "minimum": 0 },
+          "active_registry_total": { "type": "integer", "minimum": 0 },
+          "hashes": { "$ref": "#/components/schemas/StatsInputHashes" },
+          "leaderboard": { "type": "array", "items": { "$ref": "#/components/schemas/LeaderboardEntry" } },
+          "impostor_candidates": { "type": "array", "items": { "$ref": "#/components/schemas/CatalogAbsentToken" } },
+          "unsupported_candidates": { "type": "array", "items": { "$ref": "#/components/schemas/UnsupportedCatalogCandidate" } },
+          "active_registry": { "type": "array", "items": { "$ref": "#/components/schemas/RegistryEntry" } }
+        }
+      },
+      
+      "PublisherCatalogWatch": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["first_flagged_this_week", "currently_flagged_last_7_days", "unsupported_chain_candidates_seen", "official_on_unsupported_chain", "evicted_entries", "evicted_unsupported_candidates", "rejected_oversize_entries", "rejected_oversize_unsupported_candidates", "last_scanned_at", "method", "catalog_absent_tokens_truncated"],
+        "properties": {
+          "first_flagged_this_week": { "type": "integer", "minimum": 0, "description": "Retained catalog observations first seen in the current UTC week." },
+          "currently_flagged_last_7_days": { "type": "integer", "minimum": 0, "description": "Retained supported-chain catalog observations last seen within the previous seven days." },
+          "unsupported_chain_candidates_seen": { "type": "integer", "minimum": 0 },
+          "official_on_unsupported_chain": { "type": "integer", "minimum": 0, "description": "Unique official deployments observed on unsupported networks; separate from unsupported candidate counts and not part of the headline." },
+          "evicted_entries": { "type": "integer", "minimum": 0, "description": "Supported observations evicted because retained history exceeded its bound." },
+          "evicted_unsupported_candidates": { "type": "integer", "minimum": 0, "description": "Unsupported-chain observations evicted because retained history exceeded its bound." },
+          "rejected_oversize_entries": { "type": "integer", "minimum": 0, "description": "Supported observations rejected for an invalid chain, token address, or publisher catalog hash; overlong text and read evidence are clipped, retained, and marked with evidence_truncated." },
+          "rejected_oversize_unsupported_candidates": { "type": "integer", "minimum": 0, "description": "Unsupported-chain candidates rejected for an invalid chain id or token address; overlong text is clipped, retained, and marked with evidence_truncated." },
+          "last_scanned_at": { "type": "string", "description": "RFC 3339 time of the last successful scan, or empty before the first one." },
+          "source_unavailable_since": { "type": "string", "description": "RFC 3339 start of the current search-source outage; absent after a successful scan. Counts then come from the last successful scan." },
+          "method": { "type": "string" },
+          "catalog_absent_tokens_truncated": { "type": "boolean", "description": "True when more than 20 retained observations were seen within the last seven days and the HTML table is truncated." }
+        }
+      },
+      "LeaderboardStats": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["generated_at", "headline", "listed_pools", "pools_checked", "issuer_matches", "mismatches", "unsupported_venue", "not_read_yet", "by_chain", "registry", "publisher_catalog_watch"],
+        "properties": {
+          "generated_at": { "type": "string", "format": "date-time" },
+          "headline": { "type": "string" },
+          "listed_pools": { "type": "integer", "minimum": 0 },
+          "pools_checked": { "type": "integer", "minimum": 0 },
+          "issuer_matches": { "type": "integer", "minimum": 0 },
+          "mismatches": { "type": "integer", "minimum": 0 },
+          "unsupported_venue": { "type": "integer", "minimum": 0, "description": "Pool reads omitted because QED does not support the venue." },
+          "not_read_yet": { "$ref": "#/components/schemas/ReadStatusCounts" },
+          "by_chain": { "type": "array", "items": { "$ref": "#/components/schemas/ChainLeaderboardCounts" } },
+          "registry": { "$ref": "#/components/schemas/RegistrySizes" },
+          "publisher_catalog_watch": { "$ref": "#/components/schemas/PublisherCatalogWatch" }
+        }
+      },
+      "StatsDocument": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Strict Ed25519-signed point-in-time statistics snapshot accepted by POST /verify.",
+        "required": ["id", "kind", "stats", "reducer_inputs", "observed_at", "public_key", "signature", "dev"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the canonical signed payload." },
+          "kind": { "type": "string", "const": "stats" },
+          "stats": { "$ref": "#/components/schemas/LeaderboardStats" },
+          "reducer_inputs": { "$ref": "#/components/schemas/StatsReducerInputs" },
+          "observed_at": { "type": "string", "format": "date-time" },
+          "public_key": { "type": "string", "maxLength": 44, "description": "Base58 Ed25519 public key." },
+          "signature": { "type": "string", "contentEncoding": "base64" },
+          "dev": { "type": "boolean" }
+        }
+      },
       "JsonRpcRequest": {
         "type": "object",
         "example": {
@@ -1392,7 +1929,7 @@ mod openapi {
                   "issuer": "Backed xStocks",
                   "ticker": "NVDA",
                   "name": "NVIDIA",
-                  "chain": "Bnb",
+                  "chain": "bnb",
                   "contract": "0xc845b2894dBddd03858fd2D643B4eF725fE0849d",
                   "decimals": null,
                   "source": "xstocks-api",
@@ -1403,7 +1940,7 @@ mod openapi {
                   "issuer": "Backed xStocks",
                   "ticker": "NVDA",
                   "name": "NVIDIA",
-                  "chain": "Ethereum",
+                  "chain": "ethereum",
                   "contract": "0xc845b2894dBddd03858fd2D643B4eF725fE0849d",
                   "decimals": null,
                   "source": "xstocks-api",
@@ -1414,7 +1951,7 @@ mod openapi {
                   "issuer": "Backed xStocks",
                   "ticker": "NVDA",
                   "name": "NVIDIA",
-                  "chain": "Solana",
+                  "chain": "solana",
                   "contract": "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh",
                   "decimals": null,
                   "source": "xstocks-api",
@@ -1425,7 +1962,7 @@ mod openapi {
                   "issuer": "Robinhood",
                   "ticker": "NVDA",
                   "name": "NVIDIA",
-                  "chain": "RobinhoodChain",
+                  "chain": "robinhood",
                   "contract": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
                   "decimals": 18,
                   "source": "robinhood-registry",
@@ -1443,9 +1980,9 @@ mod openapi {
           "id": { "oneOf": [{ "type": "string" }, { "type": "number" }] },
           "result": {
             "type": "object",
-            "description": "MCP CallToolResult; qed_guard structuredContent is a GuardDocument, qed_powers is a PowersRecord for one match or an object with records (PowersRecordSet) for multiple matches, and qed_statement returns a Statement.",
+            "description": "MCP CallToolResult; structuredContent contains the JSON payload for issuer checks, wallet holdings, registry lookups, or document verification.",
             "properties": {
-              "structuredContent": { "description": "Tool-specific structured JSON; see GuardDocument for qed_guard, PowersRecord and PowersRecordSet for qed_powers, and Statement for qed_statement." },
+              "structuredContent": { "description": "Tool-specific structured JSON payload." },
               "content": { "type": "array", "items": { "type": "object" } },
               "isError": { "type": "boolean" }
             }
@@ -1482,7 +2019,7 @@ mod openapi {
         "properties": {
           "code": {
             "type": "string",
-            "enum": ["publisher_contract_match", "publisher_contract_mismatch", "name_resembles_registry_entry", "publisher_metadata_unavailable", "no_publisher", "registry_stale", "registry_removed", "token_paused", "powers_incomplete", "powers_unavailable", "wallet_check_not_applicable", "wallet_check_unavailable", "wallet_frozen", "wallet_blocked", "wallet_sanctioned", "source_unverified", "source_unavailable", "pool_unavailable"]
+            "enum": ["publisher_contract_match", "publisher_contract_mismatch", "claims_unpublished_publisher_product", "name_resembles_registry_entry", "publisher_metadata_unavailable", "no_publisher", "registry_stale", "registry_removed", "token_paused", "powers_incomplete", "powers_unavailable", "wallet_check_not_applicable", "wallet_check_unavailable", "wallet_frozen", "wallet_blocked", "wallet_sanctioned", "source_unverified", "source_unavailable", "pool_unavailable"]
           },
           "detail": { "type": "string" }
         }
@@ -1503,7 +2040,7 @@ mod openapi {
         "type": "object",
         "required": ["chain", "contract", "can_seize", "can_block", "can_change_rules", "unavailable", "source_verified_subject", "source_verified", "observed_at", "block", "slot", "reads"],
         "properties": {
-          "chain": { "type": "string", "enum": ["Solana", "RobinhoodChain", "Base", "Ethereum", "Bnb"] },
+          "chain": { "type": "string", "enum": ["solana", "robinhood", "base", "ethereum", "bnb"] },
           "contract": { "type": "string" },
           "token_paused": { "type": ["boolean", "null"], "description": "Observed token-wide pause; absent when the chain does not expose this fact or the read is unavailable." },
           "sanctions_list": { "type": ["string", "null"], "description": "Configured sanctions-list oracle used for wallet checks." },
@@ -1534,7 +2071,7 @@ mod openapi {
         "properties": {
           "id": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
           "kind": { "type": "string", "const": "guard" },
-          "chain": { "type": "string", "enum": ["Solana", "RobinhoodChain", "Base", "Ethereum", "Bnb"] },
+          "chain": { "type": "string", "enum": ["solana", "robinhood", "base", "ethereum", "bnb"] },
           "address": { "type": "string" },
           "subject_type": { "type": "string", "enum": ["token", "pool"] },
           "subject_address": { "type": ["string", "null"] },
@@ -1562,7 +2099,11 @@ mod openapi {
           "matched_contract": { "type": ["string", "null"] },
           "ticker": { "type": ["string", "null"] },
           "status": { "type": "string", "enum": ["match", "mismatch", "no_publisher", "registry_stale", "registry_removed"] },
-          "candidate": { "oneOf": [{ "$ref": "#/components/schemas/GuardIdentityCandidate" }, { "type": "null" }] }
+          "candidate": { "oneOf": [{ "$ref": "#/components/schemas/GuardIdentityCandidate" }, { "type": "null" }] },
+          "observed_symbol": { "type": ["string", "null"] },
+          "observed_name": { "type": ["string", "null"] },
+          "unpublished_product_detail": { "type": ["string", "null"] },
+          "deployments": { "type": "array", "items": { "$ref": "#/components/schemas/GuardDeployment" } }
         }
       },
       "GuardIdentityCandidate": {
@@ -1617,7 +2158,7 @@ mod openapi {
         "properties": {
           "id": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
           "version": { "type": "integer", "const": 1 },
-          "chain": { "type": "string", "enum": ["Solana", "RobinhoodChain", "Base", "Ethereum", "Bnb"] },
+          "chain": { "type": "string", "enum": ["solana", "robinhood", "base", "ethereum", "bnb"] },
           "subject": { "type": "string" },
           "verdict": { "type": "object" },
           "issuer": { "type": ["string", "null"] },
@@ -1641,18 +2182,19 @@ mod openapi {
         "required": ["ok", "kind", "id", "cryptographic", "trusted_signer", "environment_match", "fresh"],
         "properties": {
           "ok": { "type": "boolean" },
-          "kind": { "type": "string", "enum": ["attestation", "statement", "guard"] },
+          "kind": { "type": "string", "enum": ["attestation", "statement", "guard", "stats"] },
           "id": { "type": "string" },
           "cryptographic": { "type": "boolean" },
           "trusted_signer": { "type": "boolean" },
           "environment_match": { "type": "boolean" },
-          "fresh": { "type": ["boolean", "null"], "description": "Null for statements and Guards, which do not have an attestation expiry check." }
+          "fresh": { "type": ["boolean", "null"], "description": "Null for statements, Guards, and stats snapshots, which do not have attestation expiry checks." }
         }
       },
       "StatementRequest": {
         "type": "object",
         "required": ["wallets", "chains"],
         "properties": {
+          "label": { "type": "string", "description": "Optional human label included in the signed statement." },
           "wallets": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "type": "string" } },
           "chains": { "type": "array", "minItems": 1, "maxItems": 5, "uniqueItems": true, "items": { "type": "string", "enum": ["solana", "robinhood", "base", "ethereum", "bnb"] } },
           "block": { "type": ["integer", "null"], "minimum": 0, "description": "Optional exact EVM block; for Solana this is a minimum context slot." }
@@ -1665,6 +2207,7 @@ mod openapi {
           "id": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the canonical signed payload." },
           "kind": { "type": "string", "const": "statement", "description": "Signed document type." },
           "version": { "type": "integer", "const": 1 },
+          "label": { "type": "string", "description": "Optional human label included in the signed statement." },
           "wallets": { "type": "array", "items": { "$ref": "#/components/schemas/StatementWallet" } },
           "assets": { "type": "array", "items": { "$ref": "#/components/schemas/StatementAsset" } },
           "positions": { "type": "array", "items": { "$ref": "#/components/schemas/StatementPosition" } },
@@ -1681,7 +2224,7 @@ mod openapi {
         "type": "object",
         "required": ["chain", "address"],
         "properties": {
-          "chain": { "type": "string", "enum": ["Solana", "RobinhoodChain", "Base", "Ethereum", "Bnb"] },
+          "chain": { "type": "string", "enum": ["solana", "robinhood", "base", "ethereum", "bnb"] },
           "address": { "type": "string" }
         }
       },
@@ -1689,7 +2232,7 @@ mod openapi {
         "type": "object",
         "required": ["chain", "wallet", "block", "min_slot", "max_slot"],
         "properties": {
-          "chain": { "type": "string", "enum": ["Solana", "RobinhoodChain", "Base", "Ethereum", "Bnb"] },
+          "chain": { "type": "string", "enum": ["solana", "robinhood", "base", "ethereum", "bnb"] },
           "wallet": { "type": "string" },
           "block": { "type": ["integer", "null"], "minimum": 0 },
           "min_slot": { "type": ["integer", "null"], "minimum": 0 },
@@ -1701,7 +2244,7 @@ mod openapi {
         "required": ["wallet", "chain", "contract", "ticker", "issuer", "issuer_match", "balance", "decimals", "slot", "powers_summary"],
         "properties": {
           "wallet": { "type": "string" },
-          "chain": { "type": "string", "enum": ["Solana", "RobinhoodChain", "Base", "Ethereum", "Bnb"] },
+          "chain": { "type": "string", "enum": ["solana", "robinhood", "base", "ethereum", "bnb"] },
           "contract": { "type": "string" },
           "ticker": { "type": "string" },
           "issuer": { "type": "string" },
@@ -1789,6 +2332,45 @@ mod openapi {
         card_example["tools"] = json!(tools);
         card_example["description"] = json!(super::super::mcp::SERVER_CARD_DESCRIPTION);
         card_example["readOnlyStatement"] = json!(super::super::mcp::READ_ONLY_STATEMENT);
+        document["components"]["schemas"]["ApiError"] = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["error", "detail"],
+            "properties": {
+                "error": { "type": "string", "description": "Short error summary." },
+                "detail": { "type": "string", "description": "Readable explanation of the invalid request." }
+            }
+        });
+        for (path, method) in [
+            ("/api/leaderboard", "get"),
+            ("/api/stats", "get"),
+            ("/api/prices", "get"),
+            ("/api/check/{address}", "get"),
+            ("/api/guard", "post"),
+            ("/api/guard/{address}", "get"),
+            ("/api/powers/{address}", "get"),
+            ("/api/wallet", "post"),
+            ("/api/statement", "post"),
+            ("/verify", "post"),
+        ] {
+            let operation = &mut document["paths"][path][method];
+            let previous = operation["responses"]["400"]["description"]
+                .as_str()
+                .unwrap_or("Invalid request.")
+                .to_owned();
+            operation["responses"]["400"] = json!({
+                "description": previous,
+                "content": {
+                    "application/json": {
+                        "schema": { "$ref": "#/components/schemas/ApiError" },
+                        "example": {
+                            "error": "Bad request",
+                            "detail": "The request is missing or contains invalid fields."
+                        }
+                    }
+                }
+            });
+        }
         document
     });
 
@@ -2394,13 +2976,129 @@ mod openapi {
         use serde_json::Value;
 
         #[test]
-        fn openapi_documents_mcp_powers_and_server_card_contracts() {
+        fn openapi_documents_powers_guard_and_server_card_contracts() {
             let document = parsed_document();
             let paths = &document["paths"];
             let verify_post = &paths["/verify"]["post"];
             let powers_get = &paths["/api/powers/{address}"]["get"];
             let guard_get = &paths["/api/guard/{address}"]["get"];
             let guard_post = &paths["/api/guard"]["post"];
+            let stats_json_get = &paths["/stats.json"]["get"];
+            let stats_csv_get = &paths["/stats.csv"]["get"];
+            let api_error = &document["components"]["schemas"]["ApiError"];
+            assert_eq!(api_error["required"], serde_json::json!(["error", "detail"]));
+            for (path, method) in [
+                ("/api/leaderboard", "get"),
+                ("/api/stats", "get"),
+                ("/api/prices", "get"),
+                ("/api/check/{address}", "get"),
+                ("/api/guard", "post"),
+                ("/api/guard/{address}", "get"),
+                ("/api/powers/{address}", "get"),
+                ("/api/wallet", "post"),
+                ("/api/statement", "post"),
+                ("/verify", "post"),
+            ] {
+                assert_eq!(
+                    paths[path][method]["responses"]["400"]["content"]["application/json"]["schema"]
+                        ["$ref"],
+                    "#/components/schemas/ApiError"
+                );
+            }
+            assert_eq!(
+                stats_json_get["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/StatsDocument"
+            );
+            assert_eq!(
+                stats_csv_get["responses"]["200"]["content"]["text/csv"]["schema"]["type"],
+                "string"
+            );
+            assert_eq!(
+                paths["/api/stats"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+                    ["$ref"],
+                "#/components/schemas/StatsApiPage"
+            );
+            assert_eq!(
+                document["components"]["schemas"]["MarketDataSource"]["enum"],
+                serde_json::json!(["dexscreener", "geckoterminal"])
+            );
+            for schema in ["LeaderboardEntry", "CatalogAbsentToken", "UnsupportedCatalogCandidate"]
+            {
+                assert_eq!(
+                    document["components"]["schemas"][schema]["properties"]["source"]["$ref"],
+                    "#/components/schemas/MarketDataSource"
+                );
+            }
+            assert_eq!(
+                document["components"]["schemas"]["PricePoint"]["properties"]["source"]["$ref"],
+                "#/components/schemas/MarketDataSource"
+            );
+            assert_eq!(
+                document["components"]["schemas"]["StatsDocument"]["properties"]["kind"]["const"],
+                "stats"
+            );
+            assert!(
+                document["components"]["schemas"]["StatsDocument"]["properties"]["reducer_inputs"]
+                    .is_object()
+            );
+            assert!(
+                document["components"]["schemas"]["StatsReducerInputs"]["properties"]
+                    ["active_registry"]
+                    .is_object()
+            );
+            assert!(
+                document["components"]["schemas"]["LeaderboardStats"]["properties"]
+                    ["publisher_catalog_watch"]
+                    .is_object()
+            );
+            assert!(
+                document["components"]["schemas"]["PublisherCatalogWatch"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("catalog_absent_tokens_truncated"))
+            );
+            assert!(
+                document["components"]["schemas"]["PublisherCatalogWatch"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("currently_flagged_last_7_days"))
+            );
+            assert!(
+                document["components"]["schemas"]["PublisherCatalogWatch"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("official_on_unsupported_chain"))
+            );
+            assert_eq!(
+                document["components"]["schemas"]["PublisherCatalogWatch"]["properties"]["currently_flagged_last_7_days"]
+                    ["type"],
+                "integer"
+            );
+            assert_eq!(
+                document["components"]["schemas"]["PublisherCatalogWatch"]["properties"]["official_on_unsupported_chain"]
+                    ["type"],
+                "integer"
+            );
+            assert_eq!(
+                document["components"]["schemas"]["PublisherCatalogWatch"]["properties"]["catalog_absent_tokens_truncated"]
+                    ["type"],
+                "boolean"
+            );
+            assert!(
+                document["components"]["schemas"]["PublisherCatalogWatch"]["properties"]
+                    .get("catalog_absent_tokens")
+                    .is_none(),
+                "catalog rows are delivered only as signed reducer inputs"
+            );
+            assert_eq!(
+                document["components"]["schemas"]["ImpostorSnapshot"]["properties"]["entries"]["maxItems"],
+                128
+            );
+            assert_eq!(
+                document["components"]["schemas"]["ImpostorSnapshot"]["properties"]["unsupported_candidates"]
+                    ["maxItems"],
+                256
+            );
             assert_eq!(
                 guard_post["requestBody"]["content"]["application/json"]["schema"]["required"],
                 serde_json::json!(["address", "chain"])
@@ -2428,6 +3126,12 @@ mod openapi {
                     .as_array()
                     .unwrap()
                     .contains(&serde_json::json!("publisher_metadata_unavailable"))
+            );
+            assert!(
+                document["components"]["schemas"]["GuardReason"]["properties"]["code"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("claims_unpublished_publisher_product"))
             );
             assert_eq!(
                 document["components"]["schemas"]["GuardIdentity"]["properties"]["status"]["enum"],
@@ -2479,17 +3183,8 @@ mod openapi {
             );
             assert!(
                 document["components"]["schemas"]["JsonRpcResultResponse"]["properties"]["result"]
-                    ["description"]
-                    .as_str()
-                    .unwrap()
-                    .contains("PowersRecordSet")
-            );
-            assert!(
-                document["components"]["schemas"]["JsonRpcResultResponse"]["properties"]["result"]
-                    ["description"]
-                    .as_str()
-                    .unwrap()
-                    .contains("GuardDocument")
+                    ["properties"]["structuredContent"]
+                    .is_object()
             );
             assert_eq!(
                 paths["/.well-known/mcp/server-card.json"]["get"]["responses"]["200"]["content"]["application/json"]
@@ -2507,8 +3202,18 @@ mod openapi {
                 super::super::super::mcp::READ_ONLY_STATEMENT
             );
             let tools = card_example["tools"].as_array().expect("MCP card tool list");
-            assert_eq!(tools.len(), 7);
-            assert!(tools.iter().any(|tool| tool["name"] == "qed_guard"));
+            assert_eq!(
+                tools.iter().filter_map(|tool| tool["name"].as_str()).collect::<Vec<_>>(),
+                [
+                    "qed_check",
+                    "qed_powers",
+                    "qed_wallet",
+                    "qed_statement",
+                    "qed_registry_lookup",
+                    "qed_verify",
+                    "qed_guard"
+                ]
+            );
             let declared_tools = super::super::super::mcp::tool_table();
             let declared_tools = declared_tools.as_array().expect("MCP tool definitions");
             assert_eq!(tools.len(), declared_tools.len());
@@ -2527,6 +3232,17 @@ mod openapi {
                 "#/components/schemas/Statement"
             );
             assert!(paths["/statements/{id}"]["get"]["responses"]["200"].is_object());
+            assert!(
+                paths["/statements/{id}/download.csv"]["get"]["responses"]["200"]["content"]
+                    ["text/csv"]
+                    .is_object()
+            );
+            assert!(paths["/statements/{id}/verify"]["get"]["responses"]["200"].is_object());
+            assert_eq!(
+                paths["/statements/{id}/recheck"]["post"]["responses"]["303"]["description"],
+                "Redirect to the new statement page with a comparison"
+            );
+            assert!(paths["/v/{id}/verify"]["get"]["responses"]["200"].is_object());
             assert_eq!(
                 paths["/api/statement/{id}"]["get"]["responses"]["200"]["content"]["application/json"]
                     ["schema"]["$ref"],
@@ -2537,7 +3253,7 @@ mod openapi {
                     .as_array()
                     .unwrap()
                     .len(),
-                3
+                4
             );
             assert_eq!(
                 verify_post["requestBody"]["content"]["application/json"]["schema"]["oneOf"][1]["$ref"],
@@ -2546,6 +3262,10 @@ mod openapi {
             assert_eq!(
                 verify_post["requestBody"]["content"]["application/json"]["schema"]["oneOf"][2]["$ref"],
                 "#/components/schemas/GuardDocument"
+            );
+            assert_eq!(
+                verify_post["requestBody"]["content"]["application/json"]["schema"]["oneOf"][3]["$ref"],
+                "#/components/schemas/StatsDocument"
             );
             assert_eq!(
                 verify_post["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
@@ -2577,8 +3297,25 @@ mod openapi {
                 "string"
             );
             assert_eq!(
+                document["components"]["schemas"]["StatementRequest"]["properties"]["label"]["type"],
+                "string"
+            );
+            assert_eq!(
+                document["components"]["schemas"]["Statement"]["properties"]["label"]["type"],
+                "string"
+            );
+            assert_eq!(
                 document["components"]["schemas"]["StatementRequest"]["required"],
                 serde_json::json!(["wallets", "chains"])
+            );
+            let chain_slugs = serde_json::json!(["solana", "robinhood", "base", "ethereum", "bnb"]);
+            assert_eq!(
+                document["components"]["schemas"]["StatementWallet"]["properties"]["chain"]["enum"],
+                chain_slugs
+            );
+            assert_eq!(
+                document["components"]["schemas"]["GuardDocument"]["properties"]["chain"]["enum"],
+                chain_slugs
             );
             assert_eq!(
                 document["components"]["schemas"]["Statement"]["properties"]["signature"]["contentEncoding"],

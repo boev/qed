@@ -6,7 +6,17 @@
       "underlyingSymbol": "NVDA",
       "deployments": [
         {"address": "So11111111111111111111111111111111111111112", "network": "Solana", "decimals": 8},
-        {"address": "0xAbCd000000000000000000000000000000000001", "network": "Ethereum", "decimals": 18}
+        {"address": "0xAbCd000000000000000000000000000000000001", "network": "Ethereum", "decimals": 18, "wrapperAddress": "0xAbCd000000000000000000000000000000000002", "wrapperAddressV2": "0xAbCd000000000000000000000000000000000003"},
+        {"address": "0x0000000000000000000000000000000000000101", "network": "Arbitrum", "decimals": 18},
+        {"address": "0x0000000000000000000000000000000000000102", "network": "BSC", "decimals": 18, "wrapperAddress": "0x0000000000000000000000000000000000000103"},
+        {"address": "0x0000000000000000000000000000000000000104", "network": "HyperEVM", "decimals": 18},
+        {"address": "0x0000000000000000000000000000000000000105", "network": "Ink", "decimals": 18},
+        {"address": "0x0000000000000000000000000000000000000106", "network": "Mantle", "decimals": 18},
+        {"address": "0x0000000000000000000000000000000000000107", "network": "Monad", "decimals": 18},
+        {"address": "0x0000000000000000000000000000000000000108", "network": "Optimism", "decimals": 18},
+        {"address": "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c", "network": "Ton", "decimals": 9},
+        {"address": "TXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "network": "Tron", "decimals": 6},
+        {"address": "0x0000000000000000000000000000000000000109", "network": "XLayer", "decimals": 18}
       ]
     }
   ]

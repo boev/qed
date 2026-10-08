@@ -1,0 +1,46 @@
+{
+  "data": [
+    {
+      "id": "base_0x0000000000000000000000000000000000000001",
+      "type": "pool",
+      "attributes": {
+        "address": "0x0000000000000000000000000000000000000001",
+        "name": "NVIDIA xStock / USDC",
+        "base_token_price_usd": "132.5",
+        "volume_usd": { "h24": "12345.67" },
+        "reserve_in_usd": "456789.01",
+        "pool_created_at": "2026-01-02T03:04:05Z"
+      },
+      "relationships": {
+        "base_token": { "data": { "id": "base_0x0000000000000000000000000000000000000011", "type": "token" } },
+        "quote_token": { "data": { "id": "base_0x0000000000000000000000000000000000000022", "type": "token" } },
+        "dex": { "data": { "id": "base_uniswap-v3", "type": "dex" } }
+      }
+    }
+  ],
+  "included": [
+    {
+      "id": "base_0x0000000000000000000000000000000000000011",
+      "type": "token",
+      "attributes": {
+        "address": "0x0000000000000000000000000000000000000011",
+        "name": "NVIDIA xStock",
+        "symbol": "NVDAx"
+      }
+    },
+    {
+      "id": "base_0x0000000000000000000000000000000000000022",
+      "type": "token",
+      "attributes": {
+        "address": "0x0000000000000000000000000000000000000022",
+        "name": "USD Coin",
+        "symbol": "USDC"
+      }
+    },
+    {
+      "id": "base_uniswap-v3",
+      "type": "dex",
+      "attributes": { "name": "Uniswap V3", "identifier": "uniswap-v3" }
+    }
+  ]
+}

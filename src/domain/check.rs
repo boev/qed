@@ -16,6 +16,15 @@ pub enum Verdict {
     Unknown { reason: String },
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckReadIssue {
+    UnsupportedVenue,
+    RpcLimit,
+    Transient,
+    Unsupported,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CheckResult {
     pub input: String,
@@ -27,6 +36,8 @@ pub struct CheckResult {
     pub checked_at: String,
     pub attestation_id: Option<String>,
     pub powers: Option<PowersRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_issue: Option<CheckReadIssue>,
 }
 
 pub(crate) fn cache_key(address: &str) -> String {

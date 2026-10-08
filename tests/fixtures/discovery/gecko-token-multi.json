@@ -1,0 +1,20 @@
+{
+  "data": [
+    {
+      "id": "base_0x0000000000000000000000000000000000000011",
+      "type": "token",
+      "attributes": {
+        "address": "0x0000000000000000000000000000000000000011",
+        "name": "NVIDIA xStock",
+        "symbol": "NVDAx"
+      },
+      "relationships": {
+        "top_pools": {
+          "data": [
+            { "id": "base_0x0000000000000000000000000000000000000001", "type": "pool" }
+          ]
+        }
+      }
+    }
+  ]
+}

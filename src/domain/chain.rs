@@ -5,15 +5,19 @@ use std::fmt;
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Chain {
+    #[serde(rename = "solana", alias = "Solana")]
     Solana,
+    #[serde(rename = "robinhood", alias = "RobinhoodChain")]
     RobinhoodChain,
+    #[serde(rename = "base", alias = "Base")]
     Base,
+    #[serde(rename = "ethereum", alias = "Ethereum")]
     Ethereum,
+    #[serde(rename = "bnb", alias = "Bnb")]
     Bnb,
 }
 
 impl Chain {
-    pub const ROBINHOOD_CHAIN_ID: u64 = 4663;
     pub const MAX_SOLANA_ADDRESS_CHARS: usize = 44;
 
     /// Decode a Solana public key without allocating in proportion to untrusted input.
@@ -55,12 +59,26 @@ impl Chain {
         hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
     }
     pub fn parse(value: &str) -> Option<Self> {
+        Self::from_network_name(value)
+    }
+
+    pub fn from_network_name(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().replace(['-', '_', ' '], "").as_str() {
-            "solana" => Some(Self::Solana),
-            "robinhood" | "robinhoodchain" | "rh" => Some(Self::RobinhoodChain),
-            "base" => Some(Self::Base),
-            "ethereum" | "eth" => Some(Self::Ethereum),
-            "bnb" | "bnbchain" | "binance" => Some(Self::Bnb),
+            "solana" | "solana900" | "900" => Some(Self::Solana),
+            "robinhood" | "robinhoodchain" | "rh" | "robinhoodchain4663" | "4663" => {
+                Some(Self::RobinhoodChain)
+            }
+            "base" | "base8453" | "8453" => Some(Self::Base),
+            "ethereum" | "ethereum1" | "mainnet" | "eth" | "eth1" | "1" => Some(Self::Ethereum),
+            "bnb"
+            | "bnbchain"
+            | "binance"
+            | "binancesmartchain"
+            | "binancesmartchain56"
+            | "bsc"
+            | "bsc56"
+            | "bnb56"
+            | "56" => Some(Self::Bnb),
             _ => None,
         }
     }
@@ -86,6 +104,23 @@ mod tests {
     #[test]
     fn detects_solana_public_key() {
         assert_eq!(Chain::detect("11111111111111111111111111111111"), Some(Chain::Solana));
+    }
+
+    #[test]
+    fn serializes_canonical_chain_slugs_and_accepts_legacy_signed_names() {
+        for (chain, slug, legacy_name) in [
+            (Chain::Solana, "solana", "Solana"),
+            (Chain::RobinhoodChain, "robinhood", "RobinhoodChain"),
+            (Chain::Base, "base", "Base"),
+            (Chain::Ethereum, "ethereum", "Ethereum"),
+            (Chain::Bnb, "bnb", "Bnb"),
+        ] {
+            assert_eq!(serde_json::to_value(chain).unwrap(), serde_json::json!(slug));
+            assert_eq!(
+                serde_json::from_str::<Chain>(&format!("\"{legacy_name}\"")).unwrap(),
+                chain
+            );
+        }
     }
 
     #[test]

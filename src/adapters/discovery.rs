@@ -4,7 +4,7 @@ use crate::{
     domain::{
         attestation::Attestation,
         chain::Chain,
-        check::{CheckResult, Verdict},
+        check::{CheckReadIssue, CheckResult, Verdict},
         pool::{IndexedPool, PoolInfo},
         registry::{self, Registry},
     },
@@ -150,11 +150,12 @@ impl DurableBoardStore {
     }
 
     pub async fn load_leaderboard(&self) -> Option<Leaderboard> {
-        self.read(&format!("{DURABLE_BOARD_PREFIX}{LEADERBOARD_CACHE_FILE}")).await.filter(
-            |board: &Leaderboard| {
+        self.read(&format!("{DURABLE_BOARD_PREFIX}{LEADERBOARD_CACHE_FILE}"))
+            .await
+            .map(normalize_leaderboard)
+            .filter(|board| {
                 !board.entries.is_empty() && board.entries.len() <= MAX_LEADERBOARD_CANDIDATES
-            },
-        )
+            })
     }
 
     pub async fn persist_leaderboard(&self, board: &Leaderboard) {
@@ -164,12 +165,12 @@ impl DurableBoardStore {
             return;
         }
         if let Some(previous) = self.load_leaderboard().await
-            && !safe_board_replacement(previous.entries.len(), board.entries.len())
+            && !safe_leaderboard_replacement(&previous.entries, &board.entries)
         {
             warn!(
                 previous = previous.entries.len(),
                 next = board.entries.len(),
-                "refusing to replace durable leaderboard with a much smaller board"
+                "refusing to replace durable leaderboard with an incomplete pool set"
             );
             return;
         }
@@ -208,7 +209,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
@@ -221,6 +222,26 @@ use tracing::{info, warn};
 const DEXSCREENER_API: &str = "https://api.dexscreener.com";
 pub const DEXSCREENER_BATCH_SIZE: usize = 30;
 const REQUEST_INTERVAL: Duration = Duration::from_millis(200);
+const MAX_IMPOSTOR_SEARCHES_PER_REFRESH: usize = 50;
+/// DexScreener search answers single-character queries with HTTP 400, so a one-character
+/// ticker is searched only in its ticker+x product form.
+const MIN_DEXSCREENER_SEARCH_BYTES: usize = 2;
+const MAX_IMPOSTOR_CANDIDATES_PER_REFRESH: usize = 50;
+const MAX_IMPOSTOR_RECHECKS_PER_REFRESH: usize = MAX_IMPOSTOR_CANDIDATES_PER_REFRESH / 2;
+const IMPOSTOR_HOT_TICKERS_PER_REFRESH: usize = 10;
+const MAX_STORED_IMPOSTORS: usize = 128;
+const MAX_STORED_UNSUPPORTED_CANDIDATES: usize = 256;
+pub(crate) const MAX_IMPOSTOR_LABEL_BYTES: usize = 64;
+const MAX_IMPOSTOR_CHAIN_ID_BYTES: usize = 32;
+pub(crate) const MAX_IMPOSTOR_REASON_BYTES: usize = 256;
+const MAX_IMPOSTOR_TIMESTAMP_BYTES: usize = 64;
+const MAX_IMPOSTOR_ADDRESS_BYTES: usize = 128;
+const MAX_IMPOSTOR_READS: usize = 4;
+pub(crate) const MAX_IMPOSTOR_READ_PARAMS_BYTES: usize = 512;
+pub(crate) const MAX_IMPOSTOR_READ_RESULT_BYTES: usize = 512;
+const MAX_IMPOSTOR_READ_METHOD_BYTES: usize = 64;
+const MAX_IMPOSTOR_URL_BYTES: usize = 200;
+const MAX_LEADERBOARD_LABEL_BYTES: usize = 64;
 pub const MIN_LIQUIDITY_USD: f64 = 1_000.0;
 pub const MAX_FEATURED_POOLS: usize = 12;
 pub const MAX_LEADERBOARD_CANDIDATES: usize = 300;
@@ -229,10 +250,43 @@ pub const DISCOVERY_REFRESH_SECS: u64 = 6 * 60 * 60;
 pub const PRICE_REFRESH_SECS: u64 = 5 * 60;
 pub const PRICE_RETRY_SECS: u64 = 60;
 pub const REGISTRY_REFRESH_SECS: u64 = 60 * 60;
-const LEADERBOARD_SOURCE: &str = "DexScreener + on-chain reads";
+const LEADERBOARD_SOURCE: &str = "DexScreener / GeckoTerminal + on-chain reads";
 const DEX_BUDGET_WINDOW: Duration = Duration::from_secs(60);
 const DEX_GLOBAL_REQUESTS_PER_MINUTE: usize = 240;
 const DEX_ENDPOINT_BACKOFF: Duration = Duration::from_secs(120);
+const DEX_CANARY_QUERY: &str = "USDC";
+const DEX_CANARY_TTL: Duration = Duration::from_secs(5 * 60);
+const GECKOTERMINAL_API: &str = "https://api.geckoterminal.com/api/v2";
+const GECKOTERMINAL_CALLS_PER_MINUTE: usize = 10;
+const GECKOTERMINAL_WINDOW: Duration = Duration::from_secs(60);
+const GECKOTERMINAL_BACKOFF: Duration = Duration::from_secs(60);
+const GECKOTERMINAL_TIMEOUT: Duration = Duration::from_secs(10);
+const GECKOTERMINAL_BATCH_SIZE: usize = 30;
+const GECKOTERMINAL_WATCH_NETWORKS: [&str; 7] =
+    ["robinhood", "solana", "eth", "base", "bsc", "arc", "ton"];
+const GECKOTERMINAL_REGISTRY_REQUESTS_PER_REFRESH: usize = 30;
+const GECKOTERMINAL_REGISTRY_POOL_IDS_PER_REFRESH: usize = 300;
+const GECKOTERMINAL_REGISTRY_TOKEN_REQUESTS_PER_CHAIN: usize = 4;
+const GECKOTERMINAL_REGISTRY_POOL_REQUESTS_PER_CHAIN: usize = 2;
+const GECKOTERMINAL_REGISTRY_POOL_IDS_PER_CHAIN: usize = 60;
+const GECKOTERMINAL_WATCH_SEARCHES_PER_REFRESH: usize = 70;
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MarketSource {
+    #[default]
+    Dexscreener,
+    Geckoterminal,
+}
+
+impl MarketSource {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dexscreener => "DexScreener",
+            Self::Geckoterminal => "GeckoTerminal",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DexEndpoint {
@@ -341,6 +395,7 @@ impl Default for RegistrySnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LeaderboardEntry {
     pub rank: usize,
     pub chain: String,
@@ -349,9 +404,17 @@ pub struct LeaderboardEntry {
     pub pool: String,
     pub base_symbol: String,
     pub quote_symbol: String,
+    #[serde(default)]
+    pub source: MarketSource,
     pub issuer: Option<String>,
     pub ticker: Option<String>,
+    #[serde(default)]
+    pub issuer_on_base: Option<bool>,
     pub verdict: String,
+    #[serde(default = "checked_read_status")]
+    pub read_status: String,
+    #[serde(default)]
+    pub read_reason: Option<String>,
     pub price_usd: Option<f64>,
     pub change_24h_pct: Option<f64>,
     pub volume_24h_usd: Option<f64>,
@@ -367,6 +430,88 @@ pub struct LeaderboardEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ImpostorEntry {
+    pub chain: String,
+    pub chain_label: String,
+    pub ticker: String,
+    pub publisher: String,
+    pub symbol: String,
+    pub name: String,
+    pub address: String,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub volume_24h_usd: Option<f64>,
+    #[serde(default)]
+    pub source: MarketSource,
+    pub guard_url: String,
+    pub reason: String,
+    #[serde(default)]
+    pub reads: Vec<crate::domain::attestation::Read>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_chain_symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_chain_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher_catalog_snapshot_hash: Option<String>,
+    #[serde(default)]
+    pub evidence_truncated: bool,
+    // Accepted only to migrate old durable boards; never emitted in stats or public responses.
+    #[serde(default, skip_serializing)]
+    pub guard_document: Option<crate::domain::guard::GuardDocument>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UnsupportedImpostorCandidate {
+    pub dex_chain_id: String,
+    pub ticker: String,
+    pub publisher: String,
+    pub symbol: String,
+    pub name: String,
+    pub address: String,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub volume_24h_usd: Option<f64>,
+    #[serde(default)]
+    pub source: MarketSource,
+    #[serde(default)]
+    pub evidence_truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ImpostorSnapshot {
+    #[serde(default)]
+    pub scanned_at: String,
+    /// Start of the current impostor-search source outage: every search failed or returned
+    /// no pairs. Absent after a successful scan; retained results and `scanned_at` stay from
+    /// the last successful scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_unavailable_since: Option<String>,
+    #[serde(default)]
+    pub next_ticker_offset: usize,
+    #[serde(default)]
+    pub next_entry_offset: usize,
+    #[serde(default)]
+    pub unsupported_seen: usize,
+    #[serde(default)]
+    pub official_on_unsupported_chain: usize,
+    #[serde(default)]
+    pub evicted_entries: usize,
+    #[serde(default)]
+    pub evicted_unsupported_candidates: usize,
+    #[serde(default)]
+    pub rejected_oversize_entries: usize,
+    #[serde(default)]
+    pub rejected_oversize_unsupported_candidates: usize,
+    #[serde(default)]
+    pub entries: Vec<ImpostorEntry>,
+    #[serde(default)]
+    pub unsupported_candidates: Vec<UnsupportedImpostorCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Leaderboard {
     pub updated_at: String,
     pub next_refresh_at: String,
@@ -379,6 +524,8 @@ pub struct Leaderboard {
     pub restored: bool,
     #[serde(default)]
     pub refreshing: bool,
+    #[serde(default)]
+    pub impostors: ImpostorSnapshot,
     #[serde(default)]
     pub empty_successful: bool,
 }
@@ -396,6 +543,7 @@ impl Default for Leaderboard {
             restored: false,
             refreshing: false,
             empty_successful: false,
+            impostors: ImpostorSnapshot::default(),
         }
     }
 }
@@ -408,6 +556,8 @@ pub struct PricePoint {
     pub change_24h_pct: Option<f64>,
     pub volume_24h_usd: Option<f64>,
     pub liquidity_usd: Option<f64>,
+    #[serde(default)]
+    pub source: MarketSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -452,14 +602,13 @@ pub fn restored_discovery_delay(
     (window - age).to_std().ok().map(|delay| delay.min(Duration::from_secs(DISCOVERY_REFRESH_SECS)))
 }
 
-/// A complete restored board needs both persisted views. Run when the first
-/// one reaches its six-hour age so neither view exceeds the verification
-/// interval.
+/// Start the first complete discovery immediately after restoring both boards.
+/// Subsequent refreshes use the regular six-hour interval.
 pub fn first_discovery_delay(
     leaderboard: Option<Duration>,
     featured: Option<Duration>,
 ) -> Option<Duration> {
-    leaderboard.zip(featured).map(|(leaderboard, featured)| leaderboard.min(featured))
+    leaderboard.zip(featured).map(|_| Duration::ZERO)
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FeaturedPool {
@@ -553,8 +702,12 @@ impl PoolIndex for DiscoveryPoolIndex {
             }) else {
                 continue;
             };
-            let trade_url =
-                canonical_market_url(chain, &entry.pool, Some(entry.trade_url.as_str()));
+            let trade_url = canonical_market_url_for_source(
+                chain,
+                &entry.pool,
+                Some(entry.trade_url.as_str()),
+                entry.source,
+            );
             for token in [&attestation.pool.base, &attestation.pool.quote] {
                 pools.push(IndexedPool {
                     chain,
@@ -681,6 +834,24 @@ fn safe_board_replacement(previous: usize, next: usize) -> bool {
     next > 0 && (previous == 0 || (next as u128).saturating_mul(2) >= previous as u128)
 }
 
+fn safe_leaderboard_replacement(previous: &[LeaderboardEntry], next: &[LeaderboardEntry]) -> bool {
+    if !safe_board_replacement(previous.len(), next.len()) {
+        return false;
+    }
+    if !next.iter().any(|entry| entry.source == MarketSource::Geckoterminal) {
+        return true;
+    }
+    previous.iter().all(|old| {
+        next.iter().any(|new| {
+            old.chain.eq_ignore_ascii_case(&new.chain)
+                && match chain_from_dex_id(&old.chain) {
+                    Some(chain) => same_pool_path(chain, &new.pool, &old.pool),
+                    None => new.pool.eq_ignore_ascii_case(&old.pool),
+                }
+        })
+    })
+}
+
 pub fn save_leaderboard(data_dir: &Path, leaderboard: &Leaderboard) {
     let path = data_dir.join(LEADERBOARD_CACHE_FILE);
     if !safe_board_replacement(0, leaderboard.entries.len()) {
@@ -688,12 +859,12 @@ pub fn save_leaderboard(data_dir: &Path, leaderboard: &Leaderboard) {
         return;
     }
     if let Some(previous) = read_board::<Leaderboard>(&path)
-        && !safe_board_replacement(previous.entries.len(), leaderboard.entries.len())
+        && !safe_leaderboard_replacement(&previous.entries, &leaderboard.entries)
     {
         warn!(
             previous = previous.entries.len(),
             next = leaderboard.entries.len(),
-            "refusing to replace persisted leaderboard with a much smaller board"
+            "refusing to replace persisted leaderboard with an incomplete pool set"
         );
         return;
     }
@@ -702,7 +873,151 @@ pub fn save_leaderboard(data_dir: &Path, leaderboard: &Leaderboard) {
 
 pub fn load_leaderboard(data_dir: &Path) -> Option<Leaderboard> {
     read_board::<Leaderboard>(&data_dir.join(LEADERBOARD_CACHE_FILE))
+        .map(normalize_leaderboard)
         .filter(|leaderboard| !leaderboard.entries.is_empty())
+}
+
+fn normalize_impostor_snapshot(mut snapshot: ImpostorSnapshot) -> ImpostorSnapshot {
+    let mut rejected_entries = 0usize;
+    let mut entries = std::mem::take(&mut snapshot.entries);
+    entries.retain_mut(|entry| {
+        let Some(chain) = chain_from_dex_id(&entry.chain) else {
+            rejected_entries = rejected_entries.saturating_add(1);
+            tracing::debug!(
+                rejection = ?InvalidWatchObservation::InvalidChain,
+                "rejected persisted publisher-watch entry"
+            );
+            return false;
+        };
+        let address = entry.address.as_str();
+        if !valid_token_address(chain, address) {
+            rejected_entries = rejected_entries.saturating_add(1);
+            tracing::debug!(
+                rejection = ?InvalidWatchObservation::InvalidAddress,
+                "rejected persisted publisher-watch entry"
+            );
+            return false;
+        }
+        if entry
+            .publisher_catalog_snapshot_hash
+            .as_deref()
+            .is_some_and(|hash| !valid_publisher_catalog_snapshot_hash(hash))
+        {
+            rejected_entries = rejected_entries.saturating_add(1);
+            tracing::debug!(
+                rejection = ?InvalidWatchObservation::InvalidCatalogHash,
+                "rejected persisted publisher-watch entry"
+            );
+            return false;
+        }
+        let guard_url = format!("/guard/{}/{}", chain_slug(chain), address);
+        let legacy_guard = entry.guard_document.take();
+        let matching_legacy_guard = legacy_guard
+            .as_ref()
+            .filter(|guard| guard.chain == chain && guard.address == entry.address);
+        let (reads, evidence_truncated) = compact_watch_reads(
+            entry
+                .reads
+                .iter()
+                .chain(matching_legacy_guard.into_iter().flat_map(|guard| guard.reads.iter())),
+            chain,
+            address,
+        );
+        entry.chain = chain_slug(chain).to_owned();
+        entry.chain_label = chain_label(chain).to_owned();
+        entry.guard_url = guard_url;
+        entry.reads = reads;
+        entry.evidence_truncated |= evidence_truncated
+            || legacy_guard.is_some()
+            || entry.publisher_catalog_snapshot_hash.is_none();
+        if let Some(guard) = matching_legacy_guard {
+            if entry.on_chain_symbol.is_none()
+                && let Some(symbol) = guard.identity.observed_symbol.clone()
+            {
+                entry.on_chain_symbol = Some(symbol);
+            }
+            if entry.on_chain_name.is_none()
+                && let Some(name) = guard.identity.observed_name.clone()
+            {
+                entry.on_chain_name = Some(name);
+            }
+            if entry.reason.is_empty()
+                && let Some(reason) = guard.reasons.first()
+            {
+                entry.reason = reason.detail.clone();
+            }
+        }
+        clip_impostor_entry_text(entry);
+        true
+    });
+    entries.sort_by(|left, right| {
+        right
+            .last_seen_at
+            .cmp(&left.last_seen_at)
+            .then_with(|| left.chain.cmp(&right.chain))
+            .then_with(|| left.address.cmp(&right.address))
+    });
+    let evicted_entries = entries.len().saturating_sub(MAX_STORED_IMPOSTORS);
+    entries.truncate(MAX_STORED_IMPOSTORS);
+    snapshot.evicted_entries = snapshot.evicted_entries.saturating_add(evicted_entries);
+    snapshot.rejected_oversize_entries =
+        snapshot.rejected_oversize_entries.saturating_add(rejected_entries);
+
+    let mut rejected_unsupported = 0usize;
+    snapshot.unsupported_candidates.retain_mut(|candidate| {
+        if let Err(rejection) =
+            validate_unsupported_candidate(&candidate.dex_chain_id, &candidate.address)
+        {
+            rejected_unsupported = rejected_unsupported.saturating_add(1);
+            tracing::debug!(
+                rejection = ?rejection,
+                "rejected persisted unsupported-chain watch candidate"
+            );
+            return false;
+        }
+        clip_unsupported_candidate_text(candidate);
+        true
+    });
+    snapshot.unsupported_candidates.sort_by(|left, right| {
+        right
+            .last_seen_at
+            .cmp(&left.last_seen_at)
+            .then_with(|| left.dex_chain_id.cmp(&right.dex_chain_id))
+            .then_with(|| left.address.cmp(&right.address))
+    });
+    let evicted_unsupported =
+        snapshot.unsupported_candidates.len().saturating_sub(MAX_STORED_UNSUPPORTED_CANDIDATES);
+    snapshot.unsupported_candidates.truncate(MAX_STORED_UNSUPPORTED_CANDIDATES);
+    snapshot.evicted_unsupported_candidates =
+        snapshot.evicted_unsupported_candidates.saturating_add(evicted_unsupported);
+    snapshot.rejected_oversize_unsupported_candidates =
+        snapshot.rejected_oversize_unsupported_candidates.saturating_add(rejected_unsupported);
+    snapshot.unsupported_seen = snapshot.unsupported_candidates.len();
+    if let Some(since) = &mut snapshot.source_unavailable_since {
+        truncate_text_bytes(since, MAX_IMPOSTOR_TIMESTAMP_BYTES);
+    }
+    snapshot.entries = entries;
+    snapshot
+}
+
+pub(crate) fn normalize_leaderboard(mut leaderboard: Leaderboard) -> Leaderboard {
+    for entry in &mut leaderboard.entries {
+        if let Some(chain) = chain_from_dex_id(&entry.chain) {
+            let slug = chain_slug(chain);
+            entry.chain = slug.to_owned();
+            entry.chain_label = chain_label(chain).to_owned();
+            entry.detail_url = format!("/validated/{slug}/{}", entry.pool);
+            entry.trade_url = canonical_market_url_for_source(
+                chain,
+                &entry.pool,
+                Some(&entry.trade_url),
+                entry.source,
+            );
+            entry.explorer_url = explorer_url(chain, &entry.pool);
+        }
+    }
+    leaderboard.impostors = normalize_impostor_snapshot(leaderboard.impostors);
+    leaderboard
 }
 
 pub fn save_featured(data_dir: &Path, featured: &FeaturedSnapshot) {
@@ -792,6 +1107,8 @@ pub struct DexPair {
     pub txns: Option<DexTransactions>,
     #[serde(default)]
     pub liquidity: Option<DexLiquidity>,
+    #[serde(skip)]
+    pub source: MarketSource,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -852,6 +1169,16 @@ pub enum DiscoveryError {
     Http(#[from] reqwest::Error),
     #[error("DexScreener response body failed limits: {0}")]
     Body(String),
+    #[error("GeckoTerminal request failed with status {0}")]
+    GeckoHttpStatus(StatusCode),
+    #[error("GeckoTerminal request failed")]
+    GeckoHttp(reqwest::Error),
+    #[error("GeckoTerminal response body failed limits: {0}")]
+    GeckoBody(String),
+    #[error("could not parse GeckoTerminal response: {0}")]
+    GeckoJson(serde_json::Error),
+    #[error("GeckoTerminal refresh request budget is exhausted")]
+    GeckoRefreshBudgetExhausted,
     #[error("could not read curated pools")]
     Io(#[from] std::io::Error),
     #[error("could not parse DexScreener response: {0}")]
@@ -878,11 +1205,17 @@ pub struct DexPairResponse {
 #[derive(Clone)]
 pub struct DexScreenerClient {
     http: reqwest::Client,
+    base_url: String,
 }
 
 impl DexScreenerClient {
     pub fn new(http: reqwest::Client) -> Self {
-        Self { http }
+        Self { http, base_url: DEXSCREENER_API.to_owned() }
+    }
+
+    #[cfg(test)]
+    fn with_base_url(http: reqwest::Client, base_url: String) -> Self {
+        Self { http, base_url }
     }
 
     /// Query up to thirty token addresses in one request. DexScreener's
@@ -899,7 +1232,7 @@ impl DexScreenerClient {
                 continue;
             }
             let addresses = chunk.join(",");
-            let url = format!("{DEXSCREENER_API}/tokens/v1/{chain_id}/{addresses}");
+            let url = format!("{}/tokens/v1/{chain_id}/{addresses}", self.base_url);
             let mut chunk_pairs: Vec<DexPair> =
                 self.get_json(&url, DexEndpoint::TokenPairs).await?;
             pairs.append(&mut chunk_pairs);
@@ -921,7 +1254,7 @@ impl DexScreenerClient {
                 continue;
             }
             let addresses = chunk.join(",");
-            let url = format!("{DEXSCREENER_API}/latest/dex/pairs/{chain_id}/{addresses}");
+            let url = format!("{}/latest/dex/pairs/{chain_id}/{addresses}", self.base_url);
             let response: DexPairResponse = self.get_json(&url, DexEndpoint::Pairs).await?;
             if let Some(mut chunk_pairs) = response.pairs {
                 pairs.append(&mut chunk_pairs);
@@ -938,15 +1271,21 @@ impl DexScreenerClient {
         pool_address: &str,
     ) -> Result<Option<DexPair>, DiscoveryError> {
         let chain_id = dex_chain_id(chain).ok_or(DiscoveryError::UnsupportedChain(chain))?;
-        let url = format!("{DEXSCREENER_API}/latest/dex/pairs/{chain_id}/{pool_address}");
+        let url = format!("{}/latest/dex/pairs/{chain_id}/{pool_address}", self.base_url);
         let response: DexPairResponse = self.get_json(&url, DexEndpoint::Pairs).await?;
         Ok(response.pair.or_else(|| response.pairs.and_then(|mut pairs| pairs.pop())))
     }
 
-    #[allow(dead_code)]
-    pub async fn search(&self, query: &str) -> Result<serde_json::Value, DiscoveryError> {
-        let url = format!("{DEXSCREENER_API}/latest/dex/search?q={query}");
-        self.get_json(&url, DexEndpoint::Search).await
+    pub async fn search(&self, query: &str) -> Result<Vec<DexPair>, DiscoveryError> {
+        let mut url = reqwest::Url::parse(&format!("{}/latest/dex/search", self.base_url))
+            .expect("DexScreener search endpoint is a valid URL");
+        url.query_pairs_mut().append_pair("q", query);
+        let response: DexPairResponse = self.get_json(url.as_str(), DexEndpoint::Search).await?;
+        let mut pairs = response.pairs.unwrap_or_default();
+        if let Some(pair) = response.pair {
+            pairs.push(pair);
+        }
+        Ok(pairs)
     }
 
     async fn get_json<T: for<'de> Deserialize<'de>>(
@@ -976,6 +1315,594 @@ impl DexScreenerClient {
         }
         let body = net::body(response).await.map_err(DiscoveryError::Body)?;
         Ok(serde_json::from_slice(&body)?)
+    }
+}
+
+#[derive(Debug)]
+struct GeckoBudget {
+    requests: VecDeque<Instant>,
+    backoff_until: Option<Instant>,
+    #[cfg(test)]
+    request_limit: usize,
+    #[cfg(test)]
+    backoff_duration: Duration,
+}
+
+impl Default for GeckoBudget {
+    fn default() -> Self {
+        Self {
+            requests: VecDeque::new(),
+            backoff_until: None,
+            #[cfg(test)]
+            request_limit: GECKOTERMINAL_CALLS_PER_MINUTE,
+            #[cfg(test)]
+            backoff_duration: GECKOTERMINAL_BACKOFF,
+        }
+    }
+}
+
+impl GeckoBudget {
+    fn delay_or_acquire(&mut self, now: Instant) -> Option<Duration> {
+        self.requests.retain(|request| now.duration_since(*request) < GECKOTERMINAL_WINDOW);
+        if let Some(until) = self.backoff_until
+            && until > now
+        {
+            return Some(until.duration_since(now));
+        }
+        self.backoff_until = None;
+        #[cfg(test)]
+        let request_limit = self.request_limit;
+        #[cfg(not(test))]
+        let request_limit = GECKOTERMINAL_CALLS_PER_MINUTE;
+        if self.requests.len() >= request_limit {
+            return self
+                .requests
+                .front()
+                .map(|oldest| (*oldest + GECKOTERMINAL_WINDOW).saturating_duration_since(now));
+        }
+        self.requests.push_back(now);
+        None
+    }
+
+    fn backoff(&mut self, now: Instant) {
+        #[cfg(test)]
+        let duration = self.backoff_duration;
+        #[cfg(not(test))]
+        let duration = GECKOTERMINAL_BACKOFF;
+        self.backoff_until = Some(now + duration);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeckoRegistryRequest {
+    Tokens,
+    Pools,
+}
+
+#[derive(Debug, Default)]
+struct GeckoRegistryBudget {
+    requests: usize,
+    pool_ids: HashSet<String>,
+    token_requests_by_chain: [usize; 5],
+    pool_requests_by_chain: [usize; 5],
+    pool_ids_by_chain: [usize; 5],
+}
+
+impl GeckoRegistryBudget {
+    fn try_acquire(&mut self, chain: Chain, request: GeckoRegistryRequest) -> bool {
+        let chain_index = gecko_chain_budget_index(chain);
+        let used = match request {
+            GeckoRegistryRequest::Tokens => self.token_requests_by_chain[chain_index],
+            GeckoRegistryRequest::Pools => self.pool_requests_by_chain[chain_index],
+        };
+        let limit = match request {
+            GeckoRegistryRequest::Tokens => GECKOTERMINAL_REGISTRY_TOKEN_REQUESTS_PER_CHAIN,
+            GeckoRegistryRequest::Pools => GECKOTERMINAL_REGISTRY_POOL_REQUESTS_PER_CHAIN,
+        };
+        if self.requests >= GECKOTERMINAL_REGISTRY_REQUESTS_PER_REFRESH || used >= limit {
+            return false;
+        }
+        match request {
+            GeckoRegistryRequest::Tokens => self.token_requests_by_chain[chain_index] += 1,
+            GeckoRegistryRequest::Pools => self.pool_requests_by_chain[chain_index] += 1,
+        }
+        self.requests += 1;
+        true
+    }
+
+    fn try_add_pool_id(&mut self, chain: Chain, network: &str, address: &str) -> bool {
+        let id = format!("{network}_{}", address.to_ascii_lowercase());
+        if self.pool_ids.contains(&id) {
+            return true;
+        }
+        let chain_index = gecko_chain_budget_index(chain);
+        if self.pool_ids.len() >= GECKOTERMINAL_REGISTRY_POOL_IDS_PER_REFRESH
+            || self.pool_ids_by_chain[chain_index] >= GECKOTERMINAL_REGISTRY_POOL_IDS_PER_CHAIN
+        {
+            return false;
+        }
+        self.pool_ids.insert(id);
+        self.pool_ids_by_chain[chain_index] += 1;
+        true
+    }
+}
+
+#[derive(Debug, Default)]
+struct GeckoWatchBudget {
+    requests: usize,
+}
+
+impl GeckoWatchBudget {
+    fn try_acquire(&mut self) -> bool {
+        if self.requests >= GECKOTERMINAL_WATCH_SEARCHES_PER_REFRESH {
+            return false;
+        }
+        self.requests += 1;
+        true
+    }
+}
+
+enum GeckoRequestBudget<'a> {
+    Registry(&'a mut GeckoRegistryBudget, Chain, GeckoRegistryRequest),
+    Watch(&'a mut GeckoWatchBudget),
+}
+
+impl GeckoRequestBudget<'_> {
+    fn try_acquire(&mut self) -> bool {
+        match self {
+            Self::Registry(budget, chain, request) => budget.try_acquire(*chain, *request),
+            Self::Watch(budget) => budget.try_acquire(),
+        }
+    }
+}
+static GLOBAL_GECKOTERMINAL_BUDGET: LazyLock<Arc<Mutex<GeckoBudget>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(GeckoBudget::default())));
+
+#[derive(Debug, Default)]
+struct DexAvailability {
+    checked_at: Option<Instant>,
+    available: bool,
+}
+
+static GLOBAL_DEX_AVAILABILITY: LazyLock<Arc<Mutex<DexAvailability>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(DexAvailability::default())));
+
+#[derive(Debug, Deserialize)]
+struct GeckoApiResponse {
+    #[serde(default)]
+    data: Vec<GeckoEntity>,
+    #[serde(default)]
+    included: Vec<GeckoEntity>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeckoEntity {
+    id: String,
+    #[serde(default)]
+    attributes: serde_json::Value,
+    #[serde(default)]
+    relationships: serde_json::Value,
+}
+
+#[derive(Clone)]
+struct GeckoTerminalClient {
+    http: reqwest::Client,
+    base_url: String,
+    budget: Arc<Mutex<GeckoBudget>>,
+}
+
+impl GeckoTerminalClient {
+    fn new(http: reqwest::Client) -> Self {
+        Self {
+            http,
+            base_url: GECKOTERMINAL_API.to_owned(),
+            budget: Arc::clone(&GLOBAL_GECKOTERMINAL_BUDGET),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_base_url(http: reqwest::Client, base_url: String) -> Self {
+        Self { http, base_url, budget: Arc::new(Mutex::new(GeckoBudget::default())) }
+    }
+
+    async fn acquire(&self) {
+        loop {
+            let delay = self.budget.lock().await.delay_or_acquire(Instant::now());
+            if let Some(delay) = delay {
+                sleep(delay).await;
+            } else {
+                return;
+            }
+        }
+    }
+
+    async fn get_json<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        mut request_budget: Option<GeckoRequestBudget<'_>>,
+    ) -> Result<T, DiscoveryError> {
+        for attempt in 0..2 {
+            if let Some(budget) = request_budget.as_mut()
+                && !budget.try_acquire()
+            {
+                return Err(DiscoveryError::GeckoRefreshBudgetExhausted);
+            }
+            self.acquire().await;
+            let response = self
+                .http
+                .get(url)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .timeout(GECKOTERMINAL_TIMEOUT)
+                .send()
+                .await
+                .map_err(DiscoveryError::GeckoHttp)?;
+            let status = response.status();
+            if status == StatusCode::TOO_MANY_REQUESTS && attempt == 0 {
+                self.budget.lock().await.backoff(Instant::now());
+                continue;
+            }
+            if !status.is_success() {
+                return Err(DiscoveryError::GeckoHttpStatus(status));
+            }
+            let body = net::body(response).await.map_err(DiscoveryError::GeckoBody)?;
+            return serde_json::from_slice(&body).map_err(DiscoveryError::GeckoJson);
+        }
+        unreachable!("GeckoTerminal request retries are bounded")
+    }
+
+    async fn search(
+        &self,
+        query: &str,
+        network: &str,
+        budget: Option<&mut GeckoWatchBudget>,
+    ) -> Result<Vec<DexPair>, DiscoveryError> {
+        let mut url = reqwest::Url::parse(&format!("{}/search/pools", self.base_url))
+            .expect("GeckoTerminal search endpoint is a valid URL");
+        url.query_pairs_mut()
+            .append_pair("query", query)
+            .append_pair("network", network)
+            .append_pair("include", "base_token,quote_token,dex");
+        let request_budget = budget.map(GeckoRequestBudget::Watch);
+        let response: GeckoApiResponse = self.get_json(url.as_str(), request_budget).await?;
+        Ok(gecko_pools_to_pairs(response, network))
+    }
+
+    async fn pools(
+        &self,
+        network: &str,
+        pool_addresses: &[String],
+    ) -> Result<Vec<DexPair>, DiscoveryError> {
+        let mut pairs = Vec::new();
+        for chunk in pool_addresses.chunks(GECKOTERMINAL_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let addresses = chunk.join(",");
+            let mut url = reqwest::Url::parse(&format!(
+                "{}/networks/{network}/pools/multi/{addresses}",
+                self.base_url
+            ))
+            .expect("GeckoTerminal pool endpoint is a valid URL");
+            url.query_pairs_mut().append_pair("include", "base_token,quote_token,dex");
+            let response: GeckoApiResponse = self.get_json(url.as_str(), None).await?;
+            pairs.extend(gecko_pools_to_pairs(response, network));
+        }
+        Ok(pairs)
+    }
+
+    async fn registry_pools(
+        &self,
+        chain: Chain,
+        addresses: &[String],
+        registry: &Registry,
+        budget: &mut GeckoRegistryBudget,
+    ) -> Result<Vec<DexPair>, DiscoveryError> {
+        let network = gecko_network_id(chain).ok_or(DiscoveryError::UnsupportedChain(chain))?;
+        let mut pool_addresses = Vec::new();
+        let mut seen_pool_addresses = HashSet::new();
+        for chunk in addresses.chunks(GECKOTERMINAL_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let mut url = reqwest::Url::parse(&format!(
+                "{}/networks/{network}/tokens/multi/{}",
+                self.base_url,
+                chunk.join(",")
+            ))
+            .expect("GeckoTerminal token endpoint is a valid URL");
+            url.query_pairs_mut().append_pair("include", "top_pools");
+            let response: GeckoApiResponse = match self
+                .get_json(
+                    url.as_str(),
+                    Some(GeckoRequestBudget::Registry(budget, chain, GeckoRegistryRequest::Tokens)),
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(DiscoveryError::GeckoRefreshBudgetExhausted) => {
+                    warn!(%chain, "GeckoTerminal registry lookup reached its request budget");
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            for token in response.data {
+                if !chunk.iter().any(|address| {
+                    gecko_attribute_string(&token, "address")
+                        .is_some_and(|token_address| token_address.eq_ignore_ascii_case(address))
+                }) {
+                    continue;
+                }
+                let Some(top_pools) = token.relationships["top_pools"]["data"].as_array() else {
+                    continue;
+                };
+                for pool in top_pools {
+                    let Some(id) = pool["id"].as_str() else { continue };
+                    let Some(address) = gecko_relationship_address(id, network) else { continue };
+                    if !valid_gecko_pool_address(chain, address)
+                        || !seen_pool_addresses.insert(address.to_ascii_lowercase())
+                        || !budget.try_add_pool_id(chain, network, address)
+                    {
+                        continue;
+                    }
+                    pool_addresses.push(address.to_owned());
+                }
+            }
+        }
+        let mut pairs = Vec::new();
+        for chunk in pool_addresses.chunks(GECKOTERMINAL_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let addresses = chunk.join(",");
+            let mut url = reqwest::Url::parse(&format!(
+                "{}/networks/{network}/pools/multi/{addresses}",
+                self.base_url
+            ))
+            .expect("GeckoTerminal pool endpoint is a valid URL");
+            url.query_pairs_mut().append_pair("include", "base_token,quote_token,dex");
+            let response: GeckoApiResponse = match self
+                .get_json(
+                    url.as_str(),
+                    Some(GeckoRequestBudget::Registry(budget, chain, GeckoRegistryRequest::Pools)),
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(DiscoveryError::GeckoRefreshBudgetExhausted) => {
+                    warn!(%chain, "GeckoTerminal pool lookup reached its request budget");
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            pairs.extend(gecko_pools_to_pairs(response, network));
+        }
+        pairs.retain(|pair| {
+            let base = pair.base_token.address.as_deref();
+            let quote = pair.quote_token.address.as_deref();
+            let matched = base
+                .and_then(|address| {
+                    registry::lookup(registry, chain, address)
+                        .map(|entry| (entry, pair.base_token.symbol.as_deref()))
+                })
+                .or_else(|| {
+                    quote.and_then(|address| {
+                        registry::lookup(registry, chain, address)
+                            .map(|entry| (entry, pair.quote_token.symbol.as_deref()))
+                    })
+                });
+            matched.is_some_and(|(entry, symbol)| {
+                symbol.is_some_and(|symbol| symbol_matches_search_ticker(symbol, &entry.ticker))
+            })
+        });
+        Ok(pairs)
+    }
+}
+
+fn gecko_attribute_string<'a>(entity: &'a GeckoEntity, field: &str) -> Option<&'a str> {
+    entity.attributes.get(field)?.as_str()
+}
+
+fn gecko_relationship_id<'a>(entity: &'a GeckoEntity, field: &str) -> Option<&'a str> {
+    entity.relationships.get(field)?.get("data")?.get("id")?.as_str()
+}
+
+fn gecko_relationship_address<'a>(id: &'a str, network: &str) -> Option<&'a str> {
+    id.strip_prefix(network)?.strip_prefix('_')
+}
+
+fn gecko_numeric(value: Option<&serde_json::Value>) -> Option<f64> {
+    let value = value?;
+    value.as_f64().or_else(|| value.as_str()?.parse::<f64>().ok())
+}
+
+fn gecko_token(
+    pool: &GeckoEntity,
+    included: &HashMap<&str, &GeckoEntity>,
+    field: &str,
+    network: &str,
+) -> DexToken {
+    let id = gecko_relationship_id(pool, field);
+    let entity = id.and_then(|id| included.get(id).copied());
+    DexToken {
+        address: entity
+            .and_then(|entity| gecko_attribute_string(entity, "address"))
+            .map(str::to_owned)
+            .or_else(|| {
+                id.and_then(|id| gecko_relationship_address(id, network)).map(str::to_owned)
+            }),
+        name: entity.and_then(|entity| gecko_attribute_string(entity, "name")).map(str::to_owned),
+        symbol: entity
+            .and_then(|entity| gecko_attribute_string(entity, "symbol"))
+            .map(str::to_owned),
+    }
+}
+
+fn gecko_pools_to_pairs(response: GeckoApiResponse, network: &str) -> Vec<DexPair> {
+    let included = response
+        .included
+        .iter()
+        .map(|entity| (entity.id.as_str(), entity))
+        .collect::<HashMap<_, _>>();
+    response
+        .data
+        .into_iter()
+        .filter_map(|pool| {
+            let address = gecko_attribute_string(&pool, "address")?.to_owned();
+            let dex = gecko_relationship_id(&pool, "dex").and_then(|id| included.get(id).copied());
+            let dex_identifier = dex.and_then(|dex| gecko_attribute_string(dex, "identifier"));
+            let dex_name = dex.and_then(|dex| gecko_attribute_string(dex, "name"));
+            let is_uniswap_v4 = dex_identifier.is_some_and(|identifier| {
+                identifier.get(..10).is_some_and(|prefix| prefix.eq_ignore_ascii_case("uniswap-v4"))
+            }) || dex_name.is_some_and(|name| {
+                name.get(..10).is_some_and(|prefix| prefix.eq_ignore_ascii_case("Uniswap V4"))
+            });
+            let (dex_id, labels) = if is_uniswap_v4 {
+                ("uniswap".to_owned(), vec!["v4".to_owned()])
+            } else {
+                (dex_name.or(dex_identifier).unwrap_or("unknown").to_owned(), Vec::new())
+            };
+            let volume =
+                gecko_numeric(pool.attributes.get("volume_usd").and_then(|value| value.get("h24")));
+            let reserve = gecko_numeric(pool.attributes.get("reserve_in_usd"));
+            let price = gecko_numeric(pool.attributes.get("base_token_price_usd"));
+            let volume =
+                volume.map(|h24| DexVolume { h24: Some(h24), h6: None, h1: None, m5: None });
+            let liquidity =
+                reserve.map(|usd| DexLiquidity { usd: Some(usd), base: None, quote: None });
+            Some(DexPair {
+                chain_id: network.to_owned(),
+                dex_id,
+                url: Some(format!("https://www.geckoterminal.com/{network}/pools/{address}")),
+                pair_address: address,
+                labels,
+                base_token: gecko_token(&pool, &included, "base_token", network),
+                quote_token: gecko_token(&pool, &included, "quote_token", network),
+                price_usd: price,
+                volume,
+                price_change: None,
+                txns: None,
+                liquidity,
+                source: MarketSource::Geckoterminal,
+            })
+        })
+        .collect()
+}
+
+#[derive(Clone)]
+struct MarketDataClient {
+    dex: DexScreenerClient,
+    gecko: GeckoTerminalClient,
+    availability: Arc<Mutex<DexAvailability>>,
+}
+
+impl MarketDataClient {
+    fn new(http: reqwest::Client) -> Self {
+        Self {
+            dex: DexScreenerClient::new(http.clone()),
+            gecko: GeckoTerminalClient::new(http),
+            availability: Arc::clone(&GLOBAL_DEX_AVAILABILITY),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_clients(dex: DexScreenerClient, gecko: GeckoTerminalClient, available: bool) -> Self {
+        Self {
+            dex,
+            gecko,
+            availability: Arc::new(Mutex::new(DexAvailability {
+                checked_at: Some(Instant::now()),
+                available,
+            })),
+        }
+    }
+
+    async fn dex_available(&self) -> bool {
+        #[cfg(debug_assertions)]
+        if std::env::var("QED_FORCE_DEXSCREENER_UNAVAILABLE").is_ok_and(|value| value == "1") {
+            return false;
+        }
+        let mut availability = self.availability.lock().await;
+        if availability.checked_at.is_some_and(|checked_at| checked_at.elapsed() < DEX_CANARY_TTL) {
+            return availability.available;
+        }
+        let available = match self.dex.search(DEX_CANARY_QUERY).await {
+            Ok(pairs) => !pairs.is_empty(),
+            Err(error) => {
+                warn!(error = %error, "DexScreener availability canary failed; using GeckoTerminal");
+                false
+            }
+        };
+        availability.checked_at = Some(Instant::now());
+        availability.available = available;
+        if !available {
+            warn!(
+                seconds = DEX_CANARY_TTL.as_secs(),
+                "DexScreener USDC canary returned no pairs; using GeckoTerminal for five minutes"
+            );
+        }
+        available
+    }
+
+    async fn registry_pools(
+        &self,
+        chain: Chain,
+        addresses: &[String],
+        registry: &Registry,
+        budget: &mut GeckoRegistryBudget,
+    ) -> Result<Vec<DexPair>, DiscoveryError> {
+        if self.dex_available().await {
+            match self.dex.tokens(chain, addresses).await {
+                Ok(pairs) => return Ok(pairs),
+                Err(error) => {
+                    warn!(%chain, error = %error, "DexScreener discovery failed; falling back to GeckoTerminal")
+                }
+            }
+        }
+        self.gecko.registry_pools(chain, addresses, registry, budget).await
+    }
+
+    async fn pairs(
+        &self,
+        chain: Chain,
+        pool_addresses: &[String],
+    ) -> Result<Vec<DexPair>, DiscoveryError> {
+        if self.dex_available().await {
+            match self.dex.pairs(chain, pool_addresses).await {
+                Ok(pairs) => return Ok(pairs),
+                Err(error) => {
+                    warn!(%chain, error = %error, "DexScreener price lookup failed; falling back to GeckoTerminal")
+                }
+            }
+        }
+        let network = gecko_network_id(chain).ok_or(DiscoveryError::UnsupportedChain(chain))?;
+        self.gecko.pools(network, pool_addresses).await
+    }
+
+    async fn pair(
+        &self,
+        chain: Chain,
+        pool_address: &str,
+    ) -> Result<Option<DexPair>, DiscoveryError> {
+        if self.dex_available().await {
+            match self.dex.pair(chain, pool_address).await {
+                Ok(pair) => return Ok(pair),
+                Err(error) => {
+                    warn!(%chain, error = %error, "DexScreener featured lookup failed; falling back to GeckoTerminal")
+                }
+            }
+        }
+        let network = gecko_network_id(chain).ok_or(DiscoveryError::UnsupportedChain(chain))?;
+        let pools = self.gecko.pools(network, &[pool_address.to_owned()]).await?;
+        Ok(pools.into_iter().find(|pair| pair.pair_address.eq_ignore_ascii_case(pool_address)))
+    }
+
+    async fn gecko_search(
+        &self,
+        query: &str,
+        network: &str,
+        budget: &mut GeckoWatchBudget,
+    ) -> Result<Vec<DexPair>, DiscoveryError> {
+        self.gecko.search(query, network, Some(budget)).await
     }
 }
 
@@ -1013,12 +1940,14 @@ struct LeaderboardCandidate {
     quote_symbol: String,
     issuer: Option<String>,
     ticker: Option<String>,
+    issuer_on_base: bool,
     price_usd: Option<f64>,
     change_24h_pct: Option<f64>,
     volume_24h_usd: Option<f64>,
     liquidity_usd: Option<f64>,
     txns_24h: Option<u64>,
     trade_url: String,
+    source: MarketSource,
 }
 
 struct DiscoveryBatch {
@@ -1048,7 +1977,7 @@ pub fn chain_from_dex_id(chain_id: &str) -> Option<Chain> {
 pub fn chain_slug(chain: Chain) -> &'static str {
     match chain {
         Chain::Solana => "solana",
-        Chain::RobinhoodChain => "robinhoodchain",
+        Chain::RobinhoodChain => "robinhood",
         Chain::Base => "base",
         Chain::Ethereum => "ethereum",
         Chain::Bnb => "bnb",
@@ -1089,6 +2018,15 @@ fn gecko_network_id(chain: Chain) -> Option<&'static str> {
         Chain::Bnb => Some("bsc"),
     }
 }
+fn gecko_chain_budget_index(chain: Chain) -> usize {
+    match chain {
+        Chain::Solana => 0,
+        Chain::RobinhoodChain => 1,
+        Chain::Base => 2,
+        Chain::Ethereum => 3,
+        Chain::Bnb => 4,
+    }
+}
 
 fn valid_token_address(chain: Chain, address: &str) -> bool {
     match chain {
@@ -1097,6 +2035,19 @@ fn valid_token_address(chain: Chain, address: &str) -> bool {
             Chain::is_evm_address(address)
         }
     }
+}
+
+fn valid_gecko_pool_address(chain: Chain, address: &str) -> bool {
+    match chain {
+        Chain::Solana => valid_token_address(chain, address),
+        Chain::RobinhoodChain | Chain::Base | Chain::Ethereum | Chain::Bnb => {
+            Chain::is_evm_address(address) || Chain::is_v4_pool_id(address)
+        }
+    }
+}
+
+fn valid_publisher_catalog_snapshot_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn valid_pair_address(chain: Chain, pair: &DexPair) -> bool {
@@ -1152,21 +2103,59 @@ fn trusted_market_url(url: &str, chain: Chain, pool: &str) -> bool {
 /// supplied chain and pool. Old or malformed persisted URLs fall back to the
 /// canonical DexScreener pair page.
 pub fn canonical_market_url(chain: Chain, pool: &str, source_url: Option<&str>) -> String {
-    source_url
-        .filter(|url| trusted_market_url(url, chain, pool))
-        .map(str::to_owned)
-        .unwrap_or_else(|| dex_pair_url(chain, pool))
+    canonical_market_url_for_source(chain, pool, source_url, MarketSource::Dexscreener)
+}
+
+pub(crate) fn canonical_market_url_for_source(
+    chain: Chain,
+    pool: &str,
+    source_url: Option<&str>,
+    source: MarketSource,
+) -> String {
+    source_url.filter(|url| trusted_market_url(url, chain, pool)).map(str::to_owned).unwrap_or_else(
+        || match source {
+            MarketSource::Dexscreener => dex_pair_url(chain, pool),
+            MarketSource::Geckoterminal => format!(
+                "https://www.geckoterminal.com/{}/pools/{pool}",
+                gecko_network_id(chain).unwrap_or_default()
+            ),
+        },
+    )
 }
 
 pub fn load_curated(path: impl AsRef<Path>) -> Result<Vec<CuratedPool>, DiscoveryError> {
     let bytes = std::fs::read(path)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
+fn pair_metadata_is_bounded(pair: &DexPair) -> bool {
+    pair.dex_id.len() <= MAX_LEADERBOARD_LABEL_BYTES
+        && pair
+            .base_token
+            .symbol
+            .as_deref()
+            .is_none_or(|symbol| symbol.len() <= MAX_LEADERBOARD_LABEL_BYTES)
+        && pair
+            .quote_token
+            .symbol
+            .as_deref()
+            .is_none_or(|symbol| symbol.len() <= MAX_LEADERBOARD_LABEL_BYTES)
+        && pair
+            .base_token
+            .name
+            .as_deref()
+            .is_none_or(|name| name.len() <= MAX_LEADERBOARD_LABEL_BYTES)
+        && pair
+            .quote_token
+            .name
+            .as_deref()
+            .is_none_or(|name| name.len() <= MAX_LEADERBOARD_LABEL_BYTES)
+}
 fn candidate_from_pair(pair: &DexPair, registry: &Registry) -> Option<DiscoveryCandidate> {
     let chain = chain_from_dex_id(&pair.chain_id)?;
     let base_address = pair.base_token.address.clone()?;
     let quote_address = pair.quote_token.address.clone()?;
-    if !valid_pair_address(chain, pair)
+    if !pair_metadata_is_bounded(pair)
+        || !valid_pair_address(chain, pair)
         || !valid_token_address(chain, &base_address)
         || !valid_token_address(chain, &quote_address)
     {
@@ -1175,6 +2164,11 @@ fn candidate_from_pair(pair: &DexPair, registry: &Registry) -> Option<DiscoveryC
     let quote_entry = registry::lookup(registry, chain, &quote_address);
     let base_entry = registry::lookup(registry, chain, &base_address);
     let matched = quote_entry.or(base_entry)?;
+    if matched.issuer.len() > MAX_LEADERBOARD_LABEL_BYTES
+        || matched.ticker.len() > MAX_LEADERBOARD_LABEL_BYTES
+    {
+        return None;
+    }
     let liquidity_usd = pair.liquidity.as_ref().and_then(|liquidity| liquidity.usd);
     if liquidity_usd.is_none_or(|liquidity| liquidity <= MIN_LIQUIDITY_USD) {
         return None;
@@ -1213,15 +2207,33 @@ fn leaderboard_candidate_from_pair(
     let chain = chain_from_dex_id(&pair.chain_id)?;
     let base_address = pair.base_token.address.as_deref()?;
     let quote_address = pair.quote_token.address.as_deref()?;
-    if !valid_pair_address(chain, pair)
+    if !pair_metadata_is_bounded(pair)
+        || !valid_pair_address(chain, pair)
         || !valid_token_address(chain, base_address)
         || !valid_token_address(chain, quote_address)
     {
         return None;
     }
-    let matched = registry::lookup(registry, chain, quote_address)
-        .or_else(|| registry::lookup(registry, chain, base_address))?;
-    let trade_url = canonical_market_url(chain, &pair.pair_address, pair.url.as_deref());
+    let quote_entry = registry::lookup(registry, chain, quote_address);
+    let base_entry = registry::lookup(registry, chain, base_address);
+    let (matched, issuer_on_base) = match quote_entry {
+        Some(matched) => (matched, false),
+        None => (base_entry?, true),
+    };
+    if matched.issuer.len() > MAX_LEADERBOARD_LABEL_BYTES
+        || matched.ticker.len() > MAX_LEADERBOARD_LABEL_BYTES
+    {
+        return None;
+    }
+    let trade_url = canonical_market_url_for_source(
+        chain,
+        &pair.pair_address,
+        pair.url.as_deref(),
+        pair.source,
+    );
+    if trade_url.len() > MAX_IMPOSTOR_URL_BYTES {
+        return None;
+    }
     let txns_24h = pair
         .txns
         .as_ref()
@@ -1235,12 +2247,14 @@ fn leaderboard_candidate_from_pair(
         quote_symbol: pair.quote_token.symbol.clone().unwrap_or_default(),
         issuer: Some(matched.issuer.clone()),
         ticker: Some(matched.ticker.clone()),
+        issuer_on_base,
         price_usd: pair.price_usd,
         change_24h_pct: pair.price_change.as_ref().and_then(|change| change.h24),
         volume_24h_usd: pair.volume.as_ref().and_then(|volume| volume.h24),
         liquidity_usd: pair.liquidity.as_ref().and_then(|liquidity| liquidity.usd),
         txns_24h,
         trade_url,
+        source: pair.source,
     })
 }
 
@@ -1363,6 +2377,44 @@ fn verdict_label(verdict: &Verdict) -> &'static str {
         Verdict::Unknown { .. } => "unknown",
     }
 }
+fn checked_read_status() -> String {
+    "checked".to_owned()
+}
+
+fn leaderboard_read_status(issue: Option<CheckReadIssue>) -> (&'static str, Option<&'static str>) {
+    match issue {
+        Some(CheckReadIssue::UnsupportedVenue) => ("unsupported_venue", Some("unsupported_venue")),
+        Some(CheckReadIssue::RpcLimit) => ("not_read_yet", Some("rpc_limit")),
+        Some(CheckReadIssue::Transient) => ("not_read_yet", Some("transient")),
+        Some(CheckReadIssue::Unsupported) => ("not_read_yet", Some("unsupported")),
+        None => ("checked", None),
+    }
+}
+#[cfg(test)]
+mod read_status_tests {
+    use super::*;
+
+    #[test]
+    fn read_status_uses_typed_issues_and_separates_unsupported_venues() {
+        assert_eq!(
+            leaderboard_read_status(Some(CheckReadIssue::UnsupportedVenue)),
+            ("unsupported_venue", Some("unsupported_venue"))
+        );
+        assert_eq!(
+            leaderboard_read_status(Some(CheckReadIssue::RpcLimit)),
+            ("not_read_yet", Some("rpc_limit"))
+        );
+        assert_eq!(
+            leaderboard_read_status(Some(CheckReadIssue::Transient)),
+            ("not_read_yet", Some("transient"))
+        );
+        assert_eq!(
+            leaderboard_read_status(Some(CheckReadIssue::Unsupported)),
+            ("not_read_yet", Some("unsupported"))
+        );
+        assert_eq!(leaderboard_read_status(None), ("checked", None));
+    }
+}
 
 fn side_values(
     pool: Option<&PoolInfo>,
@@ -1427,7 +2479,8 @@ async fn discover_registry(
     state: &AppState,
     registry: &Registry,
 ) -> Result<DiscoveryBatch, DiscoveryError> {
-    let client = DexScreenerClient::new(state.http.clone());
+    let client = MarketDataClient::new(state.http.clone());
+    let mut gecko_budget = GeckoRegistryBudget::default();
     let mut featured = Vec::new();
     let mut leaderboard = Vec::new();
     let mut attempted = 0;
@@ -1450,7 +2503,7 @@ async fn discover_registry(
             continue;
         }
         attempted += 1;
-        match client.tokens(chain, &addresses).await {
+        match client.registry_pools(chain, &addresses, registry, &mut gecko_budget).await {
             Ok(pairs) => {
                 succeeded += 1;
                 let mut chain_featured = pairs
@@ -1473,7 +2526,7 @@ async fn discover_registry(
             Err(error) if is_dex_blocked(&error) => return Err(error),
             Err(error) => {
                 failed += 1;
-                warn!(%chain, error = %error, "DexScreener discovery failed");
+                warn!(%chain, error = %error, "market-data registry discovery failed");
             }
         }
     }
@@ -1509,7 +2562,7 @@ async fn refresh_featured(
         }
     };
     candidates.extend(discovered);
-    let client = DexScreenerClient::new(state.http.clone());
+    let client = MarketDataClient::new(state.http.clone());
     let mut enriched = Vec::new();
     for mut candidate in dedup_and_order(candidates) {
         if candidate.liquidity_usd.is_none() {
@@ -1617,8 +2670,13 @@ async fn refresh_featured(
 async fn cached_leaderboard_check(
     state: &AppState,
     candidate: &LeaderboardCandidate,
+    force_refresh: bool,
 ) -> CheckResult {
     let key = (candidate.chain, candidate.pool.to_ascii_lowercase());
+    if force_refresh {
+        state.leaderboard_check_cache.invalidate(&key).await;
+        state.app.check_cache.invalidate(&crate::domain::check::cache_key(&candidate.pool)).await;
+    }
     if let Some(result) = state.leaderboard_check_cache.get(&key).await {
         return result;
     }
@@ -1641,12 +2699,16 @@ fn provisional_leaderboard_entry(
         quote_symbol: candidate.quote_symbol.clone(),
         issuer: candidate.issuer.clone(),
         ticker: candidate.ticker.clone(),
+        issuer_on_base: Some(candidate.issuer_on_base),
         verdict: "unknown".to_owned(),
+        read_status: "not_read_yet".to_owned(),
+        read_reason: None,
         price_usd: candidate.price_usd,
         change_24h_pct: candidate.change_24h_pct,
         volume_24h_usd: candidate.volume_24h_usd,
         liquidity_usd: candidate.liquidity_usd,
         txns_24h: candidate.txns_24h,
+        source: candidate.source,
         detail_url: format!("/validated/{}/{}", chain_slug(candidate.chain), candidate.pool),
         trade_url: candidate.trade_url.clone(),
         explorer_url: explorer_url(candidate.chain, &candidate.pool),
@@ -1661,6 +2723,7 @@ fn leaderboard_entry(
     result: CheckResult,
 ) -> LeaderboardEntry {
     let pool = candidate.pool.clone();
+    let (read_status, read_reason) = leaderboard_read_status(result.read_issue);
     LeaderboardEntry {
         rank,
         chain: chain_slug(candidate.chain).to_owned(),
@@ -1671,7 +2734,10 @@ fn leaderboard_entry(
         quote_symbol: candidate.quote_symbol,
         issuer: candidate.issuer,
         ticker: candidate.ticker,
+        issuer_on_base: Some(candidate.issuer_on_base),
         verdict: verdict_label(&result.verdict).to_owned(),
+        read_status: read_status.to_owned(),
+        read_reason: read_reason.map(str::to_owned),
         price_usd: candidate.price_usd,
         change_24h_pct: candidate.change_24h_pct,
         volume_24h_usd: candidate.volume_24h_usd,
@@ -1680,6 +2746,7 @@ fn leaderboard_entry(
         detail_url: format!("/validated/{}/{}", chain_slug(candidate.chain), candidate.pool),
         trade_url: candidate.trade_url.clone(),
         explorer_url: explorer_url(candidate.chain, &candidate.pool),
+        source: candidate.source,
         attestation_id: result.attestation_id,
         checked_at: Some(result.checked_at),
     }
@@ -1699,6 +2766,909 @@ fn rank_leaderboard_candidates(
     candidates.truncate(MAX_LEADERBOARD_CANDIDATES);
     candidates
 }
+fn symbol_matches_search_ticker(symbol: &str, ticker: &str) -> bool {
+    let symbol = symbol.trim();
+    let symbol_bytes = symbol.as_bytes();
+    let ticker_bytes = ticker.as_bytes();
+    symbol.eq_ignore_ascii_case(ticker)
+        || (symbol_bytes.len() == ticker_bytes.len() + 1
+            && symbol_bytes[..ticker_bytes.len()].eq_ignore_ascii_case(ticker_bytes)
+            && symbol_bytes.last().is_some_and(|byte| byte.eq_ignore_ascii_case(&b'x')))
+}
+
+fn active_search_tickers(registry: &Registry) -> Vec<String> {
+    let mut tickers = registry
+        .iter()
+        .filter(|entry| registry::matchable(entry))
+        .map(|entry| entry.ticker.clone())
+        .filter(|ticker| !ticker.trim().is_empty() && ticker.len() <= MAX_IMPOSTOR_LABEL_BYTES)
+        .collect::<Vec<_>>();
+    tickers.sort_by_key(|ticker| ticker.to_ascii_lowercase());
+    tickers.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    tickers
+}
+fn registry_product_names<'a>(registry: &'a Registry, ticker: &str) -> Vec<&'a str> {
+    let mut names = Vec::new();
+    for entry in registry
+        .iter()
+        .filter(|entry| registry::matchable(entry) && entry.ticker.eq_ignore_ascii_case(ticker))
+    {
+        let name = entry.name.trim();
+        if name.is_empty()
+            || name.len() > MAX_IMPOSTOR_LABEL_BYTES
+            || names.iter().any(|existing: &&str| existing.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        names.push(name);
+    }
+    names
+}
+
+async fn search_watch_products(
+    client: &MarketDataClient,
+    ticker: &str,
+    product_names: &[&str],
+    budget: &mut GeckoWatchBudget,
+    searches_made: &mut usize,
+    failed_queries: &mut usize,
+) -> Vec<DexPair> {
+    let mut pairs = Vec::new();
+    'products: for product_name in product_names {
+        for network in GECKOTERMINAL_WATCH_NETWORKS {
+            if budget.requests >= GECKOTERMINAL_WATCH_SEARCHES_PER_REFRESH {
+                break 'products;
+            }
+            *searches_made += 1;
+            match client.gecko_search(product_name, network, budget).await {
+                Ok(mut found) => pairs.append(&mut found),
+                Err(DiscoveryError::GeckoRefreshBudgetExhausted) => break 'products,
+                Err(error) => {
+                    *failed_queries += 1;
+                    warn!(ticker, %network, error = %error, "GeckoTerminal impostor search failed; continuing with the remaining networks");
+                }
+            }
+        }
+    }
+    pairs
+}
+
+fn prioritize_search_tickers(registry: &Registry, board: &[LeaderboardEntry]) -> Vec<String> {
+    let mut tickers = active_search_tickers(registry);
+    tickers.sort_by(|left, right| {
+        let volume = |ticker: &str| {
+            board
+                .iter()
+                .filter(|entry| {
+                    symbol_matches_search_ticker(&entry.base_symbol, ticker)
+                        || symbol_matches_search_ticker(&entry.quote_symbol, ticker)
+                })
+                .filter_map(|entry| entry.volume_24h_usd)
+                .max_by(f64::total_cmp)
+        };
+        match (volume(left), volume(right)) {
+            (Some(left), Some(right)) => right.total_cmp(&left),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase()),
+        }
+    });
+    tickers
+}
+
+fn rotating_impostor_search_terms(
+    tickers: &[String],
+    rotation_offset: usize,
+) -> (Vec<(String, String)>, usize) {
+    let hot_ticker_count = tickers.len().min(IMPOSTOR_HOT_TICKERS_PER_REFRESH);
+    let hot_search_count = hot_ticker_count * 2;
+    let tail_tickers = &tickers[hot_ticker_count..];
+    let tail_search_count = tail_tickers.len() * 2;
+    let tail_budget = MAX_IMPOSTOR_SEARCHES_PER_REFRESH.saturating_sub(hot_search_count);
+    let tail_query_count = tail_budget.min(tail_search_count);
+    let start = if tail_search_count == 0 { 0 } else { rotation_offset % tail_search_count };
+    let next_offset =
+        if tail_search_count == 0 { 0 } else { (start + tail_query_count) % tail_search_count };
+    let mut searches = Vec::with_capacity(hot_search_count + tail_query_count);
+    for ticker in &tickers[..hot_ticker_count] {
+        if ticker.len() >= MIN_DEXSCREENER_SEARCH_BYTES {
+            searches.push((ticker.clone(), ticker.clone()));
+        }
+        searches.push((ticker.clone(), format!("{ticker}x")));
+    }
+    for offset in 0..tail_query_count {
+        let term_index = (start + offset) % tail_search_count;
+        let ticker = &tail_tickers[term_index / 2];
+        if term_index % 2 == 0 && ticker.len() < MIN_DEXSCREENER_SEARCH_BYTES {
+            continue;
+        }
+        let search = if term_index % 2 == 0 { ticker.clone() } else { format!("{ticker}x") };
+        searches.push((ticker.clone(), search));
+    }
+    (searches, next_offset)
+}
+
+fn merge_unsupported_candidates(
+    mut entries: Vec<UnsupportedImpostorCandidate>,
+    detected: Vec<UnsupportedImpostorCandidate>,
+) -> (Vec<UnsupportedImpostorCandidate>, usize) {
+    for mut detected in detected {
+        if let Some(existing) = entries.iter_mut().find(|existing| {
+            existing.dex_chain_id.eq_ignore_ascii_case(&detected.dex_chain_id)
+                && existing.address.eq_ignore_ascii_case(&detected.address)
+        }) {
+            detected.first_seen_at.clone_from(&existing.first_seen_at);
+            *existing = detected;
+        } else {
+            entries.push(detected);
+        }
+    }
+    entries.sort_by(|left, right| {
+        right
+            .last_seen_at
+            .cmp(&left.last_seen_at)
+            .then_with(|| left.dex_chain_id.cmp(&right.dex_chain_id))
+            .then_with(|| left.address.cmp(&right.address))
+    });
+    let evicted = entries.len().saturating_sub(MAX_STORED_UNSUPPORTED_CANDIDATES);
+    entries.truncate(MAX_STORED_UNSUPPORTED_CANDIDATES);
+    (entries, evicted)
+}
+
+fn impostor_address_key(chain: Chain, address: &str) -> String {
+    if chain == Chain::Solana { address.to_owned() } else { address.to_ascii_lowercase() }
+}
+
+fn merge_impostor_entries(
+    mut entries: Vec<ImpostorEntry>,
+    detected: Vec<ImpostorEntry>,
+) -> (Vec<ImpostorEntry>, usize) {
+    for mut detected in detected {
+        if let Some(existing) = entries.iter_mut().find(|existing| {
+            existing.chain == detected.chain
+                && if existing.chain == "solana" {
+                    existing.address == detected.address
+                } else {
+                    existing.address.eq_ignore_ascii_case(&detected.address)
+                }
+        }) {
+            detected.first_seen_at.clone_from(&existing.first_seen_at);
+            *existing = detected;
+        } else {
+            entries.push(detected);
+        }
+    }
+    entries.sort_by(|left, right| {
+        right
+            .last_seen_at
+            .cmp(&left.last_seen_at)
+            .then_with(|| left.chain.cmp(&right.chain))
+            .then_with(|| left.address.cmp(&right.address))
+    });
+    let evicted = entries.len().saturating_sub(MAX_STORED_IMPOSTORS);
+    entries.truncate(MAX_STORED_IMPOSTORS);
+    (entries, evicted)
+}
+
+fn rank_impostor_candidates(
+    mut candidates: Vec<(Chain, usize, DexPair)>,
+) -> Vec<(Chain, usize, DexPair)> {
+    candidates.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| {
+                let left_volume = left.2.volume.as_ref().and_then(|volume| volume.h24);
+                let right_volume = right.2.volume.as_ref().and_then(|volume| volume.h24);
+                match (left_volume, right_volume) {
+                    (Some(left), Some(right)) => right.total_cmp(&left),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            })
+            .then_with(|| left.2.pair_address.cmp(&right.2.pair_address))
+    });
+    candidates.truncate(MAX_IMPOSTOR_CANDIDATES_PER_REFRESH);
+    candidates
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidWatchObservation {
+    InvalidChain,
+    InvalidAddress,
+    InvalidCatalogHash,
+}
+
+fn compact_watch_reads<'a>(
+    reads: impl IntoIterator<Item = &'a crate::domain::attestation::Read>,
+    chain: Chain,
+    address: &str,
+) -> (Vec<crate::domain::attestation::Read>, bool) {
+    let mut compact = Vec::with_capacity(MAX_IMPOSTOR_READS);
+    let mut evidence_truncated = false;
+    for source in reads {
+        if !is_identity_read(source, chain, address) {
+            evidence_truncated = true;
+            continue;
+        }
+        if compact.iter().any(|read: &crate::domain::attestation::Read| {
+            read.method == source.method
+                && read.params == source.params
+                && read.result_hash == source.result_hash
+                && read.block == source.block
+                && read.slot == source.slot
+        }) {
+            evidence_truncated = true;
+            continue;
+        }
+        if compact.len() == MAX_IMPOSTOR_READS {
+            evidence_truncated = true;
+            continue;
+        }
+        let mut read = source.clone();
+        if read.method.len() > MAX_IMPOSTOR_READ_METHOD_BYTES {
+            truncate_text_bytes(&mut read.method, MAX_IMPOSTOR_READ_METHOD_BYTES);
+            evidence_truncated = true;
+        }
+        if read.result_hash.len() > 64 {
+            truncate_text_bytes(&mut read.result_hash, 64);
+            evidence_truncated = true;
+        }
+        if truncate_json_value(&mut read.params, MAX_IMPOSTOR_READ_PARAMS_BYTES) {
+            evidence_truncated = true;
+        }
+        if let Some(raw_result) = &mut read.raw_result
+            && truncate_json_value(raw_result, MAX_IMPOSTOR_READ_RESULT_BYTES)
+        {
+            evidence_truncated = true;
+        }
+        compact.push(read);
+    }
+    (compact, evidence_truncated)
+}
+
+fn is_identity_read(read: &crate::domain::attestation::Read, chain: Chain, address: &str) -> bool {
+    let Some(params) = read.params.as_array() else { return false };
+    match (chain, read.method.as_str()) {
+        (Chain::Solana, "getAccountInfo") => params
+            .first()
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|target| target == address),
+        (Chain::Solana, "getProgramAccounts") => {
+            params.first().and_then(serde_json::Value::as_str)
+                == Some(crate::adapters::solana::METAPLEX_METADATA_PROGRAM)
+                && params
+                    .get(1)
+                    .and_then(|config| config.get("filters"))
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|filters| {
+                        filters.iter().any(|filter| {
+                            filter.pointer("/memcmp/offset").and_then(serde_json::Value::as_u64)
+                                == Some(33)
+                                && filter
+                                    .pointer("/memcmp/bytes")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some(address)
+                        })
+                    })
+        }
+        (chain, "eth_call") if chain != Chain::Solana => {
+            params
+                .first()
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|target| target.eq_ignore_ascii_case(address))
+                && matches!(
+                    params.get(1).and_then(serde_json::Value::as_str),
+                    Some("symbol()" | "name()")
+                )
+        }
+        _ => false,
+    }
+}
+
+fn truncate_text_bytes(value: &mut String, max_bytes: usize) {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+}
+
+fn truncate_watch_text(value: &mut String, max_bytes: usize, evidence_truncated: &mut bool) {
+    if value.len() > max_bytes {
+        truncate_text_bytes(value, max_bytes);
+        *evidence_truncated = true;
+    }
+}
+
+/// Clips overlong observation text to its storage cap. Text length never rejects a
+/// valid observation; clipping is recorded in `evidence_truncated`.
+fn clip_impostor_entry_text(entry: &mut ImpostorEntry) {
+    let labels = [&mut entry.ticker, &mut entry.publisher, &mut entry.symbol, &mut entry.name]
+        .into_iter()
+        .chain(entry.on_chain_symbol.as_mut())
+        .chain(entry.on_chain_name.as_mut());
+    for label in labels {
+        truncate_watch_text(label, MAX_IMPOSTOR_LABEL_BYTES, &mut entry.evidence_truncated);
+    }
+    for timestamp in [&mut entry.first_seen_at, &mut entry.last_seen_at] {
+        truncate_watch_text(timestamp, MAX_IMPOSTOR_TIMESTAMP_BYTES, &mut entry.evidence_truncated);
+    }
+    truncate_watch_text(
+        &mut entry.reason,
+        MAX_IMPOSTOR_REASON_BYTES,
+        &mut entry.evidence_truncated,
+    );
+}
+
+fn clip_unsupported_candidate_text(candidate: &mut UnsupportedImpostorCandidate) {
+    for label in [
+        &mut candidate.ticker,
+        &mut candidate.publisher,
+        &mut candidate.symbol,
+        &mut candidate.name,
+    ] {
+        truncate_watch_text(label, MAX_IMPOSTOR_LABEL_BYTES, &mut candidate.evidence_truncated);
+    }
+    for timestamp in [&mut candidate.first_seen_at, &mut candidate.last_seen_at] {
+        truncate_watch_text(
+            timestamp,
+            MAX_IMPOSTOR_TIMESTAMP_BYTES,
+            &mut candidate.evidence_truncated,
+        );
+    }
+}
+
+/// An unsupported-chain candidate is rejected only when its DexScreener chain id or
+/// token address is not a well-formed identifier; its text is clipped instead.
+fn validate_unsupported_candidate(
+    dex_chain_id: &str,
+    address: &str,
+) -> Result<(), InvalidWatchObservation> {
+    if dex_chain_id.is_empty()
+        || dex_chain_id.len() > MAX_IMPOSTOR_CHAIN_ID_BYTES
+        || !dex_chain_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(InvalidWatchObservation::InvalidChain);
+    }
+    if address.is_empty()
+        || address.len() > MAX_IMPOSTOR_ADDRESS_BYTES
+        || !address.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(InvalidWatchObservation::InvalidAddress);
+    }
+    Ok(())
+}
+
+fn json_value_len(value: &serde_json::Value) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+fn json_array_len(items: &[serde_json::Value]) -> usize {
+    items.iter().fold(2usize.saturating_add(items.len().saturating_sub(1)), |len, item| {
+        len.saturating_add(json_value_len(item))
+    })
+}
+
+fn json_object_len(items: &serde_json::Map<String, serde_json::Value>) -> usize {
+    items.iter().fold(2usize.saturating_add(items.len().saturating_sub(1)), |len, (key, item)| {
+        let key_len = serde_json::to_vec(key).map_or(usize::MAX, |bytes| bytes.len());
+        len.saturating_add(key_len).saturating_add(1).saturating_add(json_value_len(item))
+    })
+}
+
+fn truncate_json_value(value: &mut serde_json::Value, max_bytes: usize) -> bool {
+    if json_value_len(value) <= max_bytes {
+        return false;
+    }
+    match value {
+        serde_json::Value::String(text) => {
+            truncate_text_bytes(text, max_bytes.saturating_sub(2));
+            while serde_json::to_vec(text).is_ok_and(|bytes| bytes.len() > max_bytes) {
+                text.pop();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            while json_array_len(items) > max_bytes {
+                let Some(index) = items.len().checked_sub(1) else { break };
+                let reduced = {
+                    let item = &mut items[index];
+                    let previous_len = json_value_len(item);
+                    truncate_json_value(item, previous_len.saturating_div(2).max(2));
+                    json_value_len(item) < previous_len
+                };
+                if !reduced {
+                    items.pop();
+                }
+            }
+        }
+        serde_json::Value::Object(items) => {
+            while json_object_len(items) > max_bytes {
+                let Some(key) = items
+                    .iter()
+                    .max_by_key(|(key, item)| key.len().saturating_add(json_value_len(item)))
+                    .map(|(key, _)| key.clone())
+                else {
+                    break;
+                };
+                let reduced = {
+                    let Some(item) = items.get_mut(&key) else { break };
+                    let previous_len = json_value_len(item);
+                    truncate_json_value(item, previous_len.saturating_div(2).max(2));
+                    json_value_len(item) < previous_len
+                };
+                if !reduced {
+                    items.remove(&key);
+                }
+            }
+        }
+        _ => {}
+    }
+    if json_value_len(value) > max_bytes {
+        *value = serde_json::Value::Null;
+    }
+    true
+}
+
+fn catalog_absent_entry(
+    chain: Chain,
+    scanned_at: &str,
+    symbol: String,
+    name: String,
+    volume_24h_usd: Option<f64>,
+    source: MarketSource,
+    publisher_catalog_snapshot_hash: Option<String>,
+    mut guard: crate::domain::guard::GuardDocument,
+) -> Result<Option<ImpostorEntry>, InvalidWatchObservation> {
+    if guard.verdict != crate::domain::guard::GuardVerdict::Deny
+        || guard.identity.status != crate::domain::guard::IdentityStatus::Mismatch
+    {
+        return Ok(None);
+    }
+    let Some(reason_index) = guard
+        .reasons
+        .iter()
+        .position(|reason| reason.code == "claims_unpublished_publisher_product")
+    else {
+        return Ok(None);
+    };
+    let (Some(publisher), Some(ticker)) =
+        (guard.identity.publisher.take(), guard.identity.ticker.take())
+    else {
+        return Ok(None);
+    };
+    if !valid_token_address(chain, &guard.address) {
+        return Err(InvalidWatchObservation::InvalidAddress);
+    }
+    if publisher_catalog_snapshot_hash
+        .as_deref()
+        .is_some_and(|hash| !valid_publisher_catalog_snapshot_hash(hash))
+    {
+        return Err(InvalidWatchObservation::InvalidCatalogHash);
+    }
+    let (reads, reads_truncated) = compact_watch_reads(guard.reads.iter(), chain, &guard.address);
+    let evidence_truncated =
+        guard.reads_truncated || reads_truncated || publisher_catalog_snapshot_hash.is_none();
+    let guard_url = format!("/guard/{}/{}", chain_slug(chain), guard.address);
+    let mut entry = ImpostorEntry {
+        chain: chain_slug(chain).to_owned(),
+        chain_label: chain_label(chain).to_owned(),
+        ticker,
+        publisher,
+        symbol,
+        name,
+        address: std::mem::take(&mut guard.address),
+        first_seen_at: scanned_at.to_owned(),
+        last_seen_at: scanned_at.to_owned(),
+        volume_24h_usd,
+        source,
+        guard_url,
+        reason: guard.reasons.swap_remove(reason_index).detail,
+        reads,
+        on_chain_symbol: guard.identity.observed_symbol.take(),
+        on_chain_name: guard.identity.observed_name.take(),
+        publisher_catalog_snapshot_hash,
+        evidence_truncated,
+        guard_document: None,
+    };
+    clip_impostor_entry_text(&mut entry);
+    Ok(Some(entry))
+}
+
+/// Records that the impostor search source returned no usable data. The last successful
+/// results, scan time and search rotation stay unchanged; the outage start is kept until a
+/// scan succeeds.
+fn impostor_source_unavailable(
+    mut previous: ImpostorSnapshot,
+    observed_at: &str,
+) -> ImpostorSnapshot {
+    previous.source_unavailable_since.get_or_insert_with(|| observed_at.to_owned());
+    previous
+}
+
+fn compact_network_id_eq(left: &str, right: &str) -> bool {
+    left.bytes()
+        .filter(u8::is_ascii_alphanumeric)
+        .map(|byte| byte.to_ascii_lowercase())
+        .eq(right.bytes().filter(u8::is_ascii_alphanumeric).map(|byte| byte.to_ascii_lowercase()))
+}
+
+fn watch_network_ids_equal(left: &str, right: &str) -> bool {
+    let left_is_ton =
+        compact_network_id_eq(left, "ton") || compact_network_id_eq(left, "theopennetwork");
+    let right_is_ton =
+        compact_network_id_eq(right, "ton") || compact_network_id_eq(right, "theopennetwork");
+    if left_is_ton || right_is_ton {
+        left_is_ton && right_is_ton
+    } else {
+        compact_network_id_eq(left, right)
+    }
+}
+
+fn normalized_watch_network_id(network: &str) -> String {
+    if compact_network_id_eq(network, "ton") || compact_network_id_eq(network, "theopennetwork") {
+        "ton".to_owned()
+    } else {
+        network
+            .bytes()
+            .filter(u8::is_ascii_alphanumeric)
+            .map(|byte| byte.to_ascii_lowercase())
+            .map(char::from)
+            .collect()
+    }
+}
+
+fn watch_addresses_equal(left: &str, right: &str) -> bool {
+    if left.starts_with("0x") && right.starts_with("0x") {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+fn watch_address_key(address: &str) -> String {
+    if address.starts_with("0x") { address.to_ascii_lowercase() } else { address.to_owned() }
+}
+
+fn official_unsupported_deployment_matches(
+    registry: &Registry,
+    network: &str,
+    address: &str,
+) -> bool {
+    registry.iter().filter(|entry| registry::matchable(entry)).any(|entry| {
+        entry.official_deployments.iter().any(|deployment| {
+            watch_network_ids_equal(network, &deployment.network)
+                && [
+                    Some(deployment.address.as_str()),
+                    deployment.wrapper_address.as_deref(),
+                    deployment.wrapper_address_v2.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|official_address| watch_addresses_equal(official_address, address))
+        })
+    })
+}
+
+fn official_unsupported_deployment_key(network: &str, address: &str) -> (String, String) {
+    (normalized_watch_network_id(network), watch_address_key(address))
+}
+
+async fn refresh_impostor_watch(
+    state: &AppState,
+    client: &MarketDataClient,
+    registry: &Registry,
+    publisher_catalog_snapshot_hash: Option<String>,
+    mut previous: ImpostorSnapshot,
+) -> ImpostorSnapshot {
+    let tickers = {
+        let board = state.leaderboard.read().await;
+        prioritize_search_tickers(registry, &board.entries)
+    };
+    let (searches, next_ticker_offset) =
+        rotating_impostor_search_terms(&tickers, previous.next_ticker_offset);
+    if searches.is_empty() {
+        return previous;
+    }
+    let query_count = searches.len();
+    let mut source_pairs = 0usize;
+    let mut failed_queries = 0usize;
+    let scanned_at = now_rfc3339();
+    let mut candidates = Vec::<(Chain, usize, DexPair)>::new();
+    let mut candidate_keys = HashSet::new();
+    let mut unsupported_keys = HashSet::new();
+    let mut official_unsupported_keys = HashSet::new();
+    let mut official_on_unsupported_chain = 0usize;
+    let mut unsupported_detected = Vec::new();
+    let mut rejected_entries = 0usize;
+    let mut rejected_unsupported_candidates = 0usize;
+    let dex_available = client.dex_available().await;
+    let hot_ticker_count = tickers.len().min(IMPOSTOR_HOT_TICKERS_PER_REFRESH);
+    let mut fallback_tickers = HashSet::new();
+    let mut watch_budget = GeckoWatchBudget::default();
+    let mut searches_made = 0usize;
+    for offset in 0..query_count {
+        if offset > 0 {
+            sleep(REQUEST_INTERVAL).await;
+        }
+        let (ticker, search) = &searches[offset];
+        let ticker_rank =
+            tickers.iter().position(|priority| priority == ticker).unwrap_or(usize::MAX);
+        let mut pairs = Vec::new();
+        if dex_available {
+            searches_made += 1;
+            match client.dex.search(search).await {
+                Ok(found) => pairs = found,
+                Err(error) => {
+                    failed_queries += 1;
+                    warn!(ticker, query = search, error = %error, "DexScreener impostor search failed; checking GeckoTerminal");
+                    if ticker_rank < hot_ticker_count && fallback_tickers.insert(ticker.clone()) {
+                        let product_names = registry_product_names(registry, ticker);
+                        let mut found = search_watch_products(
+                            client,
+                            ticker,
+                            &product_names,
+                            &mut watch_budget,
+                            &mut searches_made,
+                            &mut failed_queries,
+                        )
+                        .await;
+                        pairs.append(&mut found);
+                    }
+                }
+            }
+        } else if ticker_rank < hot_ticker_count && fallback_tickers.insert(ticker.clone()) {
+            let product_names = registry_product_names(registry, ticker);
+            let mut found = search_watch_products(
+                client,
+                ticker,
+                &product_names,
+                &mut watch_budget,
+                &mut searches_made,
+                &mut failed_queries,
+            )
+            .await;
+            pairs.append(&mut found);
+        }
+        source_pairs = source_pairs.saturating_add(pairs.len());
+        for pair in pairs {
+            let Some(symbol) = pair.base_token.symbol.as_deref() else { continue };
+            if !symbol_matches_search_ticker(symbol, ticker) {
+                continue;
+            }
+            let Some(address) = pair.base_token.address.as_deref() else { continue };
+            let Some(chain) = chain_from_dex_id(&pair.chain_id) else {
+                if let Err(rejection) = validate_unsupported_candidate(&pair.chain_id, address) {
+                    tracing::debug!(
+                        rejection = ?rejection,
+                        "rejected invalid unsupported-chain watch candidate"
+                    );
+                    rejected_unsupported_candidates =
+                        rejected_unsupported_candidates.saturating_add(1);
+                    continue;
+                }
+                if official_unsupported_deployment_matches(registry, &pair.chain_id, address) {
+                    if official_unsupported_keys
+                        .insert(official_unsupported_deployment_key(&pair.chain_id, address))
+                    {
+                        official_on_unsupported_chain =
+                            official_on_unsupported_chain.saturating_add(1);
+                    }
+                    continue;
+                }
+                let key = (pair.chain_id.to_ascii_lowercase(), address.to_ascii_lowercase());
+                if unsupported_keys.insert(key) {
+                    let publisher = registry
+                        .iter()
+                        .find(|entry| {
+                            registry::matchable(entry) && entry.ticker.eq_ignore_ascii_case(ticker)
+                        })
+                        .map(|entry| entry.issuer.as_str())
+                        .unwrap_or_default();
+                    let mut candidate = UnsupportedImpostorCandidate {
+                        dex_chain_id: pair.chain_id.clone(),
+                        ticker: ticker.clone(),
+                        publisher: publisher.to_owned(),
+                        symbol: symbol.to_owned(),
+                        name: pair.base_token.name.clone().unwrap_or_default(),
+                        address: address.to_owned(),
+                        first_seen_at: scanned_at.clone(),
+                        last_seen_at: scanned_at.clone(),
+                        volume_24h_usd: pair.volume.as_ref().and_then(|volume| volume.h24),
+                        source: pair.source,
+                        evidence_truncated: false,
+                    };
+                    clip_unsupported_candidate_text(&mut candidate);
+                    unsupported_detected.push(candidate);
+                }
+                continue;
+            };
+            if !valid_token_address(chain, address) {
+                tracing::debug!(
+                    %chain,
+                    rejection = ?InvalidWatchObservation::InvalidAddress,
+                    "rejected invalid publisher-watch candidate"
+                );
+                continue;
+            }
+            if registry::lookup(registry, chain, address).is_some() {
+                continue;
+            }
+            let key = (chain, impostor_address_key(chain, address));
+            if candidate_keys.insert(key) {
+                candidates.push((chain, ticker_rank, pair));
+            }
+        }
+    }
+    if source_pairs == 0 {
+        warn!(
+            searches = searches_made,
+            gecko_requests = watch_budget.requests,
+            failed_queries,
+            "market-data impostor searches returned no pairs; keeping last successful watch results"
+        );
+        return impostor_source_unavailable(previous, &scanned_at);
+    }
+    let candidates = rank_impostor_candidates(candidates);
+    let current_candidate_keys = candidates
+        .iter()
+        .filter_map(|(chain, _, pair)| {
+            pair.base_token
+                .address
+                .as_deref()
+                .map(|address| (*chain, impostor_address_key(*chain, address)))
+        })
+        .collect::<HashSet<_>>();
+
+    let mut previous_entries = std::mem::take(&mut previous.entries);
+    previous_entries.retain(|entry| {
+        Chain::from_network_name(&entry.chain)
+            .is_none_or(|chain| registry::lookup(registry, chain, &entry.address).is_none())
+    });
+    let eligible_previous = previous_entries
+        .iter()
+        .filter(|entry| {
+            let Some(chain) = Chain::from_network_name(&entry.chain) else { return false };
+            !current_candidate_keys.contains(&(chain, impostor_address_key(chain, &entry.address)))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let recheck_count = eligible_previous.len().min(MAX_IMPOSTOR_RECHECKS_PER_REFRESH);
+    let recheck_start = if eligible_previous.is_empty() {
+        0
+    } else {
+        previous.next_entry_offset % eligible_previous.len()
+    };
+    let next_entry_offset = if eligible_previous.is_empty() {
+        0
+    } else {
+        (recheck_start + recheck_count) % eligible_previous.len()
+    };
+    let mut detected = Vec::new();
+    let mut confirmed_official = HashSet::new();
+    let mut guard_checks = 0;
+    for offset in 0..recheck_count {
+        if guard_checks > 0 {
+            sleep(REQUEST_INTERVAL).await;
+        }
+        guard_checks += 1;
+        let previous_entry = &eligible_previous[(recheck_start + offset) % eligible_previous.len()];
+        let Some(chain) = Chain::from_network_name(&previous_entry.chain) else { continue };
+        let guard = match crate::app::guard::create(
+            &state.app,
+            &previous_entry.address,
+            chain,
+            None,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                warn!(%chain, address = %previous_entry.address, error = %error, "Guard could not recheck impostor candidate");
+                continue;
+            }
+        };
+        if guard.identity.status == crate::domain::guard::IdentityStatus::Match {
+            confirmed_official
+                .insert((chain, impostor_address_key(chain, &previous_entry.address)));
+            continue;
+        }
+        match catalog_absent_entry(
+            chain,
+            &scanned_at,
+            previous_entry.symbol.clone(),
+            previous_entry.name.clone(),
+            previous_entry.volume_24h_usd,
+            previous_entry.source,
+            publisher_catalog_snapshot_hash.clone(),
+            guard,
+        ) {
+            Ok(Some(updated)) => detected.push(updated),
+            Err(rejection) => {
+                tracing::debug!(%chain, rejection = ?rejection, "rejected invalid publisher-watch entry");
+                rejected_entries = rejected_entries.saturating_add(1);
+            }
+            Ok(None) => {}
+        }
+    }
+    previous_entries.retain(|entry| {
+        let Some(chain) = Chain::from_network_name(&entry.chain) else { return true };
+        !confirmed_official.contains(&(chain, impostor_address_key(chain, &entry.address)))
+    });
+
+    let new_candidate_limit = MAX_IMPOSTOR_CANDIDATES_PER_REFRESH.saturating_sub(guard_checks);
+    let judged_count = recheck_count + candidates.len().min(new_candidate_limit);
+    for (chain, _ticker_rank, pair) in candidates.into_iter().take(new_candidate_limit) {
+        if guard_checks > 0 {
+            sleep(REQUEST_INTERVAL).await;
+        }
+        guard_checks += 1;
+        let Some(address) = pair.base_token.address.as_deref() else { continue };
+        let guard = match crate::app::guard::create(&state.app, address, chain, None).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                warn!(%chain, address, error = %error, "Guard could not read impostor candidate");
+                continue;
+            }
+        };
+        match catalog_absent_entry(
+            chain,
+            &scanned_at,
+            pair.base_token.symbol.unwrap_or_default(),
+            pair.base_token.name.unwrap_or_default(),
+            pair.volume.as_ref().and_then(|volume| volume.h24),
+            pair.source,
+            publisher_catalog_snapshot_hash.clone(),
+            guard,
+        ) {
+            Ok(Some(entry)) => detected.push(entry),
+            Err(rejection) => {
+                tracing::debug!(%chain, rejection = ?rejection, "rejected invalid publisher-watch entry");
+                rejected_entries = rejected_entries.saturating_add(1);
+            }
+            Ok(None) => {}
+        }
+    }
+    let (entries, evicted_entries) = merge_impostor_entries(previous_entries, detected);
+    let (unsupported_candidates, evicted_unsupported_candidates) = merge_unsupported_candidates(
+        std::mem::take(&mut previous.unsupported_candidates),
+        unsupported_detected,
+    );
+    let unsupported_seen = unsupported_candidates.len();
+    info!(
+        searches = searches_made,
+        gecko_requests = watch_budget.requests,
+        judged = judged_count,
+        impostors = entries.len(),
+        unsupported_seen,
+        evicted_entries,
+        official_on_unsupported_chain,
+        evicted_unsupported_candidates,
+        rejected_entries,
+        rejected_unsupported_candidates,
+        failed_queries,
+        "market-data impostor watch refresh complete"
+    );
+    previous.scanned_at = scanned_at;
+    previous.source_unavailable_since = None;
+    previous.next_ticker_offset = next_ticker_offset;
+    previous.next_entry_offset = next_entry_offset;
+    previous.unsupported_seen = unsupported_seen;
+    previous.official_on_unsupported_chain = official_on_unsupported_chain;
+    previous.evicted_entries = previous.evicted_entries.saturating_add(evicted_entries);
+    previous.evicted_unsupported_candidates =
+        previous.evicted_unsupported_candidates.saturating_add(evicted_unsupported_candidates);
+    previous.rejected_oversize_entries =
+        previous.rejected_oversize_entries.saturating_add(rejected_entries);
+    previous.rejected_oversize_unsupported_candidates = previous
+        .rejected_oversize_unsupported_candidates
+        .saturating_add(rejected_unsupported_candidates);
+    previous.entries = entries;
+    previous.unsupported_candidates = unsupported_candidates;
+    previous
+}
 
 async fn publish_leaderboard(
     state: &AppState,
@@ -1709,7 +3679,11 @@ async fn publish_leaderboard(
     updated_at: &str,
     persist: bool,
 ) {
-    let previous_count = state.leaderboard.read().await.entries.len();
+    let (previous_entries, impostors) = {
+        let board = state.leaderboard.read().await;
+        (board.entries.clone(), board.impostors.clone())
+    };
+    let previous_count = previous_entries.len();
     if entries.is_empty() {
         if previous_count > 0 {
             defer_leaderboard_refresh(
@@ -1731,11 +3705,11 @@ async fn publish_leaderboard(
         board.empty_successful = true;
         return;
     }
-    if !safe_board_replacement(previous_count, entries.len()) {
+    if !safe_leaderboard_replacement(&previous_entries, &entries) {
         defer_leaderboard_refresh(
             state,
             data_dir,
-            "discovery returned too few pools",
+            "discovery returned an incomplete pool set",
             DISCOVERY_REFRESH_SECS,
         )
         .await;
@@ -1754,6 +3728,7 @@ async fn publish_leaderboard(
         restored: false,
         refreshing: false,
         empty_successful: false,
+        impostors,
     };
     if persist {
         save_leaderboard(data_dir, &leaderboard);
@@ -1797,11 +3772,26 @@ async fn refresh_leaderboard(
         .map(|(index, candidate)| provisional_leaderboard_entry(index + 1, candidate))
         .collect::<Vec<_>>();
     let mut shared_checks = HashMap::with_capacity(candidate_count);
+    let transient_retry_keys = state
+        .leaderboard
+        .read()
+        .await
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.read_status == "not_read_yet" && entry.read_reason.as_deref() == Some("transient")
+        })
+        .filter_map(|entry| {
+            chain_from_dex_id(&entry.chain).map(|chain| (chain, entry.pool.to_ascii_lowercase()))
+        })
+        .collect::<HashSet<_>>();
     for (index, candidate) in candidates.into_iter().enumerate() {
         if index > 0 {
             sleep(REQUEST_INTERVAL).await;
         }
-        let result = cached_leaderboard_check(state, &candidate).await;
+        let force_refresh =
+            transient_retry_keys.contains(&(candidate.chain, candidate.pool.to_ascii_lowercase()));
+        let result = cached_leaderboard_check(state, &candidate, force_refresh).await;
         shared_checks
             .insert((candidate.chain, candidate.pool.to_ascii_lowercase()), result.clone());
         entries[index] = leaderboard_entry(index + 1, candidate, result);
@@ -1835,6 +3825,13 @@ pub async fn refresh_discovery(
     }
     let retry_delay = if first_refresh { 30 } else { DISCOVERY_REFRESH_SECS };
     let registry = state.registry.read().await.clone();
+    let publisher_catalog_snapshot_hash = state
+        .app
+        .registry_hash
+        .read()
+        .ok()
+        .map(|hash| hash.clone())
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
     if startup_discovery_waits_for_registry(first_refresh, &registry) {
         defer_leaderboard_refresh(
             state,
@@ -1879,8 +3876,30 @@ pub async fn refresh_discovery(
         }
     };
     let shared_checks = refresh_leaderboard(state, data_dir, &registry, batch.leaderboard).await;
+    if let Err(error) = crate::adapters::web::refresh_stats_snapshot(state).await {
+        warn!(%error, "could not refresh prepared statistics after leaderboard refresh");
+    }
     refresh_featured(state, data_dir, batch.featured, &shared_checks).await;
+    let previous_impostors = state.leaderboard.read().await.impostors.clone();
+    let impostors = refresh_impostor_watch(
+        state,
+        &MarketDataClient::new(state.http.clone()),
+        &registry,
+        publisher_catalog_snapshot_hash,
+        previous_impostors,
+    )
+    .await;
+    let persisted_board = {
+        let mut board = state.leaderboard.write().await;
+        board.impostors = impostors;
+        board.clone()
+    };
+    save_leaderboard(data_dir, &persisted_board);
+    state.board_store.persist_leaderboard(&persisted_board).await;
     crate::app::warm::notify_powers_warm_if_targets(&state.app, warm_notify).await;
+    if let Err(error) = crate::adapters::web::refresh_stats_snapshot(state).await {
+        warn!(%error, "could not refresh prepared statistics snapshot");
+    }
     false
 }
 
@@ -1893,11 +3912,12 @@ fn price_point_from_pair(pair: DexPair) -> Option<PricePoint> {
         change_24h_pct: pair.price_change.and_then(|change| change.h24),
         volume_24h_usd: pair.volume.and_then(|volume| volume.h24),
         liquidity_usd: pair.liquidity.and_then(|liquidity| liquidity.usd),
+        source: pair.source,
     })
 }
 
-/// Merge a DexScreener response into the last ticker snapshot. Keeping points
-/// not present in a response makes a partial upstream failure non-destructive.
+/// Merge market-data pairs into the last ticker snapshot. Keeping points not
+/// present in a response makes a partial upstream failure non-destructive.
 pub fn merge_price_points(
     previous: &[PricePoint],
     pairs: impl IntoIterator<Item = DexPair>,
@@ -1937,13 +3957,13 @@ pub async fn refresh_prices(state: &AppState) -> bool {
         return true;
     }
 
-    let client = DexScreenerClient::new(state.http.clone());
+    let client = MarketDataClient::new(state.http.clone());
     let mut pairs = Vec::new();
     for (chain, pools) in pools_by_chain {
         match client.pairs(chain, &pools).await {
             Ok(mut chain_pairs) => pairs.append(&mut chain_pairs),
             Err(error) if is_dex_blocked(&error) => return false,
-            Err(error) => warn!(%chain, error = %error, "DexScreener price ticker failed"),
+            Err(error) => warn!(%chain, error = %error, "market-data price ticker failed"),
         }
     }
 
@@ -1966,6 +3986,7 @@ pub async fn refresh_prices(state: &AppState) -> bool {
         entry.change_24h_pct = point.change_24h_pct;
         entry.volume_24h_usd = point.volume_24h_usd;
         entry.liquidity_usd = point.liquidity_usd;
+        entry.source = point.source;
     }
     true
 }
@@ -2021,6 +4042,7 @@ pub fn format_balance(raw: &str, decimals: Option<u8>, symbol: Option<&str>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::solana::METAPLEX_METADATA_PROGRAM;
     use crate::domain::{chain::Chain, registry::Entry};
 
     #[test]
@@ -2029,6 +4051,100 @@ mod tests {
             explorer_url(Chain::RobinhoodChain, "0xpool"),
             "https://robinhoodchain.blockscout.com/address/0xpool"
         );
+    }
+
+    #[test]
+    fn public_chain_slug_matches_json_chain_encoding() {
+        for chain in
+            [Chain::Solana, Chain::RobinhoodChain, Chain::Base, Chain::Ethereum, Chain::Bnb]
+        {
+            assert_eq!(
+                serde_json::to_value(chain).expect("chain JSON"),
+                serde_json::json!(chain_slug(chain))
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_cached_legacy_chain_names_and_urls() {
+        let mut board = sample_leaderboard("2026-10-06T00:00:00Z", 1);
+        let pool = "0x0000000000000000000000000000000000000001";
+        board.entries[0].chain = "RobinhoodChain".to_owned();
+        board.entries[0].pool = pool.to_owned();
+        board.entries[0].detail_url = format!("/validated/robinhoodchain/{pool}");
+        board.entries[0].trade_url = format!("https://dexscreener.com/robinhoodchain/{pool}");
+        board.impostors.entries.push(ImpostorEntry {
+            chain: "robinhoodchain".to_owned(),
+            chain_label: "RobinhoodChain".to_owned(),
+            ticker: "NVDA".to_owned(),
+            publisher: "Backed xStocks".to_owned(),
+            symbol: "NVDAx".to_owned(),
+            name: "NVIDIA xStock".to_owned(),
+            address: pool.to_owned(),
+            first_seen_at: "2026-10-06T00:00:00Z".to_owned(),
+            last_seen_at: "2026-10-06T00:00:00Z".to_owned(),
+            volume_24h_usd: None,
+            source: MarketSource::Dexscreener,
+            guard_url: format!("/guard/robinhoodchain/{pool}"),
+            reason: "catalog observation".to_owned(),
+            reads: Vec::new(),
+            on_chain_symbol: None,
+            on_chain_name: None,
+            publisher_catalog_snapshot_hash: None,
+            evidence_truncated: false,
+            guard_document: None,
+        });
+
+        let normalized = normalize_leaderboard(board);
+        let entry = &normalized.entries[0];
+        assert_eq!(entry.chain, "robinhood");
+        assert_eq!(entry.chain_label, "Robinhood Chain");
+        assert_eq!(entry.detail_url, format!("/validated/robinhood/{pool}"));
+        assert_eq!(entry.trade_url, format!("https://dexscreener.com/robinhood/{pool}"));
+        assert_eq!(
+            entry.explorer_url,
+            format!("https://robinhoodchain.blockscout.com/address/{pool}")
+        );
+        let impostor = &normalized.impostors.entries[0];
+        assert_eq!(impostor.chain, "robinhood");
+        assert_eq!(impostor.guard_url, format!("/guard/robinhood/{pool}"));
+    }
+
+    #[test]
+    fn legacy_market_data_rows_default_to_dexscreener() {
+        let mut board = sample_leaderboard("2026-10-07T00:00:00Z", 1);
+        board.impostors.entries.push(ImpostorEntry {
+            chain: "base".to_owned(),
+            chain_label: "Base".to_owned(),
+            ticker: "NVDA".to_owned(),
+            publisher: "Backed xStocks".to_owned(),
+            symbol: "NVDAx".to_owned(),
+            name: "NVIDIA xStock".to_owned(),
+            address: "0x0000000000000000000000000000000000000001".to_owned(),
+            first_seen_at: "2026-10-07T00:00:00Z".to_owned(),
+            last_seen_at: "2026-10-07T00:00:00Z".to_owned(),
+            volume_24h_usd: None,
+            source: MarketSource::Geckoterminal,
+            guard_url: "/guard/base/0x0000000000000000000000000000000000000001".to_owned(),
+            reason: "catalog observation".to_owned(),
+            reads: Vec::new(),
+            on_chain_symbol: None,
+            on_chain_name: None,
+            publisher_catalog_snapshot_hash: None,
+            evidence_truncated: false,
+            guard_document: None,
+        });
+        let mut legacy = serde_json::to_value(board).expect("legacy board value");
+        legacy["entries"][0].as_object_mut().expect("legacy leaderboard row").remove("source");
+        legacy["impostors"]["entries"][0]
+            .as_object_mut()
+            .expect("legacy watch row")
+            .remove("source");
+
+        let restored: Leaderboard =
+            serde_json::from_value(legacy).expect("legacy source-less leaderboard");
+        assert_eq!(restored.entries[0].source, MarketSource::Dexscreener);
+        assert_eq!(restored.impostors.entries[0].source, MarketSource::Dexscreener);
     }
 
     #[derive(Debug, Deserialize)]
@@ -2050,7 +4166,605 @@ mod tests {
             last_checked: "2026-09-22T00:00:00Z".to_owned(),
             removed_at: None,
             stale_since: None,
+            official_deployments: Vec::new(),
         }
+    }
+
+    async fn start_local_discovery_fixture(
+        app: axum::Router,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("fixture listener");
+        let base_url = format!("http://{}", listener.local_addr().expect("fixture address"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("fixture server");
+        });
+        (base_url, server)
+    }
+
+    #[tokio::test]
+    async fn gecko_search_and_discovery_map_recorded_search_token_and_pool_fixtures() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dex_canary_requests = Arc::new(AtomicUsize::new(0));
+        let dex_token_requests = Arc::new(AtomicUsize::new(0));
+        let gecko_search_requests = Arc::new(AtomicUsize::new(0));
+        let gecko_token_requests = Arc::new(AtomicUsize::new(0));
+        let gecko_pool_requests = Arc::new(AtomicUsize::new(0));
+        let bad_accept_headers = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().fallback({
+            let dex_canary_requests = Arc::clone(&dex_canary_requests);
+            let dex_token_requests = Arc::clone(&dex_token_requests);
+            let gecko_search_requests = Arc::clone(&gecko_search_requests);
+            let gecko_token_requests = Arc::clone(&gecko_token_requests);
+            let gecko_pool_requests = Arc::clone(&gecko_pool_requests);
+            let bad_accept_headers = Arc::clone(&bad_accept_headers);
+            move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
+                let path = uri.path().to_owned();
+                if path.starts_with("/api/v2/")
+                    && headers.get(reqwest::header::ACCEPT).and_then(|value| value.to_str().ok())
+                        != Some("application/json")
+                {
+                    bad_accept_headers.fetch_add(1, Ordering::Relaxed);
+                }
+                let dex_canary_requests = Arc::clone(&dex_canary_requests);
+                let dex_token_requests = Arc::clone(&dex_token_requests);
+                let gecko_search_requests = Arc::clone(&gecko_search_requests);
+                let gecko_token_requests = Arc::clone(&gecko_token_requests);
+                let gecko_pool_requests = Arc::clone(&gecko_pool_requests);
+                async move {
+                    let body = match path.as_str() {
+                        "/latest/dex/search" => {
+                            dex_canary_requests.fetch_add(1, Ordering::Relaxed);
+                            r#"{"schemaVersion":"1.0.0","pairs":[]}"#.to_owned()
+                        }
+                        "/api/v2/search/pools" => {
+                            gecko_search_requests.fetch_add(1, Ordering::Relaxed);
+                            include_str!("../../tests/fixtures/discovery/gecko-search-pools.json")
+                                .to_owned()
+                        }
+                        path if path.starts_with("/api/v2/networks/base/tokens/multi/") => {
+                            gecko_token_requests.fetch_add(1, Ordering::Relaxed);
+                            include_str!("../../tests/fixtures/discovery/gecko-token-multi.json")
+                                .to_owned()
+                        }
+                        path if path.starts_with("/api/v2/networks/base/pools/multi/") => {
+                            gecko_pool_requests.fetch_add(1, Ordering::Relaxed);
+                            include_str!("../../tests/fixtures/discovery/gecko-pool-multi.json")
+                                .to_owned()
+                        }
+                        path if path.starts_with("/tokens/v1/") => {
+                            dex_token_requests.fetch_add(1, Ordering::Relaxed);
+                            "[]".to_owned()
+                        }
+                        _ => return (axum::http::StatusCode::NOT_FOUND, String::new()),
+                    };
+                    (axum::http::StatusCode::OK, body)
+                }
+            }
+        });
+        let (base_url, server) = start_local_discovery_fixture(app).await;
+        let http = reqwest::Client::new();
+        let gecko = GeckoTerminalClient::with_base_url(http.clone(), format!("{base_url}/api/v2"));
+        let search_pairs = gecko
+            .search("NVIDIA xStock", "base", None)
+            .await
+            .expect("recorded GeckoTerminal search response");
+        assert_eq!(search_pairs.len(), 1);
+        let search_pair = &search_pairs[0];
+        assert_eq!(search_pair.source, MarketSource::Geckoterminal);
+        assert_eq!(search_pair.base_token.symbol.as_deref(), Some("NVDAx"));
+        assert_eq!(search_pair.quote_token.symbol.as_deref(), Some("USDC"));
+        assert_eq!(search_pair.price_usd, Some(132.5));
+        assert_eq!(search_pair.volume.as_ref().and_then(|volume| volume.h24), Some(12_345.67));
+        assert_eq!(
+            search_pair.liquidity.as_ref().and_then(|liquidity| liquidity.usd),
+            Some(456_789.01)
+        );
+        assert_eq!(
+            search_pair.url.as_deref(),
+            Some(
+                "https://www.geckoterminal.com/base/pools/0x0000000000000000000000000000000000000001"
+            )
+        );
+
+        let registry =
+            vec![entry(Chain::Base, "0x0000000000000000000000000000000000000011", "NVDA")];
+        let client = MarketDataClient {
+            dex: DexScreenerClient::with_base_url(http.clone(), base_url.clone()),
+            gecko,
+            availability: Arc::new(Mutex::new(DexAvailability::default())),
+        };
+        let mut gecko_budget = GeckoRegistryBudget::default();
+        let discovered = client
+            .registry_pools(
+                Chain::Base,
+                &["0x0000000000000000000000000000000000000011".to_owned()],
+                &registry,
+                &mut gecko_budget,
+            )
+            .await
+            .expect("empty canary should route discovery through GeckoTerminal");
+        assert_eq!(dex_canary_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(dex_token_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(gecko_search_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(gecko_token_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(gecko_pool_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(bad_accept_headers.load(Ordering::Relaxed), 0);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].base_token.symbol.as_deref(), Some("NVDAx"));
+        assert_eq!(discovered[0].source, MarketSource::Geckoterminal);
+        server.abort();
+    }
+
+    #[test]
+    fn gecko_uniswap_v4_pool_maps_to_robinhood_leaderboard_candidate() {
+        let response: GeckoApiResponse = serde_json::from_str(include_str!(
+            "../../tests/fixtures/discovery/gecko-pool-robinhood-v4.json"
+        ))
+        .expect("recorded Robinhood V4 pool fixture");
+        let pairs = gecko_pools_to_pairs(response, "robinhood");
+        assert_eq!(pairs.len(), 1);
+        let pair = &pairs[0];
+        let pool = "0x6444a8e0b267406a15db74ca00c4a24bdfa81ed3180f5b6d0851f8ed6f4f29c5";
+        assert_eq!(pair.pair_address, pool);
+        assert_eq!(pair.dex_id, "uniswap");
+        assert_eq!(pair.labels, vec!["v4".to_owned()]);
+        assert!(valid_pair_address(Chain::RobinhoodChain, pair));
+
+        let registry = vec![entry(
+            Chain::RobinhoodChain,
+            "0x0000000000000000000000000000000000000011",
+            "NVDA",
+        )];
+        let candidate = leaderboard_candidate_from_pair(pair, &registry)
+            .expect("Robinhood V4 pool should survive leaderboard candidate validation");
+        assert_eq!(candidate.chain, Chain::RobinhoodChain);
+        assert_eq!(candidate.pool, pool);
+        assert_eq!(candidate.dex, "uniswap");
+        assert_eq!(candidate.source, MarketSource::Geckoterminal);
+        assert_eq!(
+            candidate.trade_url,
+            format!("https://www.geckoterminal.com/robinhood/pools/{pool}")
+        );
+
+        let mut name_only_response: GeckoApiResponse = serde_json::from_str(include_str!(
+            "../../tests/fixtures/discovery/gecko-pool-robinhood-v4.json"
+        ))
+        .expect("recorded Robinhood V4 pool fixture");
+        let dex = name_only_response
+            .included
+            .iter_mut()
+            .find(|entity| entity.id == "robinhood_uniswap-v4")
+            .expect("included V4 DEX");
+        dex.attributes["identifier"] = serde_json::json!("uniswap-v2");
+        let name_mapped = gecko_pools_to_pairs(name_only_response, "robinhood");
+        assert_eq!(name_mapped[0].dex_id, "uniswap");
+        assert_eq!(name_mapped[0].labels, vec!["v4".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn gecko_fallback_runs_after_a_dexscreener_http_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dex_errors = Arc::new(AtomicUsize::new(0));
+        let gecko_requests = Arc::new(AtomicUsize::new(0));
+        let bad_accept_headers = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().fallback({
+            let dex_errors = Arc::clone(&dex_errors);
+            let gecko_requests = Arc::clone(&gecko_requests);
+            let bad_accept_headers = Arc::clone(&bad_accept_headers);
+            move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
+                let path = uri.path().to_owned();
+                if path.starts_with("/api/v2/")
+                    && headers.get(reqwest::header::ACCEPT).and_then(|value| value.to_str().ok())
+                        != Some("application/json")
+                {
+                    bad_accept_headers.fetch_add(1, Ordering::Relaxed);
+                }
+                let dex_errors = Arc::clone(&dex_errors);
+                let gecko_requests = Arc::clone(&gecko_requests);
+                async move {
+                    if path.starts_with("/latest/dex/pairs/") {
+                        dex_errors.fetch_add(1, Ordering::Relaxed);
+                        return (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            "fixture outage".to_owned(),
+                        );
+                    }
+                    if path.starts_with("/api/v2/networks/base/pools/multi/") {
+                        gecko_requests.fetch_add(1, Ordering::Relaxed);
+                        return (
+                            axum::http::StatusCode::OK,
+                            include_str!("../../tests/fixtures/discovery/gecko-pool-multi.json")
+                                .to_owned(),
+                        );
+                    }
+                    (axum::http::StatusCode::NOT_FOUND, String::new())
+                }
+            }
+        });
+        let (base_url, server) = start_local_discovery_fixture(app).await;
+        let http = reqwest::Client::new();
+        let client = MarketDataClient {
+            dex: DexScreenerClient::with_base_url(http.clone(), base_url.clone()),
+            gecko: GeckoTerminalClient::with_base_url(http, format!("{base_url}/api/v2")),
+            availability: Arc::new(Mutex::new(DexAvailability {
+                checked_at: Some(Instant::now()),
+                available: true,
+            })),
+        };
+        let pairs = client
+            .pairs(Chain::Base, &["0x0000000000000000000000000000000000000001".to_owned()])
+            .await
+            .expect("DexScreener HTTP errors should use GeckoTerminal");
+        assert_eq!(dex_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(gecko_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(bad_accept_headers.load(Ordering::Relaxed), 0);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].source, MarketSource::Geckoterminal);
+        assert_eq!(
+            canonical_market_url_for_source(
+                Chain::Base,
+                &pairs[0].pair_address,
+                pairs[0].url.as_deref(),
+                pairs[0].source,
+            ),
+            "https://www.geckoterminal.com/base/pools/0x0000000000000000000000000000000000000001"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn gecko_budget_waits_for_capacity_and_applies_429_backoff() {
+        let start = Instant::now();
+        let mut budget = GeckoBudget::default();
+        for _ in 0..GECKOTERMINAL_CALLS_PER_MINUTE {
+            assert_eq!(budget.delay_or_acquire(start), None);
+        }
+        assert_eq!(budget.delay_or_acquire(start), Some(GECKOTERMINAL_WINDOW));
+        budget.backoff(start);
+        assert_eq!(budget.delay_or_acquire(start), Some(GECKOTERMINAL_BACKOFF));
+        assert_eq!(budget.delay_or_acquire(start + GECKOTERMINAL_BACKOFF), None);
+    }
+
+    #[tokio::test]
+    async fn gecko_client_retries_a_429_after_backoff() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().fallback({
+            let requests = Arc::clone(&requests);
+            move |uri: axum::http::Uri| {
+                let path = uri.path().to_owned();
+                let requests = Arc::clone(&requests);
+                async move {
+                    if path == "/api/v2/search/pools" {
+                        if requests.fetch_add(1, Ordering::Relaxed) == 0 {
+                            return (axum::http::StatusCode::TOO_MANY_REQUESTS, String::new());
+                        }
+                        return (axum::http::StatusCode::OK, r#"{"data":[]}"#.to_owned());
+                    }
+                    (axum::http::StatusCode::NOT_FOUND, String::new())
+                }
+            }
+        });
+        let (base_url, server) = start_local_discovery_fixture(app).await;
+        let client = GeckoTerminalClient::with_base_url(
+            reqwest::Client::new(),
+            format!("{base_url}/api/v2"),
+        );
+        {
+            let mut budget = client.budget.lock().await;
+            budget.request_limit = usize::MAX;
+            budget.backoff_duration = Duration::ZERO;
+        }
+        let pairs = client
+            .search("NVIDIA xStock", "robinhood", None)
+            .await
+            .expect("GeckoTerminal should retry one rate-limited request");
+        assert!(pairs.is_empty());
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gecko_registry_caps_requests_and_validated_pool_ids() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let token_requests = Arc::new(AtomicUsize::new(0));
+        let next_pool_id = Arc::new(AtomicUsize::new(0));
+        let pool_paths = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let app = axum::Router::new().fallback({
+            let token_requests = Arc::clone(&token_requests);
+            let next_pool_id = Arc::clone(&next_pool_id);
+            let pool_paths = Arc::clone(&pool_paths);
+            move |uri: axum::http::Uri| {
+                let path = uri.path().to_owned();
+                let token_requests = Arc::clone(&token_requests);
+                let next_pool_id = Arc::clone(&next_pool_id);
+                let pool_paths = Arc::clone(&pool_paths);
+                async move {
+                    if let Some(addresses) = path
+                        .split("/tokens/multi/")
+                        .nth(1)
+                        .filter(|_| path.contains("/tokens/multi/"))
+                    {
+                        token_requests.fetch_add(1, Ordering::Relaxed);
+                        let addresses = addresses.replace("%2C", ",").replace("%2c", ",");
+                        let data = addresses
+                            .split(',')
+                            .map(|address| {
+                                let sequence = next_pool_id.fetch_add(1, Ordering::Relaxed);
+                                let mut top_pools = vec![serde_json::json!({
+                                    "id": format!("base_0x{:040x}", sequence + 1)
+                                })];
+                                if sequence == 0 {
+                                    top_pools.push(serde_json::json!({"id": "base_not-a-pool"}));
+                                }
+                                serde_json::json!({
+                                    "id": format!("base_{address}"),
+                                    "attributes": {"address": address},
+                                    "relationships": {
+                                        "top_pools": {"data": top_pools}
+                                    }
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        return (
+                            axum::http::StatusCode::OK,
+                            serde_json::json!({"data": data}).to_string(),
+                        );
+                    }
+                    if path.starts_with("/api/v2/networks/base/pools/multi/") {
+                        pool_paths.lock().expect("pool request log").push(path);
+                        return (axum::http::StatusCode::OK, r#"{"data":[]}"#.to_owned());
+                    }
+                    (axum::http::StatusCode::NOT_FOUND, String::new())
+                }
+            }
+        });
+        let (base_url, server) = start_local_discovery_fixture(app).await;
+        let client = GeckoTerminalClient::with_base_url(
+            reqwest::Client::new(),
+            format!("{base_url}/api/v2"),
+        );
+        client.budget.lock().await.request_limit = usize::MAX;
+        let addresses = (0..630).map(|index| format!("0x{:040x}", index + 1)).collect::<Vec<_>>();
+        let registry = Registry::new();
+        let mut refresh_budget = GeckoRegistryBudget::default();
+        let pairs = client
+            .registry_pools(Chain::Base, &addresses, &registry, &mut refresh_budget)
+            .await
+            .expect("bounded GeckoTerminal registry discovery");
+        assert!(pairs.is_empty());
+        let pool_paths = pool_paths.lock().expect("pool request log").clone();
+        assert_eq!(token_requests.load(Ordering::Relaxed), 4);
+        assert_eq!(pool_paths.len(), 2);
+        assert_eq!(refresh_budget.requests, 6);
+        assert_eq!(refresh_budget.pool_ids.len(), 60);
+        let mut requested_pool_ids = Vec::new();
+        for path in pool_paths {
+            let addresses = path.rsplit('/').next().expect("pool multi path");
+            let addresses = addresses.replace("%2C", ",").replace("%2c", ",");
+            requested_pool_ids.extend(addresses.split(',').map(str::to_owned));
+        }
+        assert_eq!(requested_pool_ids.len(), 60);
+        assert_eq!(requested_pool_ids.iter().collect::<HashSet<_>>().len(), 60);
+        assert!(
+            requested_pool_ids.iter().all(|address| valid_gecko_pool_address(Chain::Base, address))
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn gecko_registry_budget_covers_each_network_within_the_global_caps() {
+        let chains =
+            [Chain::Solana, Chain::RobinhoodChain, Chain::Base, Chain::Ethereum, Chain::Bnb];
+        let mut budget = GeckoRegistryBudget::default();
+        for chain in chains {
+            for _ in 0..GECKOTERMINAL_REGISTRY_TOKEN_REQUESTS_PER_CHAIN {
+                assert!(budget.try_acquire(chain, GeckoRegistryRequest::Tokens));
+            }
+            assert!(!budget.try_acquire(chain, GeckoRegistryRequest::Tokens));
+            for _ in 0..GECKOTERMINAL_REGISTRY_POOL_REQUESTS_PER_CHAIN {
+                assert!(budget.try_acquire(chain, GeckoRegistryRequest::Pools));
+            }
+            assert!(!budget.try_acquire(chain, GeckoRegistryRequest::Pools));
+
+            let network = gecko_network_id(chain).expect("supported GeckoTerminal network");
+            for index in 0..GECKOTERMINAL_REGISTRY_POOL_IDS_PER_CHAIN {
+                let address = format!("0x{index:040x}");
+                assert!(budget.try_add_pool_id(chain, network, &address));
+            }
+            let excess = format!("0x{:040x}", GECKOTERMINAL_REGISTRY_POOL_IDS_PER_CHAIN);
+            assert!(!budget.try_add_pool_id(chain, network, &excess));
+        }
+        assert_eq!(budget.requests, GECKOTERMINAL_REGISTRY_REQUESTS_PER_REFRESH);
+        assert_eq!(budget.pool_ids.len(), GECKOTERMINAL_REGISTRY_POOL_IDS_PER_REFRESH);
+    }
+
+    #[tokio::test]
+    async fn watch_fallback_searches_each_product_name_across_networks_without_judging_unsupported()
+    {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dex_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = axum::Router::new().fallback({
+            let requests = Arc::clone(&requests);
+            let dex_requests = Arc::clone(&dex_requests);
+            move |uri: axum::http::Uri| {
+                let path = uri.path().to_owned();
+                let url =
+                    reqwest::Url::parse(&format!("http://fixture{uri}")).expect("fixture URL");
+                let mut query = String::new();
+                let mut network = String::new();
+                for (key, value) in url.query_pairs() {
+                    match key.as_ref() {
+                        "query" => query = value.into_owned(),
+                        "network" => network = value.into_owned(),
+                        _ => {}
+                    }
+                }
+                if path.starts_with("/latest/dex/") {
+                    dex_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if path == "/api/v2/search/pools" {
+                    requests.lock().expect("fixture request log").push((query, network.clone()));
+                }
+                async move {
+                    if path == "/api/v2/search/pools" {
+                        let body = if network == "arc" {
+                            include_str!("../../tests/fixtures/discovery/gecko-search-pools.json")
+                        } else {
+                            r#"{"data":[]}"#
+                        };
+                        return (axum::http::StatusCode::OK, body.to_owned());
+                    }
+                    (axum::http::StatusCode::NOT_FOUND, String::new())
+                }
+            }
+        });
+        let (base_url, server) = start_local_discovery_fixture(app).await;
+        let mut nvda = entry(Chain::Base, "0x0000000000000000000000000000000000000011", "NVDA");
+        nvda.name = "NVIDIA xStock".to_owned();
+        let mut robinhood_nvda =
+            entry(Chain::RobinhoodChain, "0x0000000000000000000000000000000000000012", "NVDA");
+        robinhood_nvda.name = "NVIDIA Robinhood Token".to_owned();
+        let state = AppState::for_tests(vec![nvda, robinhood_nvda], Vec::new(), true);
+        let registry = state.registry.read().await.clone();
+        let http = state.http.clone();
+        let gecko = GeckoTerminalClient::with_base_url(http, format!("{base_url}/api/v2"));
+        gecko.budget.lock().await.request_limit = 100;
+        let client = MarketDataClient::with_clients(
+            DexScreenerClient::with_base_url(state.http.clone(), base_url.clone()),
+            gecko,
+            false,
+        );
+
+        let snapshot = refresh_impostor_watch(
+            &state,
+            &client,
+            &registry,
+            Some("d".repeat(64)),
+            ImpostorSnapshot::default(),
+        )
+        .await;
+        let requests = requests.lock().expect("fixture request log").clone();
+        assert_eq!(dex_requests.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(requests.len(), 2 * GECKOTERMINAL_WATCH_NETWORKS.len());
+        let mut expected = Vec::new();
+        for product_name in ["NVIDIA xStock", "NVIDIA Robinhood Token"] {
+            for network in GECKOTERMINAL_WATCH_NETWORKS {
+                expected.push((product_name.to_owned(), network.to_owned()));
+            }
+        }
+        assert_eq!(
+            requests.into_iter().collect::<HashSet<_>>(),
+            expected.into_iter().collect::<HashSet<_>>()
+        );
+        assert!(snapshot.entries.is_empty());
+        assert_eq!(snapshot.unsupported_seen, 1);
+        assert_eq!(snapshot.unsupported_candidates.len(), 1);
+        assert_eq!(snapshot.unsupported_candidates[0].dex_chain_id, "arc");
+        assert_eq!(snapshot.unsupported_candidates[0].source, MarketSource::Geckoterminal);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn watch_counts_and_excludes_official_ton_spyx_deployment() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = axum::Router::new().fallback({
+            let requests = Arc::clone(&requests);
+            move |uri: axum::http::Uri| {
+                let path = uri.path().to_owned();
+                let url =
+                    reqwest::Url::parse(&format!("http://fixture{uri}")).expect("fixture URL");
+                let mut query = String::new();
+                let mut network = String::new();
+                for (key, value) in url.query_pairs() {
+                    match key.as_ref() {
+                        "query" => query = value.into_owned(),
+                        "network" => network = value.into_owned(),
+                        _ => {}
+                    }
+                }
+                if path == "/api/v2/search/pools" {
+                    requests.lock().expect("fixture request log").push((query, network.clone()));
+                }
+                async move {
+                    if path == "/api/v2/search/pools" {
+                        let body = if network == "ton" {
+                            include_str!(
+                                "../../tests/fixtures/discovery/gecko-search-pools-ton-spyx.json"
+                            )
+                        } else {
+                            r#"{"data":[]}"#
+                        };
+                        return (axum::http::StatusCode::OK, body.to_owned());
+                    }
+                    (axum::http::StatusCode::NOT_FOUND, String::new())
+                }
+            }
+        });
+        let (base_url, server) = start_local_discovery_fixture(app).await;
+        let mut spy = entry(Chain::Base, "0x0000000000000000000000000000000000000012", "SPY");
+        spy.name = "SPY xStock".to_owned();
+        spy.official_deployments = vec![crate::domain::registry::OfficialDeployment {
+            network: "The Open Network".to_owned(),
+            address: "EQB1fyBAA9qQDP6LEGaF3cbU-Xbr-p6ESBZGnqlHkHIHAJZv".to_owned(),
+            wrapper_address: Some("EQB1fyBAA9qQDP6LEGaF3cbU-Xbr-p6ESBZGnqlHkHIHAJZ1".to_owned()),
+            wrapper_address_v2: Some("EQB1fyBAA9qQDP6LEGaF3cbU-Xbr-p6ESBZGnqlHkHIHAJZ2".to_owned()),
+        }];
+        let state = AppState::for_tests(vec![spy], Vec::new(), true);
+        let registry = state.registry.read().await.clone();
+        let http = state.http.clone();
+        let client = MarketDataClient::with_clients(
+            DexScreenerClient::with_base_url(http.clone(), base_url.clone()),
+            GeckoTerminalClient::with_base_url(http, format!("{base_url}/api/v2")),
+            false,
+        );
+
+        let snapshot = refresh_impostor_watch(
+            &state,
+            &client,
+            &registry,
+            Some("d".repeat(64)),
+            ImpostorSnapshot::default(),
+        )
+        .await;
+        let requests = requests.lock().expect("fixture request log").clone();
+        assert_eq!(requests.len(), GECKOTERMINAL_WATCH_NETWORKS.len());
+        assert_eq!(
+            requests,
+            GECKOTERMINAL_WATCH_NETWORKS
+                .iter()
+                .map(|network| ("SPY xStock".to_owned(), (*network).to_owned()))
+                .collect::<Vec<_>>()
+        );
+        assert!(snapshot.entries.is_empty());
+        assert_eq!(snapshot.official_on_unsupported_chain, 1);
+        assert_eq!(snapshot.unsupported_seen, 0);
+        assert!(snapshot.unsupported_candidates.is_empty());
+        server.abort();
+    }
+
+    #[test]
+    fn official_unsupported_deployment_match_checks_address_and_wrappers() {
+        let address = "EQB1fyBAA9qQDP6LEGaF3cbU-Xbr-p6ESBZGnqlHkHIHAJZv";
+        let wrapper = "EQB1fyBAA9qQDP6LEGaF3cbU-Xbr-p6ESBZGnqlHkHIHAJZ1";
+        let wrapper_v2 = "EQB1fyBAA9qQDP6LEGaF3cbU-Xbr-p6ESBZGnqlHkHIHAJZ2";
+        let mut spy = entry(Chain::Base, "0x0000000000000000000000000000000000000012", "SPY");
+        spy.official_deployments = vec![crate::domain::registry::OfficialDeployment {
+            network: "TON".to_owned(),
+            address: address.to_owned(),
+            wrapper_address: Some(wrapper.to_owned()),
+            wrapper_address_v2: Some(wrapper_v2.to_owned()),
+        }];
+        let registry = vec![spy];
+
+        assert!(official_unsupported_deployment_matches(&registry, "ton", address));
+        assert!(official_unsupported_deployment_matches(&registry, "The Open Network", wrapper));
+        assert!(official_unsupported_deployment_matches(&registry, "ton", wrapper_v2));
     }
 
     #[tokio::test]
@@ -2103,9 +4817,13 @@ mod tests {
             pool: format!("rank-{rank}"),
             base_symbol: String::new(),
             quote_symbol: String::new(),
+            source: MarketSource::Dexscreener,
             issuer: None,
             ticker: Some(ticker.to_owned()),
+            issuer_on_base: None,
             verdict: "unknown".to_owned(),
+            read_status: "checked".to_owned(),
+            read_reason: None,
             price_usd: None,
             change_24h_pct: None,
             volume_24h_usd: None,
@@ -2167,9 +4885,13 @@ mod tests {
             pool: pool.to_owned(),
             base_symbol: "NVDA".to_owned(),
             quote_symbol: "USDC".to_owned(),
+            source: MarketSource::Dexscreener,
             issuer: Some("Backed xStocks".to_owned()),
             ticker: Some("NVDA".to_owned()),
+            issuer_on_base: None,
             verdict: "verified".to_owned(),
+            read_status: "checked".to_owned(),
+            read_reason: None,
             price_usd: None,
             change_24h_pct: None,
             volume_24h_usd: None,
@@ -2237,8 +4959,12 @@ mod tests {
                 base_symbol: "NVDA".to_owned(),
                 quote_symbol: "USDC".to_owned(),
                 issuer: Some("Backed xStocks".to_owned()),
+                source: MarketSource::Dexscreener,
                 ticker: Some("NVDA".to_owned()),
+                issuer_on_base: None,
                 verdict: "verified".to_owned(),
+                read_status: "checked".to_owned(),
+                read_reason: None,
                 price_usd: None,
                 change_24h_pct: None,
                 volume_24h_usd: None,
@@ -2339,14 +5065,14 @@ mod tests {
     }
 
     #[test]
-    fn first_discovery_delay_uses_earliest_due_board() {
+    fn first_discovery_runs_immediately_for_restored_boards() {
         let now = DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z")
             .expect("fixed timestamp parses")
             .with_timezone(&Utc);
         let older = restored_discovery_delay("2026-09-30T07:00:00Z", true, now);
         let newer = restored_discovery_delay("2026-09-30T11:00:00Z", true, now);
 
-        assert_eq!(first_discovery_delay(older, newer), Some(Duration::from_secs(60 * 60)));
+        assert_eq!(first_discovery_delay(older, newer), Some(Duration::ZERO));
         assert_eq!(first_discovery_delay(older, None), None);
         assert_eq!(first_discovery_delay(None, newer), None);
     }
@@ -2527,6 +5253,7 @@ mod tests {
             checked_at: "2026-09-22T00:00:00Z".to_owned(),
             attestation_id: None,
             powers: None,
+            read_issue: Some(crate::domain::check::CheckReadIssue::Transient),
         };
 
         let card = featured_from_check(candidate.clone(), result.clone());
@@ -2591,6 +5318,7 @@ mod tests {
                 h24: Some(DexTxnWindow { buys: Some(4), sells: Some(6) }),
             }),
             liquidity: Some(DexLiquidity { usd: Some(500.0), base: None, quote: None }),
+            source: MarketSource::Dexscreener,
         }
     }
 
@@ -2695,10 +5423,41 @@ mod tests {
             .expect("official Ethereum NVDA v4 pair is retained");
         assert_eq!(candidate.chain, Chain::Ethereum);
         assert_eq!(candidate.ticker.as_deref(), Some("NVDA"));
+        assert!(!candidate.issuer_on_base);
         assert_eq!(
             candidate.trade_url,
             format!("https://dexscreener.com/ethereum/0x{}", "ab".repeat(32))
         );
+    }
+    #[test]
+    fn dex_screener_labels_accept_64_bytes_and_reject_65() {
+        let stock_address = fixture_address("stock-token");
+        let registry = vec![entry(Chain::Solana, &stock_address, "STOCK")];
+        let label = "x".repeat(64);
+        let mut pair = leaderboard_pair("bounded-labels", Chain::Solana, Some(2.0));
+        pair.dex_id = label.clone();
+        pair.base_token.symbol = Some(label.clone());
+        pair.base_token.name = Some(label.clone());
+        pair.quote_token.symbol = Some(label.clone());
+        pair.quote_token.name = Some(label);
+
+        assert_eq!(leaderboard_candidates_from_pairs(&registry, [pair.clone()]).len(), 1);
+        for field in 0..5 {
+            let mut oversized = pair.clone();
+            let label = "x".repeat(65);
+            match field {
+                0 => oversized.dex_id = label,
+                1 => oversized.base_token.symbol = Some(label),
+                2 => oversized.base_token.name = Some(label),
+                3 => oversized.quote_token.symbol = Some(label),
+                4 => oversized.quote_token.name = Some(label),
+                _ => unreachable!(),
+            }
+            assert!(
+                leaderboard_candidates_from_pairs(&registry, [oversized]).is_empty(),
+                "overlong DexScreener field {field} must be rejected"
+            );
+        }
     }
 
     fn leaderboard_candidate(
@@ -2714,13 +5473,72 @@ mod tests {
             quote_symbol: "STOCKx".to_owned(),
             issuer: Some("Issuer".to_owned()),
             ticker: Some("STOCK".to_owned()),
+            issuer_on_base: false,
             price_usd: Some(1.0),
             change_24h_pct: None,
             volume_24h_usd: volume,
             liquidity_usd: None,
             txns_24h: None,
             trade_url: "https://example.invalid".to_owned(),
+            source: MarketSource::Dexscreener,
         }
+    }
+    struct TransientPositionReader(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl crate::ports::ChainReader for TransientPositionReader {
+        fn chain(&self) -> Chain {
+            Chain::Base
+        }
+
+        async fn read_pool(
+            &self,
+            _address: &str,
+        ) -> Result<PoolInfo, crate::domain::pool::PoolError> {
+            Err(crate::domain::pool::PoolError::Unknown("not a pool".to_owned()))
+        }
+
+        async fn code_at(&self, _address: &str) -> Result<Vec<u8>, crate::domain::pool::PoolError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(vec![1])
+        }
+
+        async fn record_position(&self) -> Result<(), crate::domain::pool::PoolError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(crate::domain::pool::PoolError::Reader("temporary timeout".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_leaderboard_read_is_retried_on_the_next_refresh() {
+        let pool = "0x0000000000000000000000000000000000000011";
+        let registry =
+            vec![entry(Chain::Base, "0x0000000000000000000000000000000000000022", "NVDA")];
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = crate::adapters::state::AppState::for_tests(
+            registry.clone(),
+            vec![Box::new(TransientPositionReader(std::sync::Arc::clone(&reads)))],
+            false,
+        );
+        let initial = check::check(&state.app, pool).await;
+        let candidate = leaderboard_candidate(Chain::Base, pool, None);
+        let initial_entry = leaderboard_entry(1, candidate.clone(), initial.clone());
+        assert_eq!(initial_entry.read_status, "not_read_yet");
+        assert_eq!(initial_entry.read_reason.as_deref(), Some("transient"));
+        state
+            .leaderboard_check_cache
+            .insert((Chain::Base, pool.to_ascii_lowercase()), initial)
+            .await;
+        *state.leaderboard.write().await =
+            Leaderboard { total: 1, entries: vec![initial_entry], ..Leaderboard::default() };
+
+        let directory = tempfile::tempdir().expect("temporary leaderboard directory");
+        refresh_leaderboard(&state, directory.path(), &registry, vec![candidate]).await;
+
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 4);
+        let refreshed = state.leaderboard.read().await;
+        assert_eq!(refreshed.entries[0].read_status, "not_read_yet");
+        assert_eq!(refreshed.entries[0].read_reason.as_deref(), Some("transient"));
     }
 
     #[test]
@@ -2823,6 +5641,166 @@ mod tests {
         );
     }
 
+    #[test]
+    fn publisher_catalog_search_matches_only_ticker_or_ticker_x() {
+        for symbol in ["NVDA", "nvda", "NVDAx", "nvdax", " NVDAx "] {
+            assert!(symbol_matches_search_ticker(symbol, "NVDA"), "{symbol}");
+        }
+        for symbol in ["XNVD", "NVDAxx", "NVDA X", "NVDA+"] {
+            assert!(!symbol_matches_search_ticker(symbol, "NVDA"), "{symbol}");
+        }
+    }
+
+    #[test]
+    fn publisher_catalog_search_uses_unique_active_tickers() {
+        let mut removed = entry(Chain::Base, "removed", "OLD");
+        removed.removed_at = Some("2026-09-22T00:00:00Z".to_owned());
+        let tickers = active_search_tickers(&vec![
+            entry(Chain::Base, "tsla-base", "TSLA"),
+            entry(Chain::Ethereum, "nvda-eth", "NVDA"),
+            entry(Chain::Base, "nvda-base", "nvda"),
+            removed,
+        ]);
+        assert_eq!(tickers, vec!["NVDA", "TSLA"]);
+    }
+
+    #[test]
+    fn publisher_catalog_search_prioritizes_leaderboard_volume_and_queries_ticker_variants() {
+        let registry = vec![entry(Chain::Base, "tsla", "TSLA"), entry(Chain::Base, "nvda", "NVDA")];
+        let mut board = sample_leaderboard("2026-10-06T00:00:00Z", 2);
+        board.entries[0].base_symbol = "TSLAx".to_owned();
+        board.entries[0].volume_24h_usd = Some(10.0);
+        board.entries[1].base_symbol = "NVDAx".to_owned();
+        board.entries[1].volume_24h_usd = Some(100.0);
+        let tickers = prioritize_search_tickers(&registry, &board.entries);
+        assert_eq!(tickers, vec!["NVDA", "TSLA"]);
+        let (searches, next_offset) = rotating_impostor_search_terms(&tickers, 0);
+        assert_eq!(next_offset, 0);
+        assert_eq!(
+            searches,
+            vec![
+                ("NVDA".to_owned(), "NVDA".to_owned()),
+                ("NVDA".to_owned(), "NVDAx".to_owned()),
+                ("TSLA".to_owned(), "TSLA".to_owned()),
+                ("TSLA".to_owned(), "TSLAx".to_owned()),
+            ]
+        );
+    }
+    #[test]
+    fn hot_watch_tickers_are_reserved_while_tail_searches_rotate() {
+        let tickers = (0..50).map(|index| format!("T{index:02}")).collect::<Vec<_>>();
+        let (first, first_offset) = rotating_impostor_search_terms(&tickers, 0);
+        let (second, second_offset) = rotating_impostor_search_terms(&tickers, first_offset);
+
+        assert_eq!(first.len(), MAX_IMPOSTOR_SEARCHES_PER_REFRESH);
+        assert_eq!(second.len(), MAX_IMPOSTOR_SEARCHES_PER_REFRESH);
+        assert_eq!(first_offset, 30);
+        assert_eq!(second_offset, 60);
+        for ticker in &tickers[..IMPOSTOR_HOT_TICKERS_PER_REFRESH] {
+            assert!(first[..20].contains(&(ticker.clone(), ticker.clone())));
+            assert!(first[..20].contains(&(ticker.clone(), format!("{ticker}x"))));
+            assert!(second[..20].contains(&(ticker.clone(), ticker.clone())));
+            assert!(second[..20].contains(&(ticker.clone(), format!("{ticker}x"))));
+        }
+        let first_tail = first[20..].iter().map(|(_, term)| term.as_str()).collect::<HashSet<_>>();
+        let second_tail =
+            second[20..].iter().map(|(_, term)| term.as_str()).collect::<HashSet<_>>();
+        assert!(first_tail.contains("T10"));
+        assert!(!first_tail.contains("T25"));
+        assert!(second_tail.contains("T25"));
+        assert_ne!(&first[20..], &second[20..]);
+    }
+
+    #[test]
+    fn one_character_tickers_are_searched_only_in_product_form() {
+        let mut tickers = vec!["F".to_owned()];
+        tickers.extend((0..9).map(|index| format!("T{index:02}")));
+        tickers.push("1".to_owned());
+        let (searches, next_offset) = rotating_impostor_search_terms(&tickers, 0);
+
+        assert!(searches.iter().all(|(_, search)| search.len() >= MIN_DEXSCREENER_SEARCH_BYTES));
+        for ticker in ["F", "1"] {
+            assert!(searches.contains(&(ticker.to_owned(), format!("{ticker}x"))));
+            assert!(!searches.contains(&(ticker.to_owned(), ticker.to_owned())));
+        }
+        assert!(searches.contains(&("T00".to_owned(), "T00".to_owned())));
+        assert_eq!(searches.len(), 20);
+        assert_eq!(next_offset, 0);
+    }
+
+    fn ranked_candidate_pair(index: usize) -> DexPair {
+        DexPair {
+            chain_id: "base".to_owned(),
+            dex_id: "test".to_owned(),
+            url: None,
+            pair_address: format!("pair-{index:03}"),
+            labels: Vec::new(),
+            base_token: DexToken {
+                address: Some(format!("0x{index:040x}")),
+                name: Some("NVIDIA xStock".to_owned()),
+                symbol: Some("NVDAx".to_owned()),
+            },
+            quote_token: DexToken { address: None, name: None, symbol: None },
+            price_usd: None,
+            volume: Some(DexVolume { h24: Some(index as f64), h6: None, h1: None, m5: None }),
+            price_change: None,
+            txns: None,
+            liquidity: None,
+            source: MarketSource::Dexscreener,
+        }
+    }
+
+    #[test]
+    fn publisher_catalog_watch_prioritizes_ticker_then_caps_by_volume() {
+        let candidates = (0..10)
+            .map(|index| (Chain::Base, 0, ranked_candidate_pair(index)))
+            .chain((10..70).map(|index| (Chain::Base, 1, ranked_candidate_pair(index))))
+            .collect();
+        let ranked = rank_impostor_candidates(candidates);
+
+        assert_eq!(ranked.len(), MAX_IMPOSTOR_CANDIDATES_PER_REFRESH);
+        assert_eq!(ranked.iter().filter(|(_, rank, _)| *rank == 0).count(), 10);
+        assert!(ranked[..10].iter().all(|(_, rank, _)| *rank == 0));
+        assert_eq!(ranked.first().unwrap().2.volume.as_ref().unwrap().h24, Some(9.0));
+        assert_eq!(ranked[9].2.volume.as_ref().unwrap().h24, Some(0.0));
+        assert_eq!(ranked[10].2.volume.as_ref().unwrap().h24, Some(69.0));
+        assert_eq!(ranked.last().unwrap().2.volume.as_ref().unwrap().h24, Some(30.0));
+    }
+
+    #[test]
+    fn publisher_catalog_watch_preserves_first_seen_when_rechecked() {
+        let make_entry =
+            |address: &str, first_seen_at: &str, last_seen_at: &str, volume: f64| ImpostorEntry {
+                chain: "base".to_owned(),
+                chain_label: "Base".to_owned(),
+                ticker: "NVDA".to_owned(),
+                publisher: "Robinhood".to_owned(),
+                symbol: "NVDAx".to_owned(),
+                name: "NVIDIA xStock".to_owned(),
+                address: address.to_owned(),
+                first_seen_at: first_seen_at.to_owned(),
+                last_seen_at: last_seen_at.to_owned(),
+                volume_24h_usd: Some(volume),
+                source: MarketSource::Dexscreener,
+                guard_url: format!("/guard/base/{address}"),
+                reason: format!("catalog observation at {last_seen_at}"),
+                reads: Vec::new(),
+                on_chain_symbol: None,
+                on_chain_name: None,
+                publisher_catalog_snapshot_hash: None,
+                evidence_truncated: false,
+                guard_document: None,
+            };
+        let previous = make_entry("0xAbCd", "first", "old", 1.0);
+        let current = make_entry("0xabcd", "later", "latest", 2.0);
+        let (merged, evicted) = merge_impostor_entries(vec![previous], vec![current]);
+        assert_eq!(evicted, 0);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].first_seen_at, "first");
+        assert_eq!(merged[0].last_seen_at, "latest");
+        assert_eq!(merged[0].volume_24h_usd, Some(2.0));
+    }
+
     fn hours_ago(hours: i64) -> String {
         (Utc::now() - chrono::Duration::hours(hours)).to_rfc3339_opts(SecondsFormat::Secs, true)
     }
@@ -2853,21 +5831,26 @@ mod tests {
                     pool: format!("pool-{index}"),
                     base_symbol: "NVDAx".to_owned(),
                     quote_symbol: "USDC".to_owned(),
+                    source: MarketSource::Dexscreener,
                     issuer: Some("Backed xStocks".to_owned()),
                     ticker: Some("NVDA".to_owned()),
+                    issuer_on_base: Some(true),
                     verdict: "backed".to_owned(),
+                    read_status: "checked".to_owned(),
+                    read_reason: None,
                     price_usd: Some(1.5),
                     change_24h_pct: Some(-0.25),
                     volume_24h_usd: Some(1_000.0),
                     liquidity_usd: Some(2_000.0),
                     txns_24h: Some(17),
                     detail_url: format!("/validated/solana/pool-{index}"),
-                    trade_url: "https://example.invalid".to_owned(),
-                    explorer_url: "https://example.invalid/explorer".to_owned(),
+                    trade_url: format!("https://dexscreener.com/solana/pool-{index}"),
+                    explorer_url: format!("https://solscan.io/account/pool-{index}"),
                     attestation_id: Some("att-1".to_owned()),
                     checked_at: Some(updated_at.to_owned()),
                 })
                 .collect(),
+            impostors: ImpostorSnapshot::default(),
         }
     }
 
@@ -2906,6 +5889,20 @@ mod tests {
         assert!(!safe_board_replacement(10, 4));
         assert!(safe_board_replacement(10, 5));
         assert!(safe_board_replacement(10, 11));
+        let previous = sample_leaderboard(&hours_ago(1), 4);
+        let mut incomplete = sample_leaderboard(&hours_ago(0), 2);
+        for entry in &mut incomplete.entries {
+            entry.source = MarketSource::Geckoterminal;
+        }
+        incomplete.entries[1].pool = "new-pool".to_owned();
+        assert!(safe_board_replacement(previous.entries.len(), incomplete.entries.len()));
+        assert!(!safe_leaderboard_replacement(&previous.entries, &incomplete.entries));
+
+        let mut complete = sample_leaderboard(&hours_ago(0), 4);
+        for entry in &mut complete.entries {
+            entry.source = MarketSource::Geckoterminal;
+        }
+        assert!(safe_leaderboard_replacement(&previous.entries, &complete.entries));
 
         let dir = tempfile::tempdir().expect("temp dir");
         let previous = sample_leaderboard(&hours_ago(1), 10);
@@ -2972,6 +5969,682 @@ mod tests {
         assert!(!dir.path().join("leaderboard.json.tmp").exists(), "temp file renamed away");
     }
 
+    fn watch_deny_guard(address: &str) -> crate::domain::guard::GuardDocument {
+        use crate::domain::guard::{GuardReason, GuardVerdict, IdentityStatus};
+
+        let mut guard = crate::domain::guard::signed_test_guard([19; 32]);
+        guard.address = address.to_owned();
+        guard.subject_address = Some(address.to_owned());
+        guard.identity.publisher = Some("Robinhood".to_owned());
+        guard.identity.ticker = Some("NVDA".to_owned());
+        guard.identity.status = IdentityStatus::Mismatch;
+        guard.identity.observed_symbol = Some("NVDAx".to_owned());
+        guard.identity.observed_name = Some("NVIDIA xStock".to_owned());
+        guard.verdict = GuardVerdict::Deny;
+        guard.reasons = vec![GuardReason {
+            code: "claims_unpublished_publisher_product".to_owned(),
+            detail: "The matching product is absent from the publisher deployment catalog."
+                .to_owned(),
+        }];
+        let mut reads = Vec::with_capacity(150);
+        for (selector, result) in [("symbol()", "NVDAx"), ("name()", "NVIDIA xStock")] {
+            reads.push(crate::domain::attestation::Read {
+                method: "eth_call".to_owned(),
+                params: serde_json::json!([address, selector]),
+                result_hash: "a".repeat(64),
+                raw_result: Some(serde_json::json!(result)),
+                block: Some(42),
+                slot: None,
+            });
+        }
+        for index in 0..148 {
+            reads.push(crate::domain::attestation::Read {
+                method: "eth_call".to_owned(),
+                params: serde_json::json!([address, format!("powerRead{index}")]),
+                result_hash: "b".repeat(64),
+                raw_result: Some(serde_json::json!({"value": "x".repeat(2048)})),
+                block: Some(42),
+                slot: None,
+            });
+        }
+        guard.reads = reads;
+        guard
+    }
+
+    #[test]
+    fn large_guard_deny_keeps_compact_identity_evidence_and_is_counted() {
+        let address = "0x0000000000000000000000000000000000000001";
+        let observation = catalog_absent_entry(
+            Chain::Base,
+            "2026-10-07T12:00:00Z",
+            "NVDAx".to_owned(),
+            "NVIDIA xStock".to_owned(),
+            Some(12.5),
+            MarketSource::Dexscreener,
+            Some("c".repeat(64)),
+            watch_deny_guard(address),
+        )
+        .expect("well-formed Guard observation")
+        .expect("catalog-deny observation");
+        assert_eq!(observation.reads.len(), 2);
+        assert!(observation.evidence_truncated);
+        assert_eq!(
+            observation.publisher_catalog_snapshot_hash.as_deref(),
+            Some("c".repeat(64).as_str())
+        );
+        assert!(observation.reads.iter().all(|read| {
+            read.params[0] == address
+                && matches!(read.params[1].as_str(), Some("symbol()" | "name()"))
+                && read
+                    .raw_result
+                    .as_ref()
+                    .is_some_and(|result| json_value_len(result) <= MAX_IMPOSTOR_READ_RESULT_BYTES)
+        }));
+
+        let directory = tempfile::tempdir().expect("temporary watch cache");
+        let mut board = sample_leaderboard("2026-10-07T12:00:00Z", 1);
+        board.impostors.entries.push(observation);
+        save_leaderboard(directory.path(), &board);
+        let restored = load_leaderboard(directory.path()).expect("persisted watch row");
+        assert_eq!(restored.impostors.entries.len(), 1);
+        assert_eq!(restored.impostors.rejected_oversize_entries, 0);
+        assert_eq!(restored.impostors.entries[0].reads.len(), 2);
+        assert!(restored.impostors.entries[0].evidence_truncated);
+    }
+
+    /// Guard document whose deny reason comes from the real identity and verdict
+    /// producers: a Robinhood Chain clone of a product published on 12 networks.
+    fn real_catalog_absence_guard(address: &str) -> crate::domain::guard::GuardDocument {
+        use crate::domain::{
+            guard::{SourceStatus, evaluate, identify_with_contract_metadata, issuer_metadata_key},
+            pool::TokenMeta,
+            registry::OfficialDeployment,
+        };
+
+        let official = "0x0000000000000000000000000000000000000101";
+        let product = |address: &str| TokenMeta {
+            address: address.to_owned(),
+            symbol: Some("NVDAx".to_owned()),
+            name: Some("NVIDIA xStock".to_owned()),
+            decimals: Some(18),
+            total_supply: None,
+        };
+        let publisher_entry = Entry {
+            issuer: "Backed xStocks".to_owned(),
+            ticker: "NVDA".to_owned(),
+            name: "NVIDIA xStock".to_owned(),
+            chain: Chain::Ethereum,
+            contract: official.to_owned(),
+            decimals: Some(18),
+            source: "xstocks-api".to_owned(),
+            source_url: "https://example.invalid/xstocks".to_owned(),
+            last_checked: now_rfc3339(),
+            removed_at: None,
+            stale_since: None,
+            official_deployments: [
+                "Arbitrum", "BSC", "Ethereum", "HyperEVM", "Ink", "Mantle", "Monad", "Optimism",
+                "Solana", "Ton", "Tron", "XLayer",
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, network)| OfficialDeployment {
+                network: network.to_owned(),
+                address: format!("0x{:040x}", 0x200 + index),
+                wrapper_address: None,
+                wrapper_address_v2: None,
+            })
+            .collect(),
+        };
+        let publisher_metadata =
+            HashMap::from([(issuer_metadata_key(Chain::Ethereum, official), product(official))]);
+        let identity = identify_with_contract_metadata(
+            Chain::RobinhoodChain,
+            address,
+            Some(&product(address)),
+            std::slice::from_ref(&publisher_entry),
+            &publisher_metadata,
+        );
+        let (verdict, reasons) = evaluate(&identity, None, None, SourceStatus::Verified);
+        let mut guard = watch_deny_guard(address);
+        guard.chain = Chain::RobinhoodChain;
+        guard.identity = identity;
+        guard.verdict = verdict;
+        guard.reasons = reasons;
+        guard
+    }
+
+    #[test]
+    fn long_real_guard_reason_and_text_fields_are_truncated_without_rejection() {
+        let address = "0x0000000000000000000000000000000000000001";
+        let guard = real_catalog_absence_guard(address);
+        assert_eq!(guard.verdict, crate::domain::guard::GuardVerdict::Deny);
+        assert_eq!(guard.reasons[0].code, "claims_unpublished_publisher_product");
+        assert!(guard.reasons[0].detail.contains("XLayer"));
+        assert!(guard.reasons[0].detail.len() > MAX_IMPOSTOR_REASON_BYTES);
+        let reason_observation = catalog_absent_entry(
+            Chain::RobinhoodChain,
+            "2026-10-07T12:00:00Z",
+            "NVDAx".to_owned(),
+            "NVIDIA xStock".to_owned(),
+            Some(12.5),
+            MarketSource::Dexscreener,
+            Some("c".repeat(64)),
+            guard,
+        )
+        .expect("valid token address and registry hash")
+        .expect("catalog-deny observation");
+
+        assert_eq!(reason_observation.reason.len(), MAX_IMPOSTOR_REASON_BYTES);
+        assert!(reason_observation.reason.starts_with(
+            "QED Guard found an exact on-chain symbol/name match for NVIDIA xStock (NVDA)"
+        ));
+        assert!(reason_observation.evidence_truncated);
+
+        let long_symbol = "NVDAx".repeat(20);
+        let long_name = "NVIDIA • xStock ".repeat(8);
+        let mut label_guard = watch_deny_guard(address);
+        label_guard.reads.truncate(2);
+        label_guard.identity.observed_symbol = Some(long_symbol.clone());
+        label_guard.identity.observed_name = Some(long_name.clone());
+        label_guard.reads[0].raw_result = Some(serde_json::json!(long_symbol));
+        label_guard.reads[1].raw_result = Some(serde_json::json!(long_name));
+        let label_observation = catalog_absent_entry(
+            Chain::Base,
+            "2026-10-07T12:00:00Z",
+            "NVDAx".repeat(20),
+            "NVIDIA • xStock ".repeat(8),
+            Some(12.5),
+            MarketSource::Dexscreener,
+            Some("c".repeat(64)),
+            label_guard,
+        )
+        .expect("valid token address and registry hash")
+        .expect("catalog-deny observation");
+        assert!(label_observation.symbol.len() <= MAX_IMPOSTOR_LABEL_BYTES);
+        assert!(label_observation.name.len() <= MAX_IMPOSTOR_LABEL_BYTES);
+        assert!(
+            label_observation.on_chain_symbol.as_ref().unwrap().len() <= MAX_IMPOSTOR_LABEL_BYTES
+        );
+        assert!(
+            label_observation.on_chain_name.as_ref().unwrap().len() <= MAX_IMPOSTOR_LABEL_BYTES
+        );
+        assert!(label_observation.evidence_truncated);
+
+        let mut observation = reason_observation;
+        observation.ticker = "N".repeat(80);
+        observation.publisher = "P".repeat(80);
+        observation.symbol = "S".repeat(80);
+        observation.name = "N".repeat(80);
+        observation.on_chain_symbol = Some("O".repeat(80));
+        observation.on_chain_name = Some("C".repeat(80));
+        observation.first_seen_at.push_str(&"x".repeat(80));
+        observation.last_seen_at.push_str(&"x".repeat(80));
+        let mut invalid_chain = observation.clone();
+        invalid_chain.chain = "not-supported".to_owned();
+        let mut invalid_address = observation.clone();
+        invalid_address.address = "not-an-address".to_owned();
+        let mut invalid_hash = observation.clone();
+        invalid_hash.publisher_catalog_snapshot_hash = Some("not-a-hash".to_owned());
+        let unsupported = UnsupportedImpostorCandidate {
+            dex_chain_id: "arc".to_owned(),
+            ticker: "T".repeat(80),
+            publisher: "P".repeat(80),
+            symbol: "S".repeat(80),
+            name: "NVIDIA • xStock ".repeat(8),
+            address: "0x0000000000000000000000000000000000000002".to_owned(),
+            first_seen_at: format!("2026-10-07T12:00:00Z{}", "x".repeat(80)),
+            last_seen_at: "2026-10-07T12:00:00Z".to_owned(),
+            volume_24h_usd: Some(8.0),
+            source: MarketSource::Dexscreener,
+            evidence_truncated: false,
+        };
+        let mut invalid_unsupported_chain = unsupported.clone();
+        invalid_unsupported_chain.dex_chain_id = "arc chain".to_owned();
+        let mut invalid_unsupported_address = unsupported.clone();
+        invalid_unsupported_address.address = "0x 0002".to_owned();
+        let mut board = sample_leaderboard("2026-10-07T12:00:00Z", 1);
+        board.impostors.entries.extend([observation, invalid_chain, invalid_address, invalid_hash]);
+        board.impostors.unsupported_candidates.extend([
+            unsupported,
+            invalid_unsupported_chain,
+            invalid_unsupported_address,
+        ]);
+
+        let directory = tempfile::tempdir().expect("temporary bounded watch cache");
+        save_leaderboard(directory.path(), &board);
+        let restored = load_leaderboard(directory.path()).expect("restore compact watch rows");
+        assert_eq!(restored.impostors.entries.len(), 1);
+        assert_eq!(restored.impostors.rejected_oversize_entries, 3);
+        let stored = &restored.impostors.entries[0];
+        assert!(stored.evidence_truncated);
+        assert_eq!(stored.reason.len(), MAX_IMPOSTOR_REASON_BYTES);
+        assert!(stored.ticker.len() <= MAX_IMPOSTOR_LABEL_BYTES);
+        assert!(stored.publisher.len() <= MAX_IMPOSTOR_LABEL_BYTES);
+        assert!(stored.symbol.len() <= MAX_IMPOSTOR_LABEL_BYTES);
+        assert!(stored.name.len() <= MAX_IMPOSTOR_LABEL_BYTES);
+        assert!(stored.on_chain_symbol.as_ref().unwrap().len() <= MAX_IMPOSTOR_LABEL_BYTES);
+        assert!(stored.on_chain_name.as_ref().unwrap().len() <= MAX_IMPOSTOR_LABEL_BYTES);
+        assert!(stored.first_seen_at.len() <= MAX_IMPOSTOR_TIMESTAMP_BYTES);
+        assert!(stored.last_seen_at.len() <= MAX_IMPOSTOR_TIMESTAMP_BYTES);
+        assert_eq!(
+            stored.publisher_catalog_snapshot_hash.as_deref(),
+            Some("c".repeat(64).as_str())
+        );
+
+        assert_eq!(restored.impostors.unsupported_candidates.len(), 1);
+        assert_eq!(restored.impostors.unsupported_seen, 1);
+        assert_eq!(restored.impostors.rejected_oversize_unsupported_candidates, 2);
+        let candidate = &restored.impostors.unsupported_candidates[0];
+        assert!(candidate.evidence_truncated);
+        assert_eq!(candidate.address, "0x0000000000000000000000000000000000000002");
+        for text in [&candidate.ticker, &candidate.publisher, &candidate.symbol, &candidate.name] {
+            assert!(text.len() <= MAX_IMPOSTOR_LABEL_BYTES);
+        }
+        assert!(candidate.first_seen_at.len() <= MAX_IMPOSTOR_TIMESTAMP_BYTES);
+    }
+
+    #[tokio::test]
+    async fn real_catalog_absence_observation_is_stored_and_counted_in_signed_stats() {
+        let address = format!("0x9d70{:036x}", 1);
+        let scanned_at = now_rfc3339();
+        let observation = catalog_absent_entry(
+            Chain::RobinhoodChain,
+            &scanned_at,
+            "NVDAx".to_owned(),
+            "NVIDIA xStock".to_owned(),
+            Some(12.5),
+            MarketSource::Geckoterminal,
+            Some("c".repeat(64)),
+            real_catalog_absence_guard(&address),
+        )
+        .expect("valid token address and registry hash")
+        .expect("catalog-deny observation");
+        let directory = tempfile::tempdir().expect("temporary watch cache");
+        let mut board = sample_leaderboard(&scanned_at, 1);
+        board.entries[0].source = MarketSource::Geckoterminal;
+        board.entries[0].trade_url = "https://www.geckoterminal.com/solana/pools/pool-0".to_owned();
+        board.impostors.scanned_at.clone_from(&scanned_at);
+        board.impostors.entries.push(observation);
+        save_leaderboard(directory.path(), &board);
+        let restored = load_leaderboard(directory.path()).expect("restore watch row");
+
+        let state = AppState::for_tests(Vec::new(), Vec::new(), true);
+        *state.leaderboard.write().await = restored;
+        crate::adapters::web::refresh_stats_snapshot(&state).await.expect("signed stats snapshot");
+        let snapshot = state.stats_snapshot.read().await.clone().expect("prepared stats snapshot");
+        let document: serde_json::Value =
+            serde_json::from_slice(&snapshot.json).expect("signed stats JSON");
+        let watch = &document["stats"]["publisher_catalog_watch"];
+        assert_eq!(watch["currently_flagged_last_7_days"], 1);
+        assert_eq!(watch["first_flagged_this_week"], 1);
+        assert_eq!(watch["rejected_oversize_entries"], 0);
+        let stored = &document["reducer_inputs"]["impostor_watch"]["entries"][0];
+        assert_eq!(stored["chain"], "robinhood");
+        assert_eq!(stored["source"], "geckoterminal");
+        assert_eq!(document["reducer_inputs"]["leaderboard"][0]["source"], "geckoterminal");
+        assert_eq!(stored["address"], address.as_str());
+        assert_eq!(stored["reason"].as_str().map(str::len), Some(MAX_IMPOSTOR_REASON_BYTES));
+        assert_eq!(stored["evidence_truncated"], true);
+        assert!(String::from_utf8_lossy(&snapshot.html).contains(address.as_str()));
+    }
+
+    #[tokio::test]
+    async fn impostor_search_outage_keeps_last_results_and_one_failed_query_does_not_abort() {
+        let no_pairs =
+            (axum::http::StatusCode::OK, r#"{"schemaVersion":"1.0.0","pairs":[]}"#.to_owned());
+        let failure = (axum::http::StatusCode::SERVICE_UNAVAILABLE, "unavailable".to_owned());
+        let responses = Arc::new(std::sync::Mutex::new(HashMap::from([
+            ("NVDA".to_owned(), no_pairs.clone()),
+            ("NVDAx".to_owned(), no_pairs.clone()),
+        ])));
+        let set_response = |query: &str, response: (axum::http::StatusCode, String)| {
+            responses.lock().expect("fixture responses").insert(query.to_owned(), response);
+        };
+        let gecko_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = axum::Router::new()
+            .route(
+                "/latest/dex/search",
+                axum::routing::get({
+                    let responses = Arc::clone(&responses);
+                    move |axum::extract::Query(query): axum::extract::Query<
+                        HashMap<String, String>,
+                    >| {
+                        let response = responses
+                            .lock()
+                            .expect("fixture responses")
+                            .get(query.get("q").map(String::as_str).unwrap_or_default())
+                            .cloned()
+                            .unwrap_or((axum::http::StatusCode::NOT_FOUND, String::new()));
+                        async move { response }
+                    }
+                }),
+            )
+            .route(
+                "/api/v2/search/pools",
+                axum::routing::get({
+                    let gecko_requests = Arc::clone(&gecko_requests);
+                    move || {
+                        gecko_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        async { (axum::http::StatusCode::OK, r#"{"data":[]}"#.to_owned()) }
+                    }
+                }),
+            );
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("fixture listener");
+        let base_url = format!("http://{}", listener.local_addr().expect("fixture address"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("fixture search server");
+        });
+        let state = AppState::for_tests(
+            vec![entry(Chain::Base, "0x0000000000000000000000000000000000000101", "NVDA")],
+            Vec::new(),
+            true,
+        );
+        let client = MarketDataClient::with_clients(
+            DexScreenerClient::with_base_url(state.http.clone(), base_url.clone()),
+            GeckoTerminalClient::with_base_url(state.http.clone(), format!("{base_url}/api/v2")),
+            true,
+        );
+        let registry = state.registry.read().await.clone();
+        let hash = Some("c".repeat(64));
+        let stats_headline = |impostors: ImpostorSnapshot| {
+            let state = state.clone();
+            async move {
+                state.leaderboard.write().await.impostors = impostors;
+                crate::adapters::web::refresh_stats_snapshot(&state).await.expect("stats");
+                let snapshot = state.stats_snapshot.read().await.clone().expect("stats snapshot");
+                serde_json::from_slice::<serde_json::Value>(&snapshot.json).expect("stats JSON")
+                    ["stats"]
+                    .clone()
+            }
+        };
+
+        let never_scanned =
+            refresh_impostor_watch(&state, &client, &registry, hash.clone(), Default::default())
+                .await;
+        let first_outage = never_scanned.source_unavailable_since.clone().expect("outage start");
+        assert!(never_scanned.scanned_at.is_empty());
+        let stats = stats_headline(never_scanned).await;
+        let headline = stats["headline"].as_str().expect("headline");
+        assert!(headline.contains(&format!(
+            "Impostor search source unavailable since {first_outage}; no successful search yet."
+        )));
+        assert!(!headline.contains("catalog observations are currently flagged"));
+
+        let last_success = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let address = format!("0x9d70{:036x}", 2);
+        let observation = catalog_absent_entry(
+            Chain::RobinhoodChain,
+            &last_success,
+            "NVDAx".to_owned(),
+            "NVIDIA xStock".to_owned(),
+            Some(12.5),
+            MarketSource::Dexscreener,
+            hash.clone(),
+            real_catalog_absence_guard(&address),
+        )
+        .expect("valid observation")
+        .expect("catalog-deny observation");
+        let last_good = ImpostorSnapshot {
+            scanned_at: last_success.clone(),
+            next_ticker_offset: 0,
+            entries: vec![observation],
+            ..ImpostorSnapshot::default()
+        };
+
+        let empty =
+            refresh_impostor_watch(&state, &client, &registry, hash.clone(), last_good.clone())
+                .await;
+        let since = empty.source_unavailable_since.clone().expect("empty search is an outage");
+        assert_eq!(ImpostorSnapshot { source_unavailable_since: None, ..empty.clone() }, last_good);
+        assert_eq!(gecko_requests.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        set_response("NVDA", failure.clone());
+        set_response("NVDAx", no_pairs.clone());
+        let failed =
+            refresh_impostor_watch(&state, &client, &registry, hash.clone(), empty.clone()).await;
+        assert_eq!(failed, empty, "an all-failing source keeps results and the first outage time");
+        assert_eq!(
+            gecko_requests.load(std::sync::atomic::Ordering::Relaxed),
+            GECKOTERMINAL_WATCH_NETWORKS.len()
+        );
+
+        let stats = stats_headline(failed.clone()).await;
+        let watch = &stats["publisher_catalog_watch"];
+        assert_eq!(watch["source_unavailable_since"], since.as_str());
+        assert_eq!(watch["last_scanned_at"], last_success.as_str());
+        assert_eq!(watch["currently_flagged_last_7_days"], 1);
+        assert!(stats["headline"].as_str().expect("headline").contains(&format!(
+            "Impostor search source unavailable since {since}; from the last successful search at {last_success}, 1 catalog observations are currently flagged"
+        )));
+
+        set_response("NVDA", no_pairs);
+        set_response(
+            "NVDAx",
+            (
+                axum::http::StatusCode::OK,
+                serde_json::json!({"schemaVersion": "1.0.0", "pairs": [{
+                    "chainId": "arc",
+                    "dexId": "uniswap",
+                    "pairAddress": "0x00000000000000000000000000000000000000a0",
+                    "baseToken": {
+                        "address": "0x00000000000000000000000000000000000000a1",
+                        "name": "NVIDIA xStock",
+                        "symbol": "NVDAx"
+                    },
+                    "quoteToken": {"address": "0x00000000000000000000000000000000000000a2", "symbol": "USDC"}
+                }]})
+                .to_string(),
+            ),
+        );
+        let recovered = refresh_impostor_watch(&state, &client, &registry, hash, failed).await;
+        assert_eq!(recovered.source_unavailable_since, None);
+        assert_ne!(recovered.scanned_at, last_success);
+        assert_eq!(recovered.entries.len(), 1);
+        assert_eq!(recovered.unsupported_candidates.len(), 1);
+        assert_eq!(recovered.unsupported_candidates[0].dex_chain_id, "arc");
+        assert_eq!(recovered.unsupported_candidates[0].source, MarketSource::Dexscreener);
+        assert_eq!(gecko_requests.load(std::sync::atomic::Ordering::Relaxed), 7);
+        server.abort();
+    }
+
+    #[test]
+    fn solana_watch_compaction_keeps_mint_metadata_reads_only() {
+        let address = bs58::encode([23u8; 32]).into_string();
+        let reads = vec![
+            crate::domain::attestation::Read {
+                method: "getAccountInfo".to_owned(),
+                params: serde_json::json!([address, { "encoding": "base64", "commitment": "confirmed" }]),
+                result_hash: "d".repeat(64),
+                raw_result: Some(serde_json::json!({
+                    "context": {"slot": 44},
+                    "value": {"data": ["x".repeat(2048), "base64"]}
+                })),
+                block: None,
+                slot: Some(44),
+            },
+            crate::domain::attestation::Read {
+                method: "getProgramAccounts".to_owned(),
+                params: serde_json::json!([
+                    METAPLEX_METADATA_PROGRAM,
+                    {"filters": [{"memcmp": {"offset": 33, "bytes": address}}]}
+                ]),
+                result_hash: "e".repeat(64),
+                raw_result: None,
+                block: None,
+                slot: Some(45),
+            },
+            crate::domain::attestation::Read {
+                method: "getAccountInfo".to_owned(),
+                params: serde_json::json!(["another-mint", {}]),
+                result_hash: "f".repeat(64),
+                raw_result: None,
+                block: None,
+                slot: Some(46),
+            },
+            crate::domain::attestation::Read {
+                method: "getProgramAccounts".to_owned(),
+                params: serde_json::json!([
+                    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                    {"filters": [{"memcmp": {"offset": 33, "bytes": address}}]}
+                ]),
+                result_hash: "1".repeat(64),
+                raw_result: None,
+                block: None,
+                slot: Some(47),
+            },
+        ];
+
+        let (compact, truncated) = compact_watch_reads(&reads, Chain::Solana, &address);
+        assert_eq!(compact.len(), 2);
+        assert!(truncated);
+        assert_eq!(compact[0].slot, Some(44));
+        assert_eq!(compact[1].slot, Some(45));
+        assert!(
+            compact[0]
+                .raw_result
+                .as_ref()
+                .is_some_and(|result| { json_value_len(result) <= MAX_IMPOSTOR_READ_RESULT_BYTES })
+        );
+        assert_eq!(compact[1].params[0], METAPLEX_METADATA_PROGRAM);
+    }
+
+    #[test]
+    fn legacy_full_guard_observation_restores_as_compact_evidence() {
+        let address = "0x0000000000000000000000000000000000000001";
+        let mut legacy_entry = serde_json::json!({
+            "chain": "base",
+            "chain_label": "Base",
+            "ticker": "NVDA",
+            "publisher": "Robinhood",
+            "symbol": "NVDAx",
+            "name": "NVIDIA xStock",
+            "address": address,
+            "first_seen_at": "2026-10-07T12:00:00Z",
+            "last_seen_at": "2026-10-07T12:00:00Z",
+            "volume_24h_usd": 12.5,
+            "guard_url": format!("/guard/base/{address}"),
+            "reason": "Publisher deployment not listed.",
+            "reads": [],
+            "on_chain_symbol": null,
+            "on_chain_name": null
+        });
+        legacy_entry["guard_document"] =
+            serde_json::to_value(watch_deny_guard(address)).expect("legacy Guard JSON");
+        let mut board = serde_json::to_value(sample_leaderboard("2026-10-07T12:00:00Z", 1))
+            .expect("legacy board JSON");
+        board["impostors"]["entries"] = serde_json::json!([legacy_entry]);
+        let directory = tempfile::tempdir().expect("temporary legacy board");
+        std::fs::write(
+            directory.path().join(LEADERBOARD_CACHE_FILE),
+            serde_json::to_vec(&board).expect("legacy board bytes"),
+        )
+        .expect("write legacy board");
+
+        let restored = load_leaderboard(directory.path()).expect("restore legacy board");
+        assert_eq!(restored.impostors.entries.len(), 1);
+        let observation = &restored.impostors.entries[0];
+        assert_eq!(observation.reads.len(), 2);
+        assert_eq!(observation.on_chain_symbol.as_deref(), Some("NVDAx"));
+        assert_eq!(observation.on_chain_name.as_deref(), Some("NVIDIA xStock"));
+        assert!(observation.publisher_catalog_snapshot_hash.is_none());
+        assert!(observation.evidence_truncated);
+        assert!(observation.guard_document.is_none());
+        assert_eq!(restored.impostors.rejected_oversize_entries, 0);
+    }
+
+    #[test]
+    fn persisted_leaderboard_retains_catalog_watch_history() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let scanned_at = "2026-10-07T12:00:00Z".to_owned();
+        let mut board = sample_leaderboard(&hours_ago(0), 2);
+        board.impostors.scanned_at = scanned_at.clone();
+        board.impostors.unsupported_seen = 1;
+        board.impostors.entries.push(ImpostorEntry {
+            chain: "robinhood".to_owned(),
+            chain_label: "Robinhood Chain".to_owned(),
+            ticker: "NVDA".to_owned(),
+            publisher: "Robinhood".to_owned(),
+            symbol: "NVDAx".to_owned(),
+            name: "NVIDIA xStock".to_owned(),
+            address: "0x0000000000000000000000000000000000000001".to_owned(),
+            first_seen_at: scanned_at.clone(),
+            last_seen_at: scanned_at.clone(),
+            volume_24h_usd: Some(12.5),
+            source: MarketSource::Dexscreener,
+            guard_url: "/guard/robinhood/0x0000000000000000000000000000000000000001".to_owned(),
+            reason: "Publisher deployment not listed.".to_owned(),
+            reads: Vec::new(),
+            on_chain_symbol: Some("NVDAx".to_owned()),
+            on_chain_name: Some("NVIDIA xStock".to_owned()),
+            publisher_catalog_snapshot_hash: Some("a".repeat(64)),
+            evidence_truncated: false,
+            guard_document: None,
+        });
+        board.impostors.unsupported_candidates.push(UnsupportedImpostorCandidate {
+            dex_chain_id: "arc".to_owned(),
+            ticker: "NVDA".to_owned(),
+            publisher: "Robinhood".to_owned(),
+            symbol: "NVDAx".to_owned(),
+            name: "NVIDIA xStock".to_owned(),
+            address: "0x0000000000000000000000000000000000000002".to_owned(),
+            first_seen_at: scanned_at.clone(),
+            last_seen_at: scanned_at,
+            volume_24h_usd: Some(8.0),
+            source: MarketSource::Dexscreener,
+            evidence_truncated: false,
+        });
+
+        save_leaderboard(dir.path(), &board);
+        assert_eq!(load_leaderboard(dir.path()), Some(board));
+    }
+
+    #[test]
+    fn legacy_market_rows_default_to_dexscreener_source() {
+        let scanned_at = now_rfc3339();
+        let address = "0x9d70000000000000000000000000000000000001";
+        let observation = catalog_absent_entry(
+            Chain::Base,
+            &scanned_at,
+            "NVDAx".to_owned(),
+            "NVIDIA xStock".to_owned(),
+            Some(12.5),
+            MarketSource::Geckoterminal,
+            Some("e".repeat(64)),
+            real_catalog_absence_guard(address),
+        )
+        .expect("valid observation")
+        .expect("catalog-deny observation");
+        let mut board = sample_leaderboard(&scanned_at, 1);
+        board.impostors.entries.push(observation);
+        board.impostors.unsupported_candidates.push(UnsupportedImpostorCandidate {
+            dex_chain_id: "arc".to_owned(),
+            ticker: "NVDA".to_owned(),
+            publisher: "Robinhood".to_owned(),
+            symbol: "NVDAx".to_owned(),
+            name: "NVIDIA xStock".to_owned(),
+            address: "0x0000000000000000000000000000000000000002".to_owned(),
+            first_seen_at: scanned_at.clone(),
+            last_seen_at: scanned_at,
+            volume_24h_usd: Some(8.0),
+            source: MarketSource::Geckoterminal,
+            evidence_truncated: false,
+        });
+        let mut stored = serde_json::to_value(board).expect("stored board JSON");
+        stored["entries"][0].as_object_mut().unwrap().remove("source");
+        stored["impostors"]["entries"][0].as_object_mut().unwrap().remove("source");
+        stored["impostors"]["unsupported_candidates"][0].as_object_mut().unwrap().remove("source");
+        stored["impostors"].as_object_mut().unwrap().remove("official_on_unsupported_chain");
+
+        let restored: Leaderboard =
+            serde_json::from_value(stored).expect("legacy source fields default");
+        assert_eq!(restored.entries[0].source, MarketSource::Dexscreener);
+        assert_eq!(restored.impostors.entries[0].source, MarketSource::Dexscreener);
+        assert_eq!(restored.impostors.unsupported_candidates[0].source, MarketSource::Dexscreener);
+        assert_eq!(restored.impostors.official_on_unsupported_chain, 0);
+    }
+
     #[test]
     fn persisted_leaderboard_stale_file_is_restored() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -3006,6 +6679,7 @@ mod tests {
                 change_24h_pct: Some(1.0),
                 volume_24h_usd: Some(10.0),
                 liquidity_usd: Some(20.0),
+                source: MarketSource::Dexscreener,
             },
             PricePoint {
                 chain: "base".to_owned(),
@@ -3014,6 +6688,7 @@ mod tests {
                 change_24h_pct: None,
                 volume_24h_usd: None,
                 liquidity_usd: None,
+                source: MarketSource::Dexscreener,
             },
         ];
         let mut updated = leaderboard_pair("old", Chain::Solana, Some(42.0));

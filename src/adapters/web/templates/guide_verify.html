@@ -17,7 +17,7 @@
         <thead><tr><th scope="col">Tool</th><th scope="col">Question it answers</th><th scope="col">One-click example</th></tr></thead>
         <tbody>
           <tr><th scope="row">Guard</th><td>Is this token what it claims to be, and what can its issuer do to it?</td><td><a href="/guard/ethereum/0xc845b2894dBddd03858fd2D643B4eF725fE0849d">Open a Guard result</a></td></tr>
-          <tr><th scope="row">Check</th><td>Does this pool use the issuer's published contract?</td><td><a href="/guard/robinhood/0xeE6F200063a53Fe9450578d99c0F8eAD4952c97a">Review a real NVDA pool with Guard</a></td></tr>
+          <tr><th scope="row">Check</th><td>Does this pool use the issuer's published contract?</td><td><a href="/guard/robinhood/0x6444a8e0b267406a15db74ca00c4a24bdfa81ed3180f5b6d0851f8ed6f4f29c5">Review the public NVDA pool</a></td></tr>
           <tr><th scope="row">Powers</th><td>What can the issuer do to this token?</td><td><a href="/tokens/NVDA">Browse NVDA's observed controls</a></td></tr>
           <tr><th scope="row">Statement</th><td>What did these wallets hold, provably?</td><td><a href="/statements">Create a wallet statement</a></td></tr>
           <tr><th scope="row">Registry</th><td>Which contracts did each issuer publish?</td><td><a href="/tokens/NVDA">Browse NVDA registry entries</a></td></tr>
@@ -47,11 +47,11 @@
       </article>
       <article class="docs-path-card">
         <h3>App: call the API</h3>
-        <p>Send a pool address to Guard for an issuer match and observed controls:</p>
+        <p>Send the public Robinhood NVDA pool address to Guard for an issuer match and observed controls:</p>
         <pre><code>curl --request POST https://qed.web3-energy.com/api/guard \
   --header 'Content-Type: application/json' \
-  --data '{"address":"0xeE6F200063a53Fe9450578d99c0F8eAD4952c97a","chain":"ethereum"}'</code></pre>
-        <p>See the <a href="/api">API reference</a> for response fields and the distinction between unknown and mismatch.</p>
+  --data '{"address":"0x6444a8e0b267406a15db74ca00c4a24bdfa81ed3180f5b6d0851f8ed6f4f29c5","chain":"robinhood"}'</code></pre>
+        <p><a href="/guard/robinhood/0x6444a8e0b267406a15db74ca00c4a24bdfa81ed3180f5b6d0851f8ed6f4f29c5">Open the same public pool in Guard</a>. See the <a href="/api">API reference</a> for response fields and the distinction between unknown and mismatch.</p>
       </article>
       <article class="docs-path-card">
         <h3>Auditor: keep a Statement</h3>
@@ -109,9 +109,9 @@
   <article class="guide-step"><p class="eyebrow">01</p><h2>Find the exact contract</h2><p>Use the issuer's official registry or documentation. Record the chain, contract address, decimals, and the time you checked it. Do not copy an address from a social post or an unlabeled search result.</p></article>
   <article class="guide-step"><p class="eyebrow">02</p><h2>Open the chain explorer</h2><p>Compare the exact address on the relevant chain explorer. Check that the token metadata, supply, and holder activity are consistent with the issuer's published information. Similar tickers on another chain are different assets.</p></article>
   <article class="guide-step"><p class="eyebrow">03</p><h2>Inspect the pool</h2><p>For a pool, identify both token contracts, the pool address, and the venue. Confirm which side is the claimed stock-linked token. Liquidity, price, and volume describe the venue; they do not prove an issuer contract match, backing, custody, or endorsement.</p></article>
-  <article class="guide-step"><p class="eyebrow">04</p><h2>Re-check with QED</h2><p>Paste the pool or token address into <a href="/check">QED</a>. QED reads the configured chain RPC, compares the observed contract with the issuer's published contract in the registry, and labels uncertainty instead of treating a failed read as a match.</p></article>
+  <article class="guide-step"><p class="eyebrow">04</p><h2>Re-check with QED</h2><p>Paste the pool or token address into <a href="/guard">QED Guard</a>. QED reads the configured chain RPC, compares the observed contract with the issuer's published contract in the registry, and labels uncertainty instead of treating a failed read as a match.</p></article>
   <article class="guide-step"><p class="eyebrow">05</p><h2>Keep the record</h2><p>When QED can produce a certificate, use its public record and API JSON. Verify the Ed25519 signature with the published key, compare the registry hash and timestamps, and remember that the record has an expiry. A verified contract match does not prove backing, custody, price, liquidity, or solvency.</p></article>
 </section>
-<section class="guide-callout"><h2>What QED automates</h2><p>QED makes the contract comparison reproducible: it records the reads, canonicalizes the payload, signs the result, and exposes the evidence for independent re-checking. It does not replace the issuer's legal disclosures, a chain explorer, or your own risk assessment.</p><a class="button primary-button" href="/check">Check a pool <span aria-hidden="true">→</span></a></section>
+<section class="guide-callout"><h2>What QED automates</h2><p>QED makes the contract comparison reproducible: it records the reads, canonicalizes the payload, signs the result, and exposes the evidence for independent re-checking. It does not replace the issuer's legal disclosures, a chain explorer, or your own risk assessment.</p><a class="button primary-button" href="/guard">Review with Guard <span aria-hidden="true">→</span></a></section>
 {% endif %}
 {% endblock %}

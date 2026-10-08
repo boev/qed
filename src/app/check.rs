@@ -1,9 +1,10 @@
 use crate::app::context::{CachedCheckResult, Context};
 use crate::domain::chain::Chain;
 use crate::domain::check::{
-    CheckResult, Verdict, bytecode_similarity, cache_key, decimal_cmp, evaluate_pool,
-    registered_token_address, same_contract, selected_sides,
+    CheckReadIssue, CheckResult, Verdict, bytecode_similarity, cache_key, decimal_cmp,
+    evaluate_pool, registered_token_address, same_contract, selected_sides,
 };
+
 #[cfg(test)]
 use crate::domain::check::{
     claims_name, claims_symbol, claims_ticker, quote_share_of_supply,
@@ -39,9 +40,50 @@ fn public_pool_error(error: &PoolError) -> &'static str {
     match error {
         PoolError::InvalidAddress => "unsupported pool address",
         PoolError::Unknown(_) => "pool was not found",
+        PoolError::UnsupportedVenue(_) => "unsupported venue",
+        PoolError::RpcLimit(_) => "RPC query limit reached",
         PoolError::CodeLookupUnsupported => "contract lookup is unavailable",
         PoolError::BudgetExceeded(_) => "bounded pool discovery was exhausted",
         PoolError::Reader(_) => "RPC provider request failed",
+    }
+}
+
+struct CheckFailure {
+    reason: String,
+    issue: CheckReadIssue,
+}
+
+impl CheckFailure {
+    fn unsupported(reason: impl Into<String>) -> Self {
+        Self { reason: reason.into(), issue: CheckReadIssue::Unsupported }
+    }
+
+    fn from_pool_error(error: PoolError) -> Self {
+        let issue = match &error {
+            PoolError::UnsupportedVenue(_) => CheckReadIssue::UnsupportedVenue,
+            PoolError::RpcLimit(_) | PoolError::BudgetExceeded(_) => CheckReadIssue::RpcLimit,
+            PoolError::Reader(_) | PoolError::CodeLookupUnsupported => CheckReadIssue::Transient,
+            PoolError::InvalidAddress | PoolError::Unknown(_) => CheckReadIssue::Unsupported,
+        };
+        let reason = match error {
+            PoolError::Unknown(reason) | PoolError::UnsupportedVenue(reason) => reason,
+            error => public_pool_error(&error).to_owned(),
+        };
+        Self { reason, issue }
+    }
+
+    fn from_pool_error_ref(error: &PoolError) -> Self {
+        let issue = match error {
+            PoolError::UnsupportedVenue(_) => CheckReadIssue::UnsupportedVenue,
+            PoolError::RpcLimit(_) | PoolError::BudgetExceeded(_) => CheckReadIssue::RpcLimit,
+            PoolError::Reader(_) | PoolError::CodeLookupUnsupported => CheckReadIssue::Transient,
+            PoolError::InvalidAddress | PoolError::Unknown(_) => CheckReadIssue::Unsupported,
+        };
+        let reason = match error {
+            PoolError::Unknown(reason) | PoolError::UnsupportedVenue(reason) => reason.clone(),
+            other => public_pool_error(other).to_owned(),
+        };
+        Self { reason, issue }
     }
 }
 
@@ -128,8 +170,8 @@ async fn check_uncached(state: &Context, address: &str, registry: &Registry) -> 
     let mut evidence = Vec::new();
     let (chain, v4_pool) = match resolve_chain(state, address, &mut evidence).await {
         Ok(resolved) => resolved,
-        Err(reason) => {
-            return unknown(address, Chain::RobinhoodChain, reason, evidence);
+        Err(failure) => {
+            return unknown_with_issue(address, Chain::RobinhoodChain, failure, evidence);
         }
     };
     let chain_entries =
@@ -142,9 +184,9 @@ async fn check_uncached(state: &Context, address: &str, registry: &Registry) -> 
         return unknown(address, chain, format!("no pool reader configured for {chain}"), evidence);
     };
     if let Err(error) = reader.record_position().await {
-        let reason = format!("chain position read failed: {}", public_pool_error(&error));
-        evidence.push(reason.clone());
-        return unknown(address, chain, reason, evidence);
+        let failure = CheckFailure::from_pool_error(error);
+        evidence.push(format!("chain position read failed: {}.", failure.reason));
+        return unknown_with_issue(address, chain, failure, evidence);
     }
     let (pool, input_meta) = match resolve_pool(
         state,
@@ -158,7 +200,7 @@ async fn check_uncached(state: &Context, address: &str, registry: &Registry) -> 
     .await
     {
         Ok(resolved) => resolved,
-        Err(reason) => return unknown(address, chain, reason, evidence),
+        Err(failure) => return unknown_with_issue(address, chain, failure, evidence),
     };
 
     evidence.push(format!("Detected supported {} pool at {}.", pool.dex, pool.pool));
@@ -173,18 +215,19 @@ async fn check_uncached(state: &Context, address: &str, registry: &Registry) -> 
     let base_meta = match metadata_for_side(reader.as_ref(), base_side, input_meta.as_ref()).await {
         Ok(meta) => meta,
         Err(error) => {
-            let reason = format!("base token metadata read failed: {}", public_pool_error(&error));
-            evidence.push(reason.clone());
-            return unknown(address, chain, reason, evidence);
+            let mut failure = CheckFailure::from_pool_error(error);
+            failure.reason = format!("base token metadata read failed: {}", failure.reason);
+            evidence.push(format!("{}.", failure.reason));
+            return unknown_with_issue(address, chain, failure, evidence);
         }
     };
     let quote_meta = match metadata_for_side(reader.as_ref(), quote_side, input_meta.as_ref()).await
     {
         Ok(meta) => meta,
         Err(error) => {
-            let reason = format!("quote token metadata read failed: {}", public_pool_error(&error));
-            evidence.push(reason.clone());
-            return unknown(address, chain, reason, evidence);
+            let failure = CheckFailure::from_pool_error(error);
+            evidence.push(format!("quote token metadata read failed: {}.", failure.reason));
+            return unknown_with_issue(address, chain, failure, evidence);
         }
     };
     evidence.push(format!(
@@ -218,9 +261,9 @@ async fn check_uncached(state: &Context, address: &str, registry: &Registry) -> 
                 ));
             }
             (Err(error), _) | (_, Err(error)) => {
-                let reason = format!("bytecode read failed: {}", public_pool_error(&error));
-                evidence.push(reason.clone());
-                return unknown(address, chain, reason, evidence);
+                let failure = CheckFailure::from_pool_error(error);
+                evidence.push(format!("bytecode read failed: {}.", failure.reason));
+                return unknown_with_issue(address, chain, failure, evidence);
             }
         }
     }
@@ -235,6 +278,7 @@ async fn check_uncached(state: &Context, address: &str, registry: &Registry) -> 
         checked_at: now(),
         attestation_id: None,
         powers: None,
+        read_issue: None,
     }
 }
 
@@ -242,25 +286,47 @@ async fn resolve_chain(
     state: &Context,
     address: &str,
     evidence: &mut Vec<String>,
-) -> Result<(Chain, Option<PoolInfo>), String> {
+) -> Result<(Chain, Option<PoolInfo>), CheckFailure> {
     if Chain::is_v4_pool_id(address) {
         evidence.push(format!("Detected Uniswap v4 pool id format for {address}."));
         let mut found = None;
+        let mut resolution_issue: Option<(u8, CheckFailure)> = None;
         for reader in state.readers.iter().filter(|reader| reader.chain() != Chain::Solana) {
             match reader.read_v4_pool(address).await {
                 Ok((pool, pool_evidence)) => {
                     found = Some((reader.chain(), pool, pool_evidence));
                     break;
                 }
-                Err(error) => evidence.push(format!(
-                    "{} v4 StateView probe did not identify the pool: {}.",
-                    reader.chain(),
-                    public_pool_error(&error)
-                )),
+                Err(error) => {
+                    let important_issue = match &error {
+                        PoolError::RpcLimit(_) => {
+                            Some((3, CheckFailure::from_pool_error_ref(&error)))
+                        }
+                        PoolError::Unknown(reason) if reason.contains("pool key hash mismatch") => {
+                            Some((2, CheckFailure::unsupported("v4 pool key hash mismatch")))
+                        }
+                        PoolError::Reader(_) => {
+                            Some((1, CheckFailure::from_pool_error_ref(&error)))
+                        }
+                        _ => None,
+                    };
+                    if let Some(issue) = important_issue
+                        && resolution_issue.as_ref().is_none_or(|current| issue.0 > current.0)
+                    {
+                        resolution_issue = Some(issue);
+                    }
+                    evidence.push(format!(
+                        "{} v4 StateView probe did not identify the pool: {}.",
+                        reader.chain(),
+                        public_pool_error(&error)
+                    ));
+                }
             }
         }
         let Some((chain, pool, pool_evidence)) = found else {
-            return Err("v4 pool id was not found on any configured EVM chain".to_owned());
+            return Err(resolution_issue.map(|(_, failure)| failure).unwrap_or_else(|| {
+                CheckFailure::unsupported("v4 pool id was not found on any configured EVM chain")
+            }));
         };
         evidence.extend(pool_evidence);
         evidence.push(format!("Resolved Uniswap v4 pool id on {chain}."));
@@ -288,9 +354,9 @@ async fn resolve_chain(
                     Ok((chain, None))
                 }
                 Err(error) => {
-                    let reason = public_pool_error(&error).to_owned();
-                    evidence.push(format!("EVM chain detection failed: {reason}."));
-                    Err(reason)
+                    let failure = CheckFailure::from_pool_error(error);
+                    evidence.push(format!("EVM chain detection failed: {}.", failure.reason));
+                    Err(failure)
                 }
             }
         }
@@ -298,7 +364,7 @@ async fn resolve_chain(
             evidence.push(format!(
                 "Address {address} is neither a Solana public key nor an EVM address."
             ));
-            Err("unsupported address format".to_owned())
+            Err(CheckFailure::unsupported("unsupported address format"))
         }
     }
 }
@@ -311,12 +377,15 @@ async fn resolve_pool(
     address: &str,
     v4_pool: Option<PoolInfo>,
     evidence: &mut Vec<String>,
-) -> Result<(PoolInfo, Option<TokenMeta>), String> {
+) -> Result<(PoolInfo, Option<TokenMeta>), CheckFailure> {
     if let Some(pool) = v4_pool {
         return Ok((pool, None));
     }
     match reader.read_pool(address).await {
         Ok(pool) => Ok((pool, None)),
+        Err(pool_error @ (PoolError::UnsupportedVenue(_) | PoolError::RpcLimit(_))) => {
+            Err(CheckFailure::from_pool_error(pool_error))
+        }
         Err(pool_error) => match reader.token_meta(address).await {
             Ok(meta) if chain == Chain::Solana => {
                 let candidate_programs =
@@ -329,15 +398,13 @@ async fn resolve_pool(
                                 left.quote.balance.as_deref(),
                             )
                         });
-                        pools
-                            .into_iter()
-                            .next()
-                            .map(|pool| (pool, Some(meta)))
-                            .ok_or_else(|| format!("no supported pool found for token: {address}"))
+                        pools.into_iter().next().map(|pool| (pool, Some(meta))).ok_or_else(|| {
+                            CheckFailure::unsupported(format!(
+                                "no supported pool found for token: {address}"
+                            ))
+                        })
                     }
-                    Err(error) => {
-                        Err(format!("token pool discovery failed: {}", public_pool_error(&error)))
-                    }
+                    Err(error) => Err(CheckFailure::from_pool_error(error)),
                 }
             }
             Ok(meta) => {
@@ -348,7 +415,7 @@ async fn resolve_pool(
                     MAX_INDEXED_POOL_CANDIDATES
                 ));
                 if candidates.is_empty() {
-                    return Err("no indexed pool candidate for token".to_owned());
+                    return Err(CheckFailure::unsupported("no indexed pool candidate for token"));
                 }
                 let token = address.to_ascii_lowercase();
                 let discovered = tokio::time::timeout(INDEXED_POOL_DEADLINE, async {
@@ -365,15 +432,19 @@ async fn resolve_pool(
                 .await;
                 match discovered {
                     Ok(Some(pool)) => Ok((pool, Some(meta))),
-                    Ok(None) => Err("indexed pool candidates did not contain the token".to_owned()),
-                    Err(_) => Err("indexed pool candidate budget was exhausted".to_owned()),
+                    Ok(None) => Err(CheckFailure::unsupported(
+                        "indexed pool candidates did not contain the token",
+                    )),
+                    Err(_) => Err(CheckFailure::from_pool_error(PoolError::BudgetExceeded(
+                        "indexed pool candidate scan",
+                    ))),
                 }
             }
-            Err(meta_error) => Err(format!(
+            Err(meta_error) => Err(CheckFailure::from_pool_error(PoolError::Reader(format!(
                 "pool read failed: {}; token metadata failed: {}",
                 public_pool_error(&pool_error),
                 public_pool_error(&meta_error)
-            )),
+            )))),
         },
     }
 }
@@ -395,18 +466,28 @@ fn format_symbol(symbol: &Option<String>) -> String {
     symbol.as_deref().map_or_else(String::new, |value| format!(" ({value})"))
 }
 
-fn unknown(input: &str, chain: Chain, reason: String, mut evidence: Vec<String>) -> CheckResult {
-    evidence.push(format!("Check is unknown: {reason}."));
+fn unknown(input: &str, chain: Chain, reason: String, evidence: Vec<String>) -> CheckResult {
+    unknown_with_issue(input, chain, CheckFailure::unsupported(reason), evidence)
+}
+
+fn unknown_with_issue(
+    input: &str,
+    chain: Chain,
+    failure: CheckFailure,
+    mut evidence: Vec<String>,
+) -> CheckResult {
+    evidence.push(format!("Check is unknown: {}.", failure.reason));
     CheckResult {
         input: input.to_owned(),
         chain,
         pool: None,
-        verdict: Verdict::Unknown { reason },
+        verdict: Verdict::Unknown { reason: failure.reason },
         quote_share_of_supply: None,
         evidence,
         checked_at: now(),
         attestation_id: None,
         powers: None,
+        read_issue: Some(failure.issue),
     }
 }
 
@@ -444,6 +525,7 @@ mod tests {
             last_checked: "2026-09-22T00:00:00Z".to_owned(),
             removed_at: None,
             stale_since: None,
+            official_deployments: Vec::new(),
         }
     }
 

@@ -16,6 +16,7 @@
   <p class="guard-facts">{{ source_sentence }}</p>
   <p class="muted">QED is read-only by design: it never holds keys, never submits transactions, and never recommends; that is why anyone can integrate it.</p>
   <p class="muted">This point-in-time review does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Re-check before relying on changed chain or issuer facts.</p>
+  <p class="muted"><strong>How to read the verdict:</strong> Allow means completed checks found no contradiction or active restriction; Deny means QED observed a contradiction or active restriction; Unknown means a check was incomplete or could not be verified. These are not safety ratings.</p>
 </section>
 <section class="lookup" aria-labelledby="guard-identity-title">
   <h2 id="guard-identity-title">Issuer identity</h2>
@@ -24,7 +25,8 @@
     <dt>Publisher</dt><dd>{{ publisher }}</dd>
     <dt>Reviewed address</dt><dd><code>{{ address }}</code></dd>
     <dt>Ticker</dt><dd>{{ ticker }}</dd>
-    <dt>Published contract</dt><dd><code>{{ matched_contract }}</code></dd>
+    {% if matched_contract != "—" %}<dt>Published contract on {{ chain }}</dt><dd><code>{{ matched_contract }}</code></dd>{% endif %}
+    {% if !deployments.is_empty() %}<dt>Official deployments</dt><dd><ul>{% for deployment in deployments %}<li>{{ deployment.network }} <code>{{ deployment.address }}</code></li>{% endfor %}</ul></dd>{% endif %}
   </dl>
 </section>
 <section class="lookup lookup-secondary" aria-labelledby="guard-powers-title">
@@ -34,6 +36,7 @@
     {% for badge in powers.summary_badges %}<span class="count-badge">{{ badge }}</span>{% endfor %}
     <span class="count-badge">{{ powers.source_badge }}</span>
   </div>
+  <p class="lookup-note">Legend: these signals are controls QED observed on {{ chain }}; “no evidence observed” is not proof that no control exists.</p>
   {% if powers.available %}
   <ul class="guard-power-summaries">
     <li>{{ seizure_summary }}</li>
@@ -57,13 +60,13 @@
   <h2 id="guard-wallet-title">Wallet transfer restrictions</h2>
   <p>Check status: <strong>{{ wallet_check_status }}</strong></p>
   {% if !wallet_check_restrictions.is_empty() %}
-  <ul>{% for restriction in wallet_check_restrictions %}<li>{{ restriction.detail }} <small><code>{{ restriction.code }}</code></small></li>{% endfor %}</ul>
+  <ul>{% for restriction in wallet_check_restrictions %}<li>{{ restriction.detail }}</li>{% endfor %}</ul>
   {% endif %}
 </section>
 <section class="lookup" aria-labelledby="guard-reasons-title">
   <h2 id="guard-reasons-title">Reasons</h2>
   {% if reasons.is_empty() %}<p>No additional reasons were recorded.</p>{% else %}
-  <ul>{% for reason in reasons %}<li>{{ reason.detail }} <small><code>{{ reason.code }}</code></small></li>{% endfor %}</ul>
+  <ul>{% for reason in reasons %}<li>{{ reason.detail }}</li>{% endfor %}</ul>
   {% endif %}
 </section>
 <section class="lookup lookup-secondary" aria-labelledby="guard-pools-title">

@@ -176,7 +176,7 @@ impl UsageStats {
     }
 
     pub(crate) fn record_mcp_tool(&self, name: &str) {
-        if matches!(name, "qed_check" | "qed_guard" | "qed_powers" | "qed_verify") {
+        if matches!(name, "qed_check" | "qed_verify") {
             self.checks.fetch_add(1, Ordering::Relaxed);
         } else if name == "qed_wallet" {
             self.wallet_requests.fetch_add(1, Ordering::Relaxed);
@@ -283,6 +283,14 @@ pub struct RegistryApiCache {
 }
 
 #[derive(Clone)]
+pub struct StatsSnapshotCache {
+    pub html: Bytes,
+    pub json: Bytes,
+    pub csv: Bytes,
+    pub api_pages: Vec<Bytes>,
+}
+
+#[derive(Clone)]
 pub struct AppState {
     pub app: Arc<Context>,
     pub registry: Arc<RwLock<Arc<Registry>>>,
@@ -298,6 +306,8 @@ pub struct AppState {
     pub leaderboard_check_cache: Cache<(Chain, String), CheckResult>,
     pub board_store: Arc<DurableBoardStore>,
     pub registry_api_cache: Arc<RwLock<Option<RegistryApiCache>>>,
+    pub stats_snapshot: Arc<RwLock<Option<Arc<StatsSnapshotCache>>>>,
+    pub stats_snapshot_refresh: Arc<tokio::sync::Mutex<()>>,
     pub public_url: Arc<String>,
     pub admin_auth: Arc<AdminAuth>,
     pub usage_stats: Arc<UsageStats>,
@@ -402,6 +412,8 @@ impl AppState {
             leaderboard_check_cache,
             board_store: Arc::new(DurableBoardStore::default()),
             registry_api_cache: Arc::new(RwLock::new(None)),
+            stats_snapshot: Arc::new(RwLock::new(None)),
+            stats_snapshot_refresh: Arc::new(tokio::sync::Mutex::new(())),
             public_url: Arc::new("http://localhost:3000".to_owned()),
             admin_auth: Arc::new(AdminAuth::new(Some("test-admin"), Some("test-password"))),
             usage_stats: Arc::new(UsageStats::new()),
@@ -533,9 +545,9 @@ where
 mod tests {
     use super::*;
     #[test]
-    fn usage_stats_count_guard_mcp_calls_as_checks() {
+    fn usage_stats_count_check_mcp_calls_as_checks() {
         let stats = UsageStats::new();
-        stats.record_mcp_tool("qed_guard");
+        stats.record_mcp_tool("qed_check");
         stats.record_mcp_tool("qed_wallet");
 
         let snapshot = stats.snapshot();

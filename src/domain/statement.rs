@@ -63,6 +63,8 @@ pub struct Statement {
     pub id: String,
     pub kind: String,
     pub version: u16,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
     pub wallets: Vec<StatementWallet>,
     pub assets: Vec<StatementAsset>,
     pub positions: Vec<StatementPosition>,
@@ -81,6 +83,8 @@ pub struct Statement {
 struct StatementPayload {
     kind: String,
     version: u16,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    label: String,
     wallets: Vec<StatementWallet>,
     assets: Vec<StatementAsset>,
     positions: Vec<StatementPosition>,
@@ -92,7 +96,6 @@ struct StatementPayload {
     signer: String,
     dev: bool,
 }
-
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -101,6 +104,7 @@ impl Statement {
         StatementPayload {
             kind: self.kind.clone(),
             version: self.version,
+            label: self.label.clone(),
             wallets: self.wallets.clone(),
             assets: self.assets.clone(),
             positions: self.positions.clone(),
@@ -144,14 +148,17 @@ pub fn verify(statement: &Statement) -> Result<(), StatementVerifyError> {
     if statement.kind != "statement" {
         return Err(StatementVerifyError::Kind);
     }
-    let payload = canonical_payload_json(statement)?;
-    let digest = Sha256::digest(&payload);
-    let expected = crate::domain::attestation::hex_lower(&digest);
+    let mut payload = canonical_payload_json(statement)?;
     if statement.id.len() != 64 || !statement.id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(StatementVerifyError::Id);
     }
+    let expected = crate::domain::attestation::hex_lower(&Sha256::digest(&payload));
     if !statement.id.eq_ignore_ascii_case(&expected) {
-        return Err(StatementVerifyError::IdMismatch);
+        payload = crate::domain::attestation::canonical_json_legacy_chains(&statement.payload())?;
+        let legacy_expected = crate::domain::attestation::hex_lower(&Sha256::digest(&payload));
+        if !statement.id.eq_ignore_ascii_case(&legacy_expected) {
+            return Err(StatementVerifyError::IdMismatch);
+        }
     }
     if statement.signer.len() > Chain::MAX_SOLANA_ADDRESS_CHARS {
         return Err(StatementVerifyError::SignerKey);
@@ -187,6 +194,7 @@ pub(crate) fn signed_test_statement(key: [u8; 32], dev: bool) -> Statement {
         id: String::new(),
         kind: "statement".to_owned(),
         version: 1,
+        label: String::new(),
         wallets: Vec::new(),
         assets: Vec::new(),
         positions: Vec::new(),

@@ -1,0 +1,46 @@
+{
+  "data": [
+    {
+      "id": "ton_ton_pool_0001",
+      "type": "pool",
+      "attributes": {
+        "address": "ton_pool_0001",
+        "name": "SPYx / TON",
+        "base_token_price_usd": "500.00",
+        "volume_usd": { "h24": "2500.00" },
+        "reserve_in_usd": "10000.00",
+        "pool_created_at": "2026-10-07T12:00:00Z"
+      },
+      "relationships": {
+        "base_token": { "data": { "id": "ton_EQB1fyBAA9qQDP6LEGaF3cbU-Xbr-p6ESBZGnqlHkHIHAJZv", "type": "token" } },
+        "quote_token": { "data": { "id": "ton_native", "type": "token" } },
+        "dex": { "data": { "id": "ton_stonfi", "type": "dex" } }
+      }
+    }
+  ],
+  "included": [
+    {
+      "id": "ton_EQB1fyBAA9qQDP6LEGaF3cbU-Xbr-p6ESBZGnqlHkHIHAJZv",
+      "type": "token",
+      "attributes": {
+        "address": "EQB1fyBAA9qQDP6LEGaF3cbU-Xbr-p6ESBZGnqlHkHIHAJZv",
+        "name": "SPY xStock",
+        "symbol": "SPYx"
+      }
+    },
+    {
+      "id": "ton_native",
+      "type": "token",
+      "attributes": {
+        "address": "native",
+        "name": "Toncoin",
+        "symbol": "TON"
+      }
+    },
+    {
+      "id": "ton_stonfi",
+      "type": "dex",
+      "attributes": { "name": "STON.fi", "identifier": "stonfi" }
+    }
+  ]
+}

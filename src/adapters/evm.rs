@@ -9,11 +9,15 @@ use crate::ports::ChainReader;
 use alloy::{
     eips::BlockId,
     network::Ethereum,
-    primitives::{Address, B256, U256, address, aliases::U24},
+    primitives::{
+        Address, B256, FixedBytes, U256, address,
+        aliases::{I24, U24},
+    },
     providers::{DynProvider, Provider, ProviderBuilder},
     rpc::client::RpcClient,
     rpc::types::Filter,
     sol,
+    sol_types::SolValue,
 };
 use alloy_json_rpc::{RequestPacket, ResponsePacket, ResponsePayload, RpcError};
 use alloy_transport::{TransportError, TransportErrorKind, TransportFut};
@@ -83,6 +87,7 @@ sol! {
             bool unlocked
         );
         function factory() external view returns (address value);
+        function tickSpacing() external view returns (int24 value);
     }
 
     #[sol(rpc)]
@@ -94,6 +99,13 @@ sol! {
     interface V3Factory {
         function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
     }
+    #[sol(rpc)]
+    interface RamsesV3Factory {
+        function getPool(address tokenA, address tokenB, int24 tickSpacing)
+            external
+            view
+            returns (address pool);
+    }
 
     #[sol(rpc)]
     interface StateView {
@@ -104,6 +116,16 @@ sol! {
             uint24 lpFee
         );
         function getLiquidity(bytes32 poolId) external view returns (uint128 liquidity);
+    }
+    #[sol(rpc)]
+    interface PositionManager {
+        function poolKeys(bytes25 poolId) external view returns (
+            address currency0,
+            address currency1,
+            uint24 fee,
+            int24 tickSpacing,
+            address hooks
+        );
     }
 
     event Initialize(
@@ -246,14 +268,22 @@ const UNI_V3_BASE: Address = address!("33128a8fC17869897dcE68Ed026d694621f6FDfD"
 const UNI_V3_BNB: Address = address!("dB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7");
 const UNI_V3_ROBINHOOD: Address = address!("1f7d7550B1b028f7571E69A784071F0205FD2EfA");
 
-// PancakeSwap v3 deployments: https://developer.pancakeswap.finance/contracts/v3/addresses
+// PancakeSwap deployments: https://developer.pancakeswap.finance/contracts/v3/addresses
+const PANCAKE_V2_BNB: Address = address!("ca143ce32fe78f1f7019d7d551a6402fc5350c73");
 const PANCAKE_V3_FACTORY: Address = address!("0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865");
-
-// Uniswap v4 StateView deployments: https://developers.uniswap.org/docs/protocols/v4/deployments
+// Ramses' official deployment table and RobinScan-verified factory:
+// https://www.ramses.xyz/docs/contract-addresses
+const RAMSES_V3_ROBINHOOD: Address = address!("e0c4ceb92d08ca985bb70fe0a22feb121a9854a8");
+// Uniswap v4 StateView and PositionManager deployments:
+// https://developers.uniswap.org/docs/protocols/v4/deployments
 const V4_STATEVIEW_ETHEREUM: Address = address!("7ffe42c4a5deea5b0fec41c94c136cf115597227");
 const V4_STATEVIEW_BASE: Address = address!("a3c0c9b65bad0b08107aa264b0f3db444b867a71");
 const V4_STATEVIEW_BNB: Address = address!("d13dd3d6e93f276fafc9db9e6bb47c1180aee0c4");
 const V4_STATEVIEW_ROBINHOOD: Address = address!("f3334192d15450cdd385c8b70e03f9a6bd9e673b");
+const V4_POSITION_MANAGER_ETHEREUM: Address = address!("bd216513d74c8cf14cf4747e6aaa6420ff64ee9e");
+const V4_POSITION_MANAGER_BASE: Address = address!("7c5f5a4bbd8fd63184577525326123b519429bdc");
+const V4_POSITION_MANAGER_BNB: Address = address!("7a4a5c919ae2541aed11041a1aeee68f1287f95b");
+const V4_POSITION_MANAGER_ROBINHOOD: Address = address!("58daec3116aae6d93017baaea7749052e8a04fa7");
 // Uniswap v4 deployments: https://developers.uniswap.org/docs/protocols/v4/deployments
 const V4_POOLMANAGER_ETHEREUM: Address = address!("000000000004444c5dc75cb358380d2e3de08a90");
 const V4_POOLMANAGER_BASE: Address = address!("498581ff718922c3f8e6a244956af099b2652b2b");
@@ -268,15 +298,18 @@ const V4_DEPLOYMENT_BASE: u64 = 25_350_988;
 const V4_DEPLOYMENT_ROBINHOOD: u64 = 9_070;
 // BNB deployment entry and transaction:
 // https://github.com/Uniswap/contracts/blob/main/deployments/56.md
-// https://bscscan.com/tx/0x64b395f1b0b3c734a477c802bc8cc3ce394f328c651290d0d166946048487bbe
+// https://bscscan.com/tx/0x64b395f1b0c3b734a477c802bc8cc3ce394f328c651290d0d166946048487bbe
 const V4_DEPLOYMENT_BNB: u64 = 45_970_610;
 
 #[derive(Clone, Copy)]
 struct Deployments {
     uniswap_v2: Option<Address>,
+    pancake_v2: Option<Address>,
     uniswap_v3: Option<Address>,
     pancake_v3: Option<Address>,
+    ramses_v3: Option<Address>,
     v4_state_view: Option<Address>,
+    v4_position_manager: Option<Address>,
     v4_pool_manager: Option<Address>,
     v4_deployment_block: u64,
 }
@@ -285,41 +318,56 @@ fn deployments(chain: Chain) -> Deployments {
     match chain {
         Chain::RobinhoodChain => Deployments {
             uniswap_v2: Some(UNI_V2_ROBINHOOD),
+            pancake_v2: None,
             uniswap_v3: Some(UNI_V3_ROBINHOOD),
-            pancake_v3: Some(PANCAKE_V3_FACTORY),
+            pancake_v3: None,
+            ramses_v3: Some(RAMSES_V3_ROBINHOOD),
             v4_state_view: Some(V4_STATEVIEW_ROBINHOOD),
+            v4_position_manager: Some(V4_POSITION_MANAGER_ROBINHOOD),
             v4_pool_manager: Some(V4_POOLMANAGER_ROBINHOOD),
             v4_deployment_block: V4_DEPLOYMENT_ROBINHOOD,
         },
         Chain::Base => Deployments {
             uniswap_v2: Some(UNI_V2_BASE),
+            pancake_v2: None,
             uniswap_v3: Some(UNI_V3_BASE),
-            pancake_v3: Some(PANCAKE_V3_FACTORY),
+            pancake_v3: None,
+            ramses_v3: None,
             v4_state_view: Some(V4_STATEVIEW_BASE),
+            v4_position_manager: Some(V4_POSITION_MANAGER_BASE),
             v4_pool_manager: Some(V4_POOLMANAGER_BASE),
             v4_deployment_block: V4_DEPLOYMENT_BASE,
         },
         Chain::Ethereum => Deployments {
             uniswap_v2: Some(UNI_V2_ETHEREUM),
+            pancake_v2: None,
             uniswap_v3: Some(UNI_V3_ETHEREUM),
-            pancake_v3: Some(PANCAKE_V3_FACTORY),
+            pancake_v3: None,
+            ramses_v3: None,
             v4_state_view: Some(V4_STATEVIEW_ETHEREUM),
+            v4_position_manager: Some(V4_POSITION_MANAGER_ETHEREUM),
             v4_pool_manager: Some(V4_POOLMANAGER_ETHEREUM),
             v4_deployment_block: V4_DEPLOYMENT_ETHEREUM,
         },
         Chain::Bnb => Deployments {
             uniswap_v2: Some(UNI_V2_BNB),
+            pancake_v2: Some(PANCAKE_V2_BNB),
             uniswap_v3: Some(UNI_V3_BNB),
             pancake_v3: Some(PANCAKE_V3_FACTORY),
+            ramses_v3: None,
             v4_state_view: Some(V4_STATEVIEW_BNB),
+            v4_position_manager: Some(V4_POSITION_MANAGER_BNB),
             v4_pool_manager: Some(V4_POOLMANAGER_BNB),
             v4_deployment_block: V4_DEPLOYMENT_BNB,
         },
         Chain::Solana => Deployments {
             uniswap_v2: None,
+            pancake_v2: None,
             uniswap_v3: None,
             pancake_v3: None,
+            ramses_v3: None,
             v4_state_view: None,
+            v4_position_manager: None,
             v4_pool_manager: None,
             v4_deployment_block: 0,
         },
@@ -949,56 +997,92 @@ impl EvmReader {
         let pair = V2Pair::new(pool, &self.provider);
         let reserves = pair.getReserves().call().await;
         record_eth_call(json!([canonical(pool), "getReserves()"]), &reserves.is_ok());
-        let dex =
-            if reserves.is_ok() {
-                let factory = pair.factory().call().await.map_err(|error| {
+        let v2_factory = if reserves.is_ok() {
+            let factory =
+                pair.factory().call().await.map_err(|error| {
                     PoolError::Reader(format!("reading v2 pool factory: {error}"))
                 })?;
-                record_eth_call(json!([canonical(pool), "factory()"]), &factory);
-                if configured.uniswap_v2 != Some(factory) {
-                    return Err(PoolError::Unknown(format!(
-                        "pool {pool} is not from a supported v2 factory"
-                    )));
-                }
-                let registered = V2Factory::new(factory, &self.provider)
-                    .getPair(token0, token1)
+            record_eth_call(json!([canonical(pool), "factory()"]), &factory);
+            if configured.uniswap_v2 == Some(factory) || configured.pancake_v2 == Some(factory) {
+                Some(factory)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let dex = if let Some(factory) = v2_factory {
+            let registered = V2Factory::new(factory, &self.provider)
+                .getPair(token0, token1)
+                .call()
+                .await
+                .map_err(|error| {
+                    PoolError::Reader(format!("checking v2 factory membership: {error}"))
+                })?;
+            record_eth_call(
+                json!([canonical(factory), "getPair", canonical(token0), canonical(token1)]),
+                &registered,
+            );
+            if registered != pool {
+                return Err(PoolError::UnsupportedVenue(format!(
+                    "pool {pool} is not registered by its V2 factory"
+                )));
+            }
+            if configured.pancake_v2 == Some(factory) { "pancake-v2" } else { "uniswap-v2" }
+        } else {
+            let slot0 = contract.slot0().call().await;
+            record_eth_call(json!([canonical(pool), "slot0()"]), &slot0.is_ok());
+            if slot0.is_err() {
+                return Err(PoolError::UnsupportedVenue(format!(
+                    "pool {pool} does not use a supported V2 or V3 interface"
+                )));
+            }
+            let factory =
+                contract.factory().call().await.map_err(|error| {
+                    PoolError::Reader(format!("reading V3 pool factory: {error}"))
+                })?;
+            record_eth_call(json!([canonical(pool), "factory()"]), &factory);
+            if configured.ramses_v3 == Some(factory) {
+                let tick_spacing = contract.tickSpacing().call().await.map_err(|error| {
+                    PoolError::Reader(format!("reading Ramses V3 tick spacing: {error}"))
+                })?;
+                record_eth_call(json!([canonical(pool), "tickSpacing()"]), &tick_spacing);
+                let registered = RamsesV3Factory::new(factory, &self.provider)
+                    .getPool(token0, token1, tick_spacing)
                     .call()
                     .await
                     .map_err(|error| {
-                        PoolError::Reader(format!("checking v2 factory membership: {error}"))
+                        PoolError::Reader(format!("checking Ramses V3 factory membership: {error}"))
                     })?;
                 record_eth_call(
-                    json!([canonical(factory), "getPair", canonical(token0), canonical(token1)]),
+                    json!([
+                        canonical(factory),
+                        "getPool",
+                        canonical(token0),
+                        canonical(token1),
+                        tick_spacing
+                    ]),
                     &registered,
                 );
                 if registered != pool {
-                    return Err(PoolError::Unknown(format!(
-                        "pool {pool} is not registered by its v2 factory"
+                    return Err(PoolError::UnsupportedVenue(format!(
+                        "pool {pool} is not registered by the configured Ramses V3 factory"
                     )));
                 }
-                "uniswap-v2"
+                "ramses-v3"
             } else {
-                let slot0 = contract.slot0().call().await;
-                record_eth_call(json!([canonical(pool), "slot0()"]), &slot0.is_ok());
-                if slot0.is_err() {
-                    return Err(PoolError::Unknown(format!("unsupported EVM pool {pool}")));
-                }
-                let factory = contract.factory().call().await.map_err(|error| {
-                    PoolError::Reader(format!("reading v3 pool factory: {error}"))
-                })?;
-                record_eth_call(json!([canonical(pool), "factory()"]), &factory);
                 let (known_factory, dex) = if configured.uniswap_v3 == Some(factory) {
                     (factory, "uniswap-v3")
                 } else if configured.pancake_v3 == Some(factory) {
                     (factory, "pancake-v3")
                 } else {
-                    return Err(PoolError::Unknown(format!(
-                        "pool {pool} is not from a supported v3 factory"
+                    return Err(PoolError::UnsupportedVenue(format!(
+                        "pool {pool} is not from a supported V3 factory"
                     )));
                 };
                 let fee =
                     contract.fee().call().await.map_err(|error| {
-                        PoolError::Reader(format!("reading v3 pool fee: {error}"))
+                        PoolError::Reader(format!("reading V3 pool fee: {error}"))
                     })?;
                 record_eth_call(json!([canonical(pool), "fee()"]), &fee);
                 let registered = V3Factory::new(known_factory, &self.provider)
@@ -1006,7 +1090,7 @@ impl EvmReader {
                     .call()
                     .await
                     .map_err(|error| {
-                        PoolError::Reader(format!("checking v3 factory membership: {error}"))
+                        PoolError::Reader(format!("checking V3 factory membership: {error}"))
                     })?;
                 record_eth_call(
                     json!([
@@ -1019,12 +1103,13 @@ impl EvmReader {
                     &registered,
                 );
                 if registered != pool {
-                    return Err(PoolError::Unknown(format!(
-                        "pool {pool} is not registered by its v3 factory"
+                    return Err(PoolError::UnsupportedVenue(format!(
+                        "pool {pool} is not registered by its V3 factory"
                     )));
                 }
                 dex
-            };
+            }
+        };
 
         let token0_side = self.token_side(pool, token0).await;
         let token1_side = self.token_side(pool, token1).await;
@@ -1036,15 +1121,86 @@ impl EvmReader {
 
         Ok(PoolInfo { chain: self.chain, pool: canonical(pool), dex: dex.to_owned(), base, quote })
     }
+    fn is_log_range_limit_error(error: &impl std::fmt::Display) -> bool {
+        let message = error.to_string().to_ascii_lowercase();
+        message.contains("range")
+            && [
+                "limit",
+                "maximum",
+                "max ",
+                "exceed",
+                "too large",
+                "too wide",
+                "too many",
+                "supported",
+            ]
+            .iter()
+            .any(|marker| message.contains(marker))
+    }
     async fn read_v4_pool_data(&self, pool_id: &str) -> Result<(PoolInfo, Vec<String>), PoolError> {
         let pool_id = B256::from_str(pool_id).map_err(|_| PoolError::InvalidAddress)?;
         let configured = deployments(self.chain);
         let state_view_address = configured
             .v4_state_view
             .ok_or_else(|| PoolError::Unknown("v4 StateView is unavailable".to_owned()))?;
+        let position_manager_address = configured
+            .v4_position_manager
+            .ok_or_else(|| PoolError::Unknown("v4 PositionManager is unavailable".to_owned()))?;
         let pool_manager = configured
             .v4_pool_manager
             .ok_or_else(|| PoolError::Unknown("v4 PoolManager is unavailable".to_owned()))?;
+
+        let pool_prefix = FixedBytes::<25>::from_slice(&pool_id.as_slice()[..25]);
+        let pool_key = PositionManager::new(position_manager_address, &self.provider)
+            .poolKeys(pool_prefix)
+            .call()
+            .await
+            .map_err(|error| PoolError::Reader(format!("reading v4 pool key: {error}")))?;
+        let pool_key_read = json!({
+            "currency0": format!("{:?}", pool_key.currency0),
+            "currency1": format!("{:?}", pool_key.currency1),
+            "fee": format!("{:?}", pool_key.fee),
+            "tickSpacing": format!("{:?}", pool_key.tickSpacing),
+            "hooks": format!("{:?}", pool_key.hooks)
+        });
+        record_eth_call(
+            json!([
+                format!("{position_manager_address:?}"),
+                "poolKeys",
+                raw_hex(pool_prefix.as_slice())
+            ]),
+            &pool_key_read,
+        );
+        let pool_key_is_empty = pool_key.currency0 == Address::ZERO
+            && pool_key.currency1 == Address::ZERO
+            && pool_key.fee == U24::ZERO
+            && pool_key.tickSpacing == I24::ZERO
+            && pool_key.hooks == Address::ZERO;
+        let resolved_key = if pool_key_is_empty {
+            None
+        } else {
+            let resolved_hash = alloy::primitives::keccak256(
+                (
+                    pool_key.currency0,
+                    pool_key.currency1,
+                    pool_key.fee,
+                    pool_key.tickSpacing,
+                    pool_key.hooks,
+                )
+                    .abi_encode(),
+            );
+            if resolved_hash != pool_id {
+                return Err(PoolError::Unknown(format!("v4 pool key hash mismatch for {pool_id}")));
+            }
+            Some((
+                pool_key.currency0,
+                pool_key.currency1,
+                pool_key.fee,
+                pool_key.tickSpacing,
+                pool_key.hooks,
+            ))
+        };
+
         let state_view = StateView::new(state_view_address, &self.provider);
         let slot0 = state_view
             .getSlot0(pool_id)
@@ -1068,57 +1224,99 @@ impl EvmReader {
             return Err(PoolError::Unknown(format!("v4 pool {pool_id} is not initialised")));
         }
 
-        let filter = Filter::new()
-            .address(pool_manager)
-            .event("Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)")
-            .topic1(pool_id);
-        let latest_block = self.provider.get_block_number().await.map_err(|error| {
-            PoolError::Reader(format!("reading latest block for v4 logs: {error}"))
-        })?;
-        let latest_value = Value::String(format!("0x{latest_block:x}"));
-        crate::ports::record_read(
-            "eth_blockNumber",
-            json!([]),
-            &latest_value,
-            false,
-            Some(latest_block),
-            None,
-        );
-        const LOG_CHUNK: u64 = 5_000_000;
-        let mut from_block = configured.v4_deployment_block;
-        let mut event = None;
-        while from_block <= latest_block {
-            let to_block = from_block.saturating_add(LOG_CHUNK - 1).min(latest_block);
-            let logs = self
-                .provider
-                .get_logs(&filter.clone().from_block(from_block).to_block(to_block))
-                .await
-                .map_err(|error| {
-                    PoolError::Reader(format!("reading v4 Initialize logs: {error}"))
-                })?;
-            record_eth_call(
-                json!([format!("{pool_manager:?}"), "eth_getLogs", from_block, to_block]),
-                &logs,
-            );
-            event = logs.iter().find_map(|log| {
-                log.log_decode::<Initialize>().ok().map(|decoded| decoded.data().clone())
-            });
-            if event.is_some() || to_block == latest_block {
-                break;
+        let (currency0, currency1, fee, tick_spacing, hooks, key_source) = match resolved_key {
+            Some((currency0, currency1, fee, tick_spacing, hooks)) => {
+                (currency0, currency1, fee, tick_spacing, hooks, "PositionManager.poolKeys")
             }
-            from_block = to_block.saturating_add(1);
-        }
-        let event = event.ok_or_else(|| {
-            PoolError::Unknown(format!("v4 Initialize event not found for {pool_id}"))
-        })?;
+            None => {
+                const MAX_LOG_WINDOWS: usize = 20;
+                const SCAN_DEADLINE: Duration = Duration::from_secs(10);
+                let filter = Filter::new()
+                    .address(pool_manager)
+                    .event("Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)")
+                    .topic1(pool_id);
+                let log_chunk: u64 = if self.chain == Chain::RobinhoodChain { 10 } else { 1_000 };
+                let event = tokio::time::timeout(SCAN_DEADLINE, async {
+                    let latest_block = self.provider.get_block_number().await.map_err(|error| {
+                        PoolError::Reader(format!("reading latest block for v4 logs: {error}"))
+                    })?;
+                    let latest_value = Value::String(format!("0x{latest_block:x}"));
+                    crate::ports::record_read(
+                        "eth_blockNumber",
+                        json!([]),
+                        &latest_value,
+                        false,
+                        Some(latest_block),
+                        None,
+                    );
+                    let max_span = log_chunk.saturating_mul(MAX_LOG_WINDOWS as u64);
+                    let mut from_block = latest_block
+                        .saturating_sub(max_span.saturating_sub(1))
+                        .max(configured.v4_deployment_block);
+                    for _ in 0..MAX_LOG_WINDOWS {
+                        if from_block > latest_block {
+                            break;
+                        }
+                        let to_block = from_block.saturating_add(log_chunk - 1).min(latest_block);
+                        let logs = self
+                            .provider
+                            .get_logs(&filter.clone().from_block(from_block).to_block(to_block))
+                            .await
+                            .map_err(|error| {
+                                if Self::is_log_range_limit_error(&error) {
+                                    PoolError::RpcLimit("provider rejected v4 Initialize log range")
+                                } else {
+                                    PoolError::Reader(format!(
+                                        "reading v4 Initialize logs: {error}"
+                                    ))
+                                }
+                            })?;
+                        record_eth_call(
+                            json!([
+                                format!("{pool_manager:?}"),
+                                "eth_getLogs",
+                                from_block,
+                                to_block
+                            ]),
+                            &logs,
+                        );
+                        if let Some(event) = logs.iter().find_map(|log| {
+                            log.log_decode::<Initialize>()
+                                .ok()
+                                .map(|decoded| decoded.data().clone())
+                        }) {
+                            return Ok::<_, PoolError>(Some(event));
+                        }
+                        if to_block == latest_block {
+                            break;
+                        }
+                        from_block = to_block.saturating_add(1);
+                    }
+                    Ok(None)
+                })
+                .await
+                .map_err(|_| PoolError::RpcLimit("v4 Initialize scan deadline exceeded"))??;
+                let event = event.ok_or(PoolError::RpcLimit(
+                    "v4 Initialize event is outside the bounded recent scan window",
+                ))?;
+                (
+                    event.currency0,
+                    event.currency1,
+                    event.fee,
+                    event.tickSpacing,
+                    event.hooks,
+                    "bounded recent Initialize log",
+                )
+            }
+        };
 
         let q96 = U256::from(1_u8) << 96;
         let liquidity = U256::from(liquidity);
         let sqrt_price = U256::from(slot0.sqrtPriceX96);
         let amount0 = if sqrt_price == 0 { U256::ZERO } else { liquidity * q96 / sqrt_price };
         let amount1 = liquidity * sqrt_price / q96;
-        let token0 = self.token_side_with_balance(event.currency0, amount0).await;
-        let token1 = self.token_side_with_balance(event.currency1, amount1).await;
+        let token0 = self.token_side_with_balance(currency0, amount0).await;
+        let token1 = self.token_side_with_balance(currency1, amount1).await;
         let pool = PoolInfo {
             chain: self.chain,
             pool: pool_id.to_string(),
@@ -1127,13 +1325,10 @@ impl EvmReader {
             quote: token1,
         };
         let evidence = vec![
+            format!("Uniswap v4 pool key source: {key_source}."),
+            format!("Uniswap v4 pool key resolved currencies {currency0} and {currency1}."),
             format!(
-                "Uniswap v4 Initialize resolved currencies {} and {}.",
-                event.currency0, event.currency1
-            ),
-            format!(
-                "Uniswap v4 fee {} (tick spacing {}) and hooks address {}.",
-                event.fee, event.tickSpacing, event.hooks
+                "Uniswap v4 fee {fee} (tick spacing {tick_spacing}) and hooks address {hooks}."
             ),
             format!(
                 "v4 reserves are approximate, v4 concentrated liquidity: amount0={} and amount1={} raw units from liquidity {} and sqrtPriceX96 {}.",
@@ -1142,6 +1337,7 @@ impl EvmReader {
         ];
         Ok((pool, evidence))
     }
+
     pub async fn read_v4_pool(&self, pool_id: &str) -> Result<(PoolInfo, Vec<String>), PoolError> {
         self.read_v4_pool_data(pool_id).await
     }
@@ -1639,6 +1835,7 @@ mod tests {
             last_checked: "2026-10-04T00:00:00Z".to_owned(),
             removed_at: None,
             stale_since: None,
+            official_deployments: Vec::new(),
         }
     }
     #[test]
@@ -1833,7 +2030,22 @@ mod tests {
     }
 
     fn standard_v2_pool(map: &mut HashMap<String, String>, pool: &str, token0: &str, token1: &str) {
-        let factory = "0x8909dc15e40173ff4699343b6eb8132c65e18ec6";
+        standard_v2_pool_from_factory(
+            map,
+            pool,
+            token0,
+            token1,
+            "0x8909dc15e40173ff4699343b6eb8132c65e18ec6",
+        );
+    }
+
+    fn standard_v2_pool_from_factory(
+        map: &mut HashMap<String, String>,
+        pool: &str,
+        token0: &str,
+        token1: &str,
+        factory: &str,
+    ) {
         put_call(map, pool, "0x0dfe1681", address_word(token0));
         put_call(map, pool, "0xd21220a7", address_word(token1));
         put_call(
@@ -1948,7 +2160,15 @@ mod tests {
                 .unwrap();
                 json!({"jsonrpc":"2.0","id":id,"error":error})
             }
-            Some(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
+            Some(result) => {
+                let result = if request["method"] == "eth_getLogs" {
+                    serde_json::from_str::<Value>(&result)
+                        .expect("fixture eth_getLogs response is JSON")
+                } else {
+                    Value::String(result)
+                };
+                json!({"jsonrpc":"2.0","id":id,"result":result})
+            }
             None => json!({
                 "jsonrpc":"2.0",
                 "id":id,
@@ -2065,6 +2285,7 @@ mod tests {
                 request["params"][1].as_str().unwrap_or_default(),
             ),
             Some("eth_getCode") => get_code_key(request["params"][0].as_str().unwrap_or_default()),
+            Some("eth_getLogs") => "eth_getLogs".to_owned(),
             _ => String::new(),
         }
     }
@@ -2113,6 +2334,151 @@ mod tests {
     fn function_selector(signature: &str) -> String {
         let hash = alloy::primitives::keccak256(signature.as_bytes());
         raw_hex(&hash[..4])
+    }
+
+    fn v4_pool_key_fixture() -> (B256, HashMap<String, String>) {
+        let currency0 = TOKEN0.parse::<Address>().unwrap();
+        let currency1 = TOKEN1.parse::<Address>().unwrap();
+        let hooks = Address::ZERO;
+        let fee = U24::from(3_000_u32);
+        let tick_spacing = I24::try_from(60_i32).unwrap();
+        let pool_id = alloy::primitives::keccak256(
+            (currency0, currency1, fee, tick_spacing, hooks).abi_encode(),
+        );
+        let mut map = responses();
+        let position_manager = format!("{V4_POSITION_MANAGER_ROBINHOOD:?}");
+        put_selector(
+            &mut map,
+            &position_manager,
+            &function_selector("poolKeys(bytes25)"),
+            format!(
+                "0x{}{}{}{}{}",
+                address_word(TOKEN0).trim_start_matches("0x"),
+                address_word(TOKEN1).trim_start_matches("0x"),
+                uint_word(3_000),
+                uint_word(60),
+                address_word("0x0000000000000000000000000000000000000000").trim_start_matches("0x")
+            ),
+        );
+        let state_view = format!("{V4_STATEVIEW_ROBINHOOD:?}");
+        put_selector(
+            &mut map,
+            &state_view,
+            &function_selector("getSlot0(bytes32)"),
+            format!(
+                "0x{:064x}{}{}{}",
+                U256::from(1_u8) << 96,
+                uint_word(0),
+                uint_word(0),
+                uint_word(0)
+            ),
+        );
+        put_selector(
+            &mut map,
+            &state_view,
+            &function_selector("getLiquidity(bytes32)"),
+            format!("0x{}", uint_word(1)),
+        );
+        (pool_id, map)
+    }
+
+    #[tokio::test]
+    async fn resolves_v4_pool_from_verified_position_manager_key_without_logs() {
+        let (pool_id, map) = v4_pool_key_fixture();
+        let (url, task, requests) = fixture_server_with_trace(map).await;
+        let reader = EvmReader::new(Chain::RobinhoodChain, &url).unwrap();
+        let (pool, evidence) = reader.read_v4_pool(&pool_id.to_string()).await.unwrap();
+        task.abort();
+
+        assert_eq!(pool.dex, "uniswap-v4");
+        assert_eq!(pool.base.address, TOKEN0);
+        assert_eq!(pool.quote.address, TOKEN1);
+        assert!(evidence.iter().any(|line| line.contains("pool key resolved")));
+        let requests = requests.lock().expect("request trace lock");
+        assert!(requests.iter().all(|request| request["method"] != "eth_getLogs"));
+        let key_call = requests
+            .iter()
+            .find(|request| {
+                request["method"] == "eth_call"
+                    && request["params"][0]["to"] == format!("{V4_POSITION_MANAGER_ROBINHOOD:?}")
+            })
+            .expect("PositionManager poolKeys call");
+        let calldata = key_call["params"][0]
+            .get("input")
+            .or_else(|| key_call["params"][0].get("data"))
+            .and_then(Value::as_str)
+            .expect("poolKeys calldata");
+        let expected_prefix = format!("{:0<64}", alloy::hex::encode(&pool_id.as_slice()[..25]));
+        assert_eq!(&calldata[10..], expected_prefix);
+    }
+
+    #[tokio::test]
+    async fn v4_recent_scan_stops_at_the_window_cap_with_typed_rpc_limit() {
+        let (pool_id, mut map) = v4_pool_key_fixture();
+        let position_manager = format!("{V4_POSITION_MANAGER_ROBINHOOD:?}");
+        put_selector(
+            &mut map,
+            &position_manager,
+            &function_selector("poolKeys(bytes25)"),
+            format!(
+                "0x{}{}{}{}{}",
+                "0".repeat(64),
+                "0".repeat(64),
+                uint_word(0),
+                uint_word(0),
+                "0".repeat(64)
+            ),
+        );
+        map.insert("eth_blockNumber".to_owned(), format!("0x{:x}", V4_DEPLOYMENT_ROBINHOOD + 199));
+        map.insert("eth_getLogs".to_owned(), "[]".to_owned());
+        let (url, task, requests) = fixture_server_with_trace(map).await;
+        let reader = EvmReader::new(Chain::RobinhoodChain, &url).unwrap();
+        let result = reader.read_v4_pool(&pool_id.to_string()).await;
+        task.abort();
+
+        assert!(
+            matches!(
+                result,
+                Err(PoolError::RpcLimit(reason)) if reason.contains("bounded recent scan window")
+            ),
+            "unexpected V4 fallback result: {result:?}"
+        );
+        let requests = requests.lock().expect("request trace lock");
+        let windows = requests
+            .iter()
+            .filter(|request| request["method"] == "eth_getLogs")
+            .collect::<Vec<_>>();
+        assert_eq!(windows.len(), 20);
+        assert_eq!(
+            windows[0]["params"][0]["fromBlock"],
+            format!("0x{:x}", V4_DEPLOYMENT_ROBINHOOD)
+        );
+        assert_eq!(
+            windows[19]["params"][0]["toBlock"],
+            format!("0x{:x}", V4_DEPLOYMENT_ROBINHOOD + 199)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_v4_pool_key_hash_mismatch_without_log_fallback() {
+        let (_, map) = v4_pool_key_fixture();
+        let (url, task, requests) = fixture_server_with_trace(map).await;
+        let reader = EvmReader::new(Chain::RobinhoodChain, &url).unwrap();
+        let unrelated_id = format!("0x{}", "ab".repeat(32));
+        let result = reader.read_v4_pool(&unrelated_id).await;
+        task.abort();
+
+        assert!(matches!(
+            result,
+            Err(PoolError::Unknown(reason)) if reason.contains("pool key hash mismatch")
+        ));
+        assert!(
+            requests
+                .lock()
+                .expect("request trace lock")
+                .iter()
+                .all(|request| request["method"] != "eth_getLogs")
+        );
     }
 
     #[tokio::test]
@@ -2483,6 +2849,138 @@ mod tests {
         assert_eq!(pool.base.address, TOKEN1);
         assert_eq!(pool.quote.balance.as_deref(), Some("41"));
         assert_eq!(pool.base.balance.as_deref(), Some("99"));
+    }
+
+    #[tokio::test]
+    async fn recognizes_pancake_v2_factory_membership_and_records_provenance() {
+        let pool_address = "0x0000000000000000000000000000000000000035";
+        let factory = format!("{PANCAKE_V2_BNB:?}");
+        let mut map = responses();
+        standard_v2_pool_from_factory(&mut map, pool_address, TOKEN0, TOKEN1, &factory);
+        token_balances(&mut map, pool_address, TOKEN0, 41, TOKEN1, 99);
+        let (reader, task) = reader_for(map, Chain::Bnb).await;
+        let (result, evidence) =
+            crate::ports::capture_reads(reader.read_pool_with_quotes(pool_address, &[])).await;
+        task.abort();
+
+        let pool = result.expect("registered Pancake V2 pool");
+        assert_eq!(pool.dex, "pancake-v2");
+        assert!(evidence.reads.iter().any(|read| {
+            read.method == "eth_call"
+                && read.params[0]
+                    .as_str()
+                    .is_some_and(|address| address.eq_ignore_ascii_case(&factory))
+                && read.params[1] == "getPair"
+        }));
+    }
+
+    #[tokio::test]
+    async fn recognizes_ramses_v3_factory_membership_and_records_provenance() {
+        let pool_address = "0x0000000000000000000000000000000000000036";
+        let factory = format!("{RAMSES_V3_ROBINHOOD:?}");
+        let mut map = responses();
+        standard_v3_pool(&mut map, pool_address, TOKEN0, TOKEN1, &factory);
+        put_call(
+            &mut map,
+            pool_address,
+            &function_selector("tickSpacing()"),
+            format!("0x{}", uint_word(60)),
+        );
+        put_selector(
+            &mut map,
+            &factory,
+            &function_selector("getPool(address,address,int24)"),
+            address_word(pool_address),
+        );
+        token_balances(&mut map, pool_address, TOKEN0, 41, TOKEN1, 99);
+        let (reader, task) = reader_for(map, Chain::RobinhoodChain).await;
+        let (result, evidence) =
+            crate::ports::capture_reads(reader.read_pool_with_quotes(pool_address, &[])).await;
+        task.abort();
+
+        let pool = result.expect("registered Ramses V3 pool");
+        assert_eq!(pool.dex, "ramses-v3");
+        assert!(
+            evidence
+                .reads
+                .iter()
+                .any(|read| { read.params.get(1).is_some_and(|method| method == "tickSpacing()") })
+        );
+        let get_pool_reads: Vec<_> = evidence
+            .reads
+            .iter()
+            .filter(|read| read.params.get(1).is_some_and(|method| method == "getPool"))
+            .collect();
+        assert!(
+            get_pool_reads.iter().any(|read| {
+                read.method == "eth_call"
+                    && read.params[0]
+                        .as_str()
+                        .is_some_and(|address| address.eq_ignore_ascii_case(&factory))
+                    && read.params[2] == canonical(TOKEN0.parse().unwrap())
+                    && read.params[3] == canonical(TOKEN1.parse().unwrap())
+                    && (read.params[4].as_i64() == Some(60)
+                        || read.params[4].as_str().and_then(|value| value.parse::<i64>().ok())
+                            == Some(60))
+            }),
+            "Ramses getPool read evidence: {get_pool_reads:?}"
+        );
+    }
+    #[tokio::test]
+    async fn recognizes_pancake_v3_factory_membership_and_records_provenance() {
+        let pool_address = "0x0000000000000000000000000000000000000038";
+        let factory = format!("{PANCAKE_V3_FACTORY:?}");
+        let mut map = responses();
+        standard_v3_pool(&mut map, pool_address, TOKEN0, TOKEN1, &factory);
+        token_balances(&mut map, pool_address, TOKEN0, 41, TOKEN1, 99);
+        let (reader, task) = reader_for(map, Chain::Bnb).await;
+        let (result, evidence) =
+            crate::ports::capture_reads(reader.read_pool_with_quotes(pool_address, &[])).await;
+        task.abort();
+
+        let pool = result.expect("registered Pancake V3 pool");
+        assert_eq!(pool.dex, "pancake-v3");
+        let membership_read = evidence
+            .reads
+            .iter()
+            .find(|read| {
+                read.method == "eth_call"
+                    && read.params.get(1).is_some_and(|method| method == "getPool")
+            })
+            .expect("Pancake V3 getPool read evidence");
+        assert!(
+            membership_read.params[0]
+                .as_str()
+                .is_some_and(|address| address.eq_ignore_ascii_case(&factory))
+        );
+        assert_eq!(membership_read.params[2], canonical(TOKEN0.parse().unwrap()));
+        assert_eq!(membership_read.params[3], canonical(TOKEN1.parse().unwrap()));
+        let fee = membership_read.params[4].as_u64().or_else(|| {
+            membership_read.params[4].as_str().and_then(|value| {
+                value.parse::<u64>().ok().or_else(|| {
+                    value.strip_prefix("0x").and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                })
+            })
+        });
+        assert_eq!(fee, Some(3_000));
+    }
+
+    #[tokio::test]
+    async fn unknown_v3_factory_is_typed_as_unsupported_venue() {
+        let pool_address = "0x0000000000000000000000000000000000000037";
+        let mut map = responses();
+        standard_v3_pool(
+            &mut map,
+            pool_address,
+            TOKEN0,
+            TOKEN1,
+            "0x0000000000000000000000000000000000000001",
+        );
+        let (reader, task) = reader_for(map, Chain::Base).await;
+        let result = reader.read_pool(pool_address).await;
+        task.abort();
+
+        assert!(matches!(result, Err(PoolError::UnsupportedVenue(_))));
     }
 
     #[tokio::test]

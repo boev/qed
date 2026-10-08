@@ -68,10 +68,7 @@
   </dl>
   <div class="pool-card-footer">
       <time data-relative-time datetime="{{ pool.updated_at }}">{{ pool.updated_at }}</time>
-    <form hx-post="/check" hx-target="#result" hx-swap="innerHTML">
-      <input type="hidden" name="address" value="{{ pool.pool }}">
-      <button class="check-pool" type="submit">Check <span aria-hidden="true">↗</span></button>
-    </form>
+      <a class="check-pool" href="/guard/{{ pool.chain_slug }}/{{ pool.pool }}">Review with Guard <span aria-hidden="true">↗</span></a>
   </div>
 </article>
 {% endfor %}

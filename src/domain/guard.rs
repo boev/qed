@@ -32,6 +32,13 @@ pub struct GuardIdentityCandidate {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct GuardDeployment {
+    pub network: String,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GuardIdentity {
     pub publisher: Option<String>,
     pub matched_contract: Option<String>,
@@ -39,6 +46,14 @@ pub struct GuardIdentity {
     pub status: IdentityStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate: Option<GuardIdentityCandidate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpublished_product_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deployments: Vec<GuardDeployment>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -228,13 +243,17 @@ pub fn verify(document: &GuardDocument) -> Result<(), GuardVerifyError> {
     if document.signature.len() != 88 {
         return Err(GuardVerifyError::SignatureLength);
     }
-    let payload = canonical_payload_json(document)?;
-    let expected = crate::domain::attestation::hex_lower(&Sha256::digest(&payload));
+    let mut payload = canonical_payload_json(document)?;
     if document.id.len() != 64 || !document.id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(GuardVerifyError::Id);
     }
+    let expected = crate::domain::attestation::hex_lower(&Sha256::digest(&payload));
     if !document.id.eq_ignore_ascii_case(&expected) {
-        return Err(GuardVerifyError::IdMismatch);
+        payload = crate::domain::attestation::canonical_json_legacy_chains(&document.payload())?;
+        let legacy_expected = crate::domain::attestation::hex_lower(&Sha256::digest(&payload));
+        if !document.id.eq_ignore_ascii_case(&legacy_expected) {
+            return Err(GuardVerifyError::IdMismatch);
+        }
     }
     let mut public_key_bytes = [0; 32];
     let public_key_len = bs58::decode(&document.public_key)
@@ -278,25 +297,72 @@ pub(crate) fn identify_with_contract_metadata(
     entries: &[Entry],
     publisher_metadata: &std::collections::HashMap<String, TokenMeta>,
 ) -> GuardIdentity {
+    let mut identity = identify_inner(chain, address, metadata, entries, publisher_metadata);
+    if let Some(metadata) = metadata {
+        identity.observed_symbol.clone_from(&metadata.symbol);
+        identity.observed_name.clone_from(&metadata.name);
+    }
+    identity
+}
+
+fn identify_inner(
+    chain: Chain,
+    address: &str,
+    metadata: Option<&TokenMeta>,
+    entries: &[Entry],
+    publisher_metadata: &std::collections::HashMap<String, TokenMeta>,
+) -> GuardIdentity {
     if let Some(entry) = registry::lookup(entries, chain, address) {
-        return identity_for(entry, IdentityStatus::Match);
+        let mut identity = identity_for(entries, entry, IdentityStatus::Match);
+        identity.matched_contract = Some(address.to_owned());
+        return identity;
     }
     match registry::match_status(entries, chain, address) {
         registry::MatchStatus::Stale { .. } => {
             if let Some(entry) = registry_entry_for(entries, chain, address, |entry| {
                 entry.stale_since.is_some() && entry.removed_at.is_none()
             }) {
-                return identity_for(entry, IdentityStatus::RegistryStale);
+                return identity_for(entries, entry, IdentityStatus::RegistryStale);
             }
         }
         registry::MatchStatus::Removed { .. } => {
             if let Some(entry) =
                 registry_entry_for(entries, chain, address, |entry| entry.removed_at.is_some())
             {
-                return identity_for(entry, IdentityStatus::RegistryRemoved);
+                return identity_for(entries, entry, IdentityStatus::RegistryRemoved);
             }
         }
         registry::MatchStatus::Active | registry::MatchStatus::NotFound => {}
+    }
+
+    if let Some(metadata) = metadata.filter(|metadata| metadata_complete(metadata)) {
+        for entry in entries.iter().filter(|entry| registry::matchable(entry)) {
+            if entry.chain == chain && same_contract(chain, address, &entry.contract) {
+                continue;
+            }
+            if !metadata_resembles_entry(metadata, entry)
+                && !metadata_claims_product_symbol(metadata, entry)
+            {
+                continue;
+            }
+            let Some(published) = publisher_metadata
+                .get(&issuer_metadata_key(entry.chain, &entry.contract))
+                .filter(|published| same_product_metadata(metadata, published))
+            else {
+                continue;
+            };
+            let Some(detail) =
+                unpublished_product_detail(entries, entry, chain, address, published)
+            else {
+                continue;
+            };
+            let mut identity = identity_for(entries, entry, IdentityStatus::Mismatch);
+            if entry.chain != chain {
+                identity.matched_contract = None;
+            }
+            identity.unpublished_product_detail = Some(detail);
+            return identity;
+        }
     }
 
     let mut candidate = None;
@@ -304,16 +370,18 @@ pub(crate) fn identify_with_contract_metadata(
         for exact_ticker in [true, false] {
             for entry in entries {
                 if !registry::matchable(entry)
-                    || entry.chain != chain
-                    || !metadata_resembles_entry(metadata, entry)
+                    || (!metadata_resembles_entry(metadata, entry)
+                        && !metadata_claims_product_symbol(metadata, entry))
                     || exact_ticker_candidate(metadata, entry) != exact_ticker
                 {
                     continue;
                 }
-                let published =
-                    publisher_metadata.get(&issuer_metadata_key(chain, &entry.contract));
-                if is_contradicted_claim(chain, metadata, entry, published) {
-                    return identity_for(entry, IdentityStatus::Mismatch);
+                if entry.chain == chain {
+                    let published =
+                        publisher_metadata.get(&issuer_metadata_key(entry.chain, &entry.contract));
+                    if is_contradicted_claim(chain, metadata, entry, published) {
+                        return identity_for(entries, entry, IdentityStatus::Mismatch);
+                    }
                 }
                 candidate.get_or_insert(entry);
             }
@@ -330,6 +398,10 @@ pub(crate) fn identify_with_contract_metadata(
                 ticker: entry.ticker.clone(),
                 name: entry.name.clone(),
             }),
+            unpublished_product_detail: None,
+            observed_symbol: None,
+            observed_name: None,
+            deployments: Vec::new(),
         };
     }
     no_publisher()
@@ -348,6 +420,103 @@ pub(crate) fn metadata_resembles_entry(metadata: &TokenMeta, entry: &Entry) -> b
             .name
             .as_deref()
             .is_some_and(|name| claims_name(name, &entry.ticker, &entry.name))
+}
+pub(crate) fn metadata_claims_product_symbol(metadata: &TokenMeta, entry: &Entry) -> bool {
+    metadata.symbol.as_deref().is_some_and(|symbol| {
+        let symbol = normalized_identity(symbol);
+        let ticker = normalized_identity(&entry.ticker);
+        symbol == ticker || symbol == format!("{ticker}x")
+    })
+}
+
+fn same_product_metadata(left: &TokenMeta, right: &TokenMeta) -> bool {
+    if !metadata_complete(left) || !metadata_complete(right) {
+        return false;
+    }
+    normalized_identity(left.symbol.as_deref().unwrap())
+        == normalized_identity(right.symbol.as_deref().unwrap())
+        && normalized_identity(left.name.as_deref().unwrap())
+            == normalized_identity(right.name.as_deref().unwrap())
+}
+
+fn unpublished_product_detail(
+    entries: &[Entry],
+    entry: &Entry,
+    chain: Chain,
+    address: &str,
+    published: &TokenMeta,
+) -> Option<String> {
+    let product_entries = entries.iter().filter(|candidate| {
+        registry::matchable(candidate)
+            && candidate.issuer == entry.issuer
+            && candidate.ticker == entry.ticker
+    });
+    let official_entry =
+        product_entries.clone().find(|candidate| !candidate.official_deployments.is_empty());
+    let networks = if let Some(official_entry) = official_entry {
+        if registry::official_deployment_matches(official_entry, chain, address) {
+            return None;
+        }
+        registry::official_networks(official_entry)
+    } else {
+        let networks = product_entries
+            .filter(|candidate| candidate.chain == chain)
+            .map(|candidate| candidate.chain.to_string())
+            .collect::<Vec<_>>();
+        if networks.is_empty() {
+            return None;
+        }
+        networks
+    };
+    if networks.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "QED Guard found an exact on-chain symbol/name match for {} ({}), but this address is absent from {}'s published deployment catalog. The catalog lists deployments on {}.",
+        published.name.as_deref()?,
+        entry.ticker,
+        entry.issuer,
+        networks.join(", ")
+    ))
+}
+fn identity_deployments(entries: &[Entry], entry: &Entry) -> Vec<GuardDeployment> {
+    let product_entries = entries
+        .iter()
+        .filter(|candidate| {
+            registry::matchable(candidate)
+                && candidate.issuer == entry.issuer
+                && candidate.ticker == entry.ticker
+        })
+        .collect::<Vec<_>>();
+    let mut deployments = Vec::new();
+    let mut add = |network: String, address: String| {
+        let network =
+            Chain::from_network_name(&network).map(|chain| chain.to_string()).unwrap_or(network);
+        if !deployments.iter().any(|existing: &GuardDeployment| {
+            existing.network == network && existing.address == address
+        }) {
+            deployments.push(GuardDeployment { network, address });
+        }
+    };
+    if let Some(official) =
+        product_entries.iter().find(|candidate| !candidate.official_deployments.is_empty())
+    {
+        for deployment in &official.official_deployments {
+            add(deployment.network.clone(), deployment.address.clone());
+            if let Some(address) = &deployment.wrapper_address {
+                add(deployment.network.clone(), address.clone());
+            }
+            if let Some(address) = &deployment.wrapper_address_v2 {
+                add(deployment.network.clone(), address.clone());
+            }
+        }
+    } else {
+        for candidate in product_entries {
+            add(candidate.chain.to_string(), candidate.contract.clone());
+        }
+    }
+    deployments
 }
 
 pub(crate) fn metadata_complete(metadata: &TokenMeta) -> bool {
@@ -369,7 +538,9 @@ fn registry_entry_for<'a>(
     predicate: impl Fn(&Entry) -> bool,
 ) -> Option<&'a Entry> {
     entries.iter().find(|entry| {
-        entry.chain == chain && same_contract(chain, &entry.contract, address) && predicate(entry)
+        ((entry.chain == chain && same_contract(chain, &entry.contract, address))
+            || registry::official_deployment_matches(entry, chain, address))
+            && predicate(entry)
     })
 }
 
@@ -410,16 +581,24 @@ fn no_publisher() -> GuardIdentity {
         ticker: None,
         status: IdentityStatus::NoPublisher,
         candidate: None,
+        unpublished_product_detail: None,
+        observed_symbol: None,
+        observed_name: None,
+        deployments: Vec::new(),
     }
 }
 
-fn identity_for(entry: &Entry, status: IdentityStatus) -> GuardIdentity {
+fn identity_for(entries: &[Entry], entry: &Entry, status: IdentityStatus) -> GuardIdentity {
     GuardIdentity {
         publisher: Some(entry.issuer.clone()),
         matched_contract: Some(entry.contract.clone()),
         ticker: Some(entry.ticker.clone()),
         status,
         candidate: None,
+        unpublished_product_detail: None,
+        observed_symbol: None,
+        observed_name: None,
+        deployments: identity_deployments(entries, entry),
     }
 }
 
@@ -441,11 +620,17 @@ pub(crate) fn evaluate(
         IdentityStatus::Mismatch => {
             deny = true;
             reasons.push(GuardReason {
-                code: "publisher_contract_mismatch".to_owned(),
-                detail: format!(
-                    "The token symbol and name match {}, but this contract is not the publisher's active contract on this chain.",
-                    identity.ticker.as_deref().unwrap_or("a registry ticker")
-                ),
+                code: if identity.unpublished_product_detail.is_some() {
+                    "claims_unpublished_publisher_product".to_owned()
+                } else {
+                    "publisher_contract_mismatch".to_owned()
+                },
+                detail: identity.unpublished_product_detail.clone().unwrap_or_else(|| {
+                    format!(
+                        "The token symbol and name match {}, but this contract is not the publisher's active contract on this chain.",
+                        identity.ticker.as_deref().unwrap_or("a registry ticker")
+                    )
+                }),
             });
         }
         IdentityStatus::NoPublisher if identity.candidate.is_some() => {
@@ -590,6 +775,10 @@ pub(crate) fn signed_test_guard_with_dev(seed: [u8; 32], dev: bool) -> GuardDocu
             ticker: Some("NVDA".to_owned()),
             status: IdentityStatus::Match,
             candidate: None,
+            unpublished_product_detail: None,
+            observed_symbol: None,
+            observed_name: None,
+            deployments: Vec::new(),
         },
         powers: None,
         source: GuardSource { status: SourceStatus::Unavailable, provider: "Sourcify".to_owned() },
@@ -631,6 +820,7 @@ mod tests {
             last_checked: "2026-10-01T00:00:00Z".to_owned(),
             removed_at: None,
             stale_since: None,
+            official_deployments: Vec::new(),
         }
     }
 
@@ -719,6 +909,76 @@ mod tests {
         assert_eq!(identity.status, IdentityStatus::Mismatch);
         assert_eq!(identity.matched_contract.as_deref(), Some(published.contract.as_str()));
     }
+    #[test]
+    fn cross_chain_mismatch_never_labels_published_address_without_its_chain() {
+        let mut published = entry("0x0000000000000000000000000000000000000001", "NVDA", "NVIDIA");
+        published.chain = Chain::RobinhoodChain;
+        published.official_deployments = vec![
+            crate::domain::registry::OfficialDeployment {
+                network: "Robinhood Chain".to_owned(),
+                address: published.contract.clone(),
+                wrapper_address: None,
+                wrapper_address_v2: None,
+            },
+            crate::domain::registry::OfficialDeployment {
+                network: "Base".to_owned(),
+                address: "0x0000000000000000000000000000000000000002".to_owned(),
+                wrapper_address: None,
+                wrapper_address_v2: None,
+            },
+        ];
+        let clone =
+            metadata("0x0000000000000000000000000000000000000003", "NVDAx", "NVIDIA xStock");
+        let published_metadata = metadata(&published.contract, "NVDAx", "NVIDIA xStock");
+        let publisher_metadata = std::collections::HashMap::from([(
+            issuer_metadata_key(Chain::RobinhoodChain, &published.contract),
+            published_metadata,
+        )]);
+
+        let identity = identify_with_contract_metadata(
+            Chain::Base,
+            &clone.address,
+            Some(&clone),
+            std::slice::from_ref(&published),
+            &publisher_metadata,
+        );
+
+        assert_eq!(identity.status, IdentityStatus::Mismatch);
+        assert_eq!(identity.matched_contract, None);
+        assert_eq!(
+            identity
+                .deployments
+                .iter()
+                .map(|deployment| deployment.network.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Robinhood Chain", "Base"]
+        );
+    }
+    #[test]
+    fn official_deployment_network_aliases_are_chain_labeled() {
+        let mut published = entry("0x0000000000000000000000000000000000000001", "NVDA", "NVIDIA");
+        published.official_deployments = vec![
+            crate::domain::registry::OfficialDeployment {
+                network: "8453".to_owned(),
+                address: published.contract.clone(),
+                wrapper_address: None,
+                wrapper_address_v2: None,
+            },
+            crate::domain::registry::OfficialDeployment {
+                network: "solana-900".to_owned(),
+                address: "11111111111111111111111111111111".to_owned(),
+                wrapper_address: None,
+                wrapper_address_v2: None,
+            },
+        ];
+
+        let deployments = identity_deployments(std::slice::from_ref(&published), &published);
+        assert_eq!(
+            deployments.iter().map(|deployment| deployment.network.as_str()).collect::<Vec<_>>(),
+            vec!["Base", "Solana"]
+        );
+        assert_eq!(crate::domain::registry::official_networks(&published), vec!["Base", "Solana"]);
+    }
 
     #[test]
     fn familiar_names_and_short_tickers_never_create_denials() {
@@ -756,6 +1016,10 @@ mod tests {
             ticker: Some("NVDA".to_owned()),
             status: IdentityStatus::Match,
             candidate: None,
+            unpublished_product_detail: None,
+            observed_symbol: None,
+            observed_name: None,
+            deployments: Vec::new(),
         };
         let mut incomplete = powers();
         incomplete

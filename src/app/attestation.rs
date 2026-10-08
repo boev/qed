@@ -101,15 +101,6 @@ pub fn get(state: &Context, id: &str) -> Option<Attestation> {
     state.attestations.read().ok()?.get(id).cloned()
 }
 
-pub async fn latest_for_pool_async(
-    state: &Context,
-    chain: Chain,
-    pool: &str,
-) -> Option<Attestation> {
-    let registry = state.registry.snapshot().await;
-    latest_for_pool_with_registry(state, &registry, chain, pool).await
-}
-
 async fn latest_for_pool_with_registry(
     state: &Context,
     registry: &Registry,
@@ -712,6 +703,7 @@ mod tests {
             last_checked: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             removed_at: None,
             stale_since: None,
+            official_deployments: Vec::new(),
         }
     }
 
@@ -771,6 +763,7 @@ mod tests {
             checked_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             attestation_id: None,
             powers: None,
+            read_issue: None,
         };
 
         let registry = state.registry.snapshot().await;
@@ -807,6 +800,7 @@ mod tests {
                 slot: None,
                 reads: Vec::new(),
             }),
+            read_issue: None,
         };
 
         let registry = state.registry.snapshot().await;

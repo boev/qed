@@ -1,10 +1,10 @@
 use super::views::{
     CertificateResultTemplate, CertificateTemplate, CertificateView, ChainTemplate,
-    CheckResultPageTemplate, CheckTemplate, ContentPageTemplate, DirectoryContractView,
-    DirectoryPoolView, DirectoryPowersView, DocsPageTemplate, FeaturedTemplate, FeaturedView,
-    GlossaryTemplate, GuardResultTemplate, GuardTemplate, GuideVerifyTemplate, IndexTemplate,
-    RegistryTableQuery, RegistryTableTemplate, RegistryTemplate, ResultTemplate, TokenTemplate,
-    ValidatedCardView, ValidatedTemplate, WalletHoldingsTemplate, WalletTemplate, WhatsNewView,
+    ContentPageTemplate, DirectoryContractView, DirectoryPoolView, DirectoryPowersView,
+    DocsPageTemplate, FeaturedTemplate, FeaturedView, GlossaryTemplate, GuardResultTemplate,
+    GuardTemplate, GuideVerifyTemplate, IndexTemplate, RegistryTableQuery, RegistryTableTemplate,
+    RegistryTemplate, TokenTemplate, ValidatedCardView, ValidatedTemplate, WalletHoldingsTemplate,
+    WalletTemplate, WhatsNewView,
 };
 #[cfg(test)]
 use super::views::{WalletHoldingView, WalletTradeLinkView, format_wallet_amount};
@@ -15,7 +15,7 @@ use crate::adapters::registry as registry_adapter;
 use crate::app::wallet::wallet_chains;
 use crate::{
     adapters::{content as content_adapter, state::AppState},
-    app::{attestation as attest, check, wallet::wallet_holdings},
+    app::{attestation as attest, wallet::wallet_holdings},
     domain::{
         chain::Chain,
         registry::{self, Entry},
@@ -35,24 +35,215 @@ pub(crate) async fn index(
     State(state): State<AppState>,
     _headers: HeaderMap,
 ) -> Result<Html<String>, StatusCode> {
-    let leaderboard = state.leaderboard.read().await;
-    let mut value = serde_json::to_value(&*leaderboard)
-        .unwrap_or_else(|_| serde_json::json!({ "entries": [] }));
+    let leaderboard = state.leaderboard.read().await.clone();
+    let mut value =
+        serde_json::to_value(&leaderboard).unwrap_or_else(|_| serde_json::json!({ "entries": [] }));
     if let Some(object) = value.as_object_mut() {
+        object.remove("impostors");
         object.insert(
             "prices_updated_at".to_owned(),
             serde_json::Value::String(state.prices.read().await.updated_at.clone()),
         );
     }
+    let registry = state.registry.read().await.clone();
+    let stats = super::api::leaderboard_stats(&leaderboard, &registry);
+    let watch = &stats.publisher_catalog_watch;
+    let stats_line = format!(
+        "{} top pools · {} issuer matches · {} mismatches · {} unsupported venues · {} not read yet · {} currently flagged (seen in the last 7 days) · {} new this UTC week · {} unsupported-chain sightings · catalog scan {}",
+        stats.listed_pools,
+        stats.issuer_matches,
+        stats.mismatches,
+        stats.unsupported_venue,
+        stats.not_read_yet.count,
+        watch.currently_flagged_last_7_days,
+        watch.first_flagged_this_week,
+        watch.unsupported_chain_candidates_seen,
+        if watch.last_scanned_at.is_empty() { "not yet run" } else { &watch.last_scanned_at }
+    );
     render_page(
         IndexTemplate {
             asset_version: ASSET_VERSION,
             public_url: state.public_url.to_string(),
+            stats_line,
             leaderboard: super::views::LeaderboardPageView::from_value(value),
             whats_new: release_news_view()?,
         },
         false,
     )
+}
+pub(crate) async fn stats_page(State(state): State<AppState>) -> Result<Response, StatusCode> {
+    if state.stats_snapshot.read().await.is_none() {
+        super::api::refresh_stats_snapshot(&state)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    let snapshot =
+        state.stats_snapshot.read().await.clone().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut response = Response::new(axum::body::Body::from(snapshot.html.clone()));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    Ok(response)
+}
+
+pub(crate) fn render_stats_page(
+    state: &AppState,
+    stats: &super::api::LeaderboardStats,
+    catalog_entries: &[&crate::adapters::discovery::ImpostorEntry],
+) -> Result<bytes::Bytes, StatusCode> {
+    let chain_rows = stats
+        .by_chain
+        .iter()
+        .map(|chain| {
+            let unread = &chain.counts.not_read_yet;
+            format!(
+                "<li><strong>{}</strong>: {} checked, {} issuer matches, {} mismatches, {} unsupported venues; {} not read yet ({} RPC limit, {} transient, {} unsupported).</li>",
+                html_escape(&chain.chain_label),
+                chain.counts.pools_checked,
+                chain.counts.issuer_matches,
+                chain.counts.mismatches,
+                chain.counts.unsupported_venue,
+                unread.count,
+                unread.rpc_limit,
+                unread.transient,
+                unread.unsupported
+            )
+        })
+        .collect::<String>();
+    let issuer_rows = stats
+        .registry
+        .by_issuer
+        .iter()
+        .map(|issuer| {
+            let chains = if issuer.chains.is_empty() {
+                "none".to_owned()
+            } else {
+                issuer.chains.iter().map(|chain| html_escape(chain)).collect::<Vec<_>>().join(", ")
+            };
+            format!(
+                "<li><strong>{}</strong>: {} active entries across {chains}.</li>",
+                html_escape(&issuer.issuer),
+                issuer.entries
+            )
+        })
+        .collect::<String>();
+    let watch = &stats.publisher_catalog_watch;
+    let mut catalog_rows = catalog_entries
+        .iter()
+        .map(|entry| {
+            let volume = entry
+                .volume_24h_usd
+                .map(|volume| {
+                    format!("${volume:.2} · reported by {}", entry.source.label())
+                })
+                .unwrap_or_else(|| "not reported".to_owned());
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{} ({})</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}\">Guard</a></td><td>{}</td></tr>",
+                html_escape(&entry.chain_label),
+                html_escape(&entry.ticker),
+                html_escape(&entry.publisher),
+                html_escape(&entry.symbol),
+                html_escape(&entry.name),
+                html_escape(&entry.address),
+                html_escape(&volume),
+                html_escape(&entry.first_seen_at),
+                html_escape(&entry.last_seen_at),
+                html_escape(&entry.guard_url),
+                html_escape(&entry.reason),
+            )
+        })
+        .collect::<String>();
+    if catalog_rows.is_empty() {
+        catalog_rows.push_str(
+            "<tr><td colspan=\"10\">No catalog observations were seen during the last 7 days.</td></tr>",
+        );
+    }
+    let last_scanned_at = if watch.last_scanned_at.is_empty() {
+        "Not yet scanned"
+    } else {
+        watch.last_scanned_at.as_str()
+    };
+    let catalog_table_note = if watch.catalog_absent_tokens_truncated {
+        "Showing the 20 most recently seen observations; the count includes all retained entries seen in the last 7 days."
+    } else {
+        "All retained observations seen in the last 7 days are shown."
+    };
+    let source_note = watch
+        .source_unavailable_since
+        .as_deref()
+        .map(|since| {
+            format!(
+                "<p>The impostor search source has been unavailable since <time>{}</time>; the observations below are from the last successful search.</p>\n",
+                html_escape(since)
+            )
+        })
+        .unwrap_or_default();
+    let body_html = format!(
+        r#"<section class="statement-summary">
+<p>Generated at <time>{}</time>.</p>
+<p><a href="/stats.json">Download signed JSON</a> · <a href="/stats.csv">Download signed CSV</a></p>
+<p>Market data: <a href="https://dexscreener.com" target="_blank" rel="noopener noreferrer">DexScreener</a> / <a href="https://www.geckoterminal.com" target="_blank" rel="noopener noreferrer">GeckoTerminal</a> · <a href="https://www.coingecko.com/en/api_terms" target="_blank" rel="noopener noreferrer">Powered by CoinGecko</a></p>
+<dl class="statement-summary-grid">
+  <div><dt>Listed pools</dt><dd>{}</dd></div>
+  <div><dt>Pools checked</dt><dd>{}</dd></div>
+  <div><dt>Issuer matches</dt><dd>{}</dd></div>
+  <div><dt>Mismatches</dt><dd>{}</dd></div>
+  <div><dt>Unsupported venues</dt><dd>{}</dd></div>
+  <div><dt>Not read yet</dt><dd>{} total: {} RPC limit, {} transient, {} unsupported</dd></div>
+</dl>
+<h2>Leaderboard by chain</h2>
+<ul>{}</ul>
+<h2>Active registry coverage</h2>
+<p>{} active registry entries across the tracked issuers.</p>
+<ul>{}</ul>
+<h2>Publisher deployment catalog watch</h2>
+{}<p>Last searched at <time>{}</time>. {} catalog observations are currently flagged (seen in the last 7 days); {} were first seen this UTC week. {} candidates on unsupported chains were seen but not judged; {} official deployments on unsupported chains were counted separately and excluded from candidates. {} supported and {} unsupported candidates were evicted; {} invalid supported and {} invalid unsupported candidates were rejected.</p>
+<p>Method: {}</p>
+<table><caption>Catalog observations currently flagged (last seen within the last 7 days); ticker, symbol, name, and 24-hour volume are reported by the source recorded for each row. On-chain identity reads are available from the linked Guard review. {}</caption>
+<thead><tr><th>Chain</th><th>Ticker reported by source</th><th>Publisher</th><th>Listing symbol and name</th><th>Address</th><th>Reported 24h volume</th><th>First seen</th><th>Last seen</th><th>Guard</th><th>Reason</th></tr></thead>
+<tbody>{}</tbody></table>
+<p>These are point-in-time pool reads. These exact symbol-and-name matches are catalog-absence observations, not conclusions about intent. A contract match does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.</p>
+</section>"#,
+        html_escape(&stats.generated_at),
+        stats.listed_pools,
+        stats.pools_checked,
+        stats.issuer_matches,
+        stats.mismatches,
+        stats.unsupported_venue,
+        stats.not_read_yet.count,
+        stats.not_read_yet.rpc_limit,
+        stats.not_read_yet.transient,
+        stats.not_read_yet.unsupported,
+        chain_rows,
+        stats.registry.active_entries,
+        issuer_rows,
+        source_note,
+        html_escape(last_scanned_at),
+        watch.currently_flagged_last_7_days,
+        watch.first_flagged_this_week,
+        watch.unsupported_chain_candidates_seen,
+        watch.official_on_unsupported_chain,
+        watch.evicted_entries,
+        watch.evicted_unsupported_candidates,
+        watch.rejected_oversize_entries,
+        watch.rejected_oversize_unsupported_candidates,
+        html_escape(&watch.method),
+        html_escape(catalog_table_note),
+        catalog_rows,
+    );
+    docs_content_page(
+        &state,
+        "Leaderboard statistics",
+        "REFERENCE",
+        "Leaderboard statistics",
+        &stats.headline,
+        "Point-in-time counts from QED's current leaderboard checks and active issuer registry.",
+        "/stats",
+        "stats",
+        body_html,
+    )
+    .map(|Html(body)| bytes::Bytes::from(body))
 }
 fn release_news_view() -> Result<WhatsNewView, StatusCode> {
     let Some(entry) = content_adapter::latest_released_changelog_entry()
@@ -62,10 +253,9 @@ fn release_news_view() -> Result<WhatsNewView, StatusCode> {
     };
     let posts = content_adapter::blog_posts().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let latest_blog = content_adapter::latest_published_blog_post(&posts);
-    let release_number = entry.anchor.strip_prefix("release-").unwrap_or_default();
     Ok(WhatsNewView {
         available: true,
-        release_label: format!("release {release_number}"),
+        release_label: entry.label,
         headline: entry.headline,
         changelog_href: format!("/changelog#{}", entry.anchor),
         has_latest_blog: latest_blog.is_some(),
@@ -148,16 +338,6 @@ pub(crate) async fn wallet_holdings_page(
             address,
             holdings,
         },
-        false,
-    )
-}
-
-pub(crate) async fn check_page(
-    State(state): State<AppState>,
-    _headers: HeaderMap,
-) -> Result<Html<String>, StatusCode> {
-    render_page(
-        CheckTemplate { asset_version: ASSET_VERSION, public_url: state.public_url.to_string() },
         false,
     )
 }
@@ -380,7 +560,7 @@ fn guide_verify_template(
             heading: if is_docs_landing {
                 "QED tools, in plain words.".to_owned()
             } else {
-                "Check a stock-token contract.".to_owned()
+                "How do I check if a stock token matches what its issuer published?".to_owned()
             },
             eyebrow: if is_docs_landing { "DOCUMENTATION".to_owned() } else { "GUIDE".to_owned() },
             intro: if is_docs_landing {
@@ -465,6 +645,51 @@ pub(crate) fn powers_view(record: crate::domain::powers::PowersRecord) -> Direct
     let has_control_signals = !record.can_seize.is_empty()
         || !record.can_block.is_empty()
         || !record.can_change_rules.is_empty();
+    let controls = [
+        (!record.can_seize.is_empty(), "the token can be seized"),
+        (!record.can_block.is_empty(), "transfers can be blocked"),
+        (!record.can_change_rules.is_empty(), "token rules can be changed"),
+    ];
+    let control_count = controls.iter().filter(|(observed, _)| *observed).count();
+    let mut summary_sentence = String::with_capacity(192);
+    use std::fmt::Write as _;
+    write!(&mut summary_sentence, "On {}: ", record.chain)
+        .expect("writing into a String cannot fail");
+    if control_count == 0 {
+        if record.unavailable.is_empty() {
+            summary_sentence.push_str(
+                "No control signals were observed; this is not proof that no authority exists.",
+            );
+        } else {
+            summary_sentence
+                .push_str("Some control checks were unavailable; retry for a complete reading.");
+        }
+    } else {
+        summary_sentence.push_str("Observed controls: ");
+        let mut included = 0;
+        for (observed, description) in controls {
+            if !observed {
+                continue;
+            }
+            if included > 0 {
+                if included + 1 == control_count {
+                    if control_count > 2 {
+                        summary_sentence.push(',');
+                    }
+                    summary_sentence.push_str(" and ");
+                } else {
+                    summary_sentence.push_str(", ");
+                }
+            }
+            summary_sentence.push_str(description);
+            included += 1;
+        }
+        summary_sentence.push('.');
+        if !record.unavailable.is_empty() {
+            summary_sentence
+                .push_str(" Other control checks were unavailable; retry for a complete reading.");
+        }
+    }
     let mut summary_badges = Vec::with_capacity(4);
     if !record.can_seize.is_empty() {
         summary_badges.push("Can seize".to_owned());
@@ -493,6 +718,7 @@ pub(crate) fn powers_view(record: crate::domain::powers::PowersRecord) -> Direct
         can_block: details(record.can_block),
         can_change_rules: details(record.can_change_rules),
         unavailable: details(record.unavailable),
+        summary_sentence,
         summary_badges,
         source_verified_subject: record.source_verified_subject.label().to_owned(),
         source_verified: status(record.source_verified).to_owned(),
@@ -516,17 +742,22 @@ fn pool_view(entry: &crate::adapters::discovery::LeaderboardEntry) -> DirectoryP
     };
     let trade_url = super::views::parse_chain(&entry.chain)
         .map(|chain| {
-            crate::adapters::discovery::canonical_market_url(
+            crate::adapters::discovery::canonical_market_url_for_source(
                 chain,
                 &entry.pool,
                 Some(&entry.trade_url),
+                entry.source,
             )
         })
         .unwrap_or_default();
     DirectoryPoolView {
         chain: entry.chain_label.clone(),
         dex: entry.dex.clone(),
-        pair: format!("{}/{}", entry.base_symbol, entry.quote_symbol),
+        pair: super::views::ordered_pair_label(
+            &entry.base_symbol,
+            &entry.quote_symbol,
+            entry.issuer_on_base,
+        ),
         verdict,
         verdict_class,
         detail_url: entry.detail_url.clone(),
@@ -579,39 +810,13 @@ pub(crate) async fn validated(
 }
 
 pub(crate) async fn validated_detail(
-    State(state): State<AppState>,
     Path((chain_name, subject)): Path<(String, String)>,
-    _headers: HeaderMap,
-) -> Result<Html<String>, StatusCode> {
+) -> Result<Redirect, StatusCode> {
     let chain = super::views::parse_chain(&chain_name).ok_or(StatusCode::NOT_FOUND)?;
-    let attestation = attest::latest_for_pool_async(&state.app, chain, &subject).await;
-    if let Some(attestation) = attestation {
-        return render_page(
-            CertificateTemplate {
-                asset_version: ASSET_VERSION,
-                public_url: state.public_url.to_string(),
-                certificate: CertificateView::from_live_attestation(attestation),
-            },
-            false,
-        );
+    if !crate::domain::check::valid_public_input(&subject) {
+        return Err(StatusCode::NOT_FOUND);
     }
-    let result = check::check(&state.app, &subject).await;
-    let attestation = match result.attestation_id.as_deref() {
-        Some(id) => attest::get_async(&state.app, id).await,
-        None => None,
-    };
-    let result = ResultTemplate::from_check(result, attestation)
-        .render()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    render_page(
-        CheckResultPageTemplate {
-            asset_version: ASSET_VERSION,
-            public_url: state.public_url.to_string(),
-            canonical_path: format!("/validated/{}/{}", super::views::chain_slug(chain), subject),
-            result,
-        },
-        false,
-    )
+    Ok(Redirect::permanent(&format!("/guard/{}/{}", super::views::chain_slug(chain), subject)))
 }
 pub(crate) async fn registry_table(
     State(state): State<AppState>,
@@ -627,10 +832,6 @@ pub(crate) async fn registry_table(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct CheckForm {
-    address: String,
-}
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct RecheckQuery {
     live: Option<String>,
@@ -640,28 +841,6 @@ impl RecheckQuery {
     fn is_live(&self) -> bool {
         self.live.as_deref().is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
     }
-}
-
-pub(crate) async fn check_form(
-    State(state): State<AppState>,
-    Form(form): Form<CheckForm>,
-) -> Result<Html<String>, StatusCode> {
-    let address = form.address.trim();
-    let template = if address.is_empty()
-        || (Chain::detect(address).is_none()
-            && !Chain::is_evm_address(address)
-            && !Chain::is_v4_pool_id(address))
-    {
-        ResultTemplate::invalid()
-    } else {
-        let result = check::check(&state.app, address).await;
-        let attestation = match result.attestation_id.as_deref() {
-            Some(id) => attest::get_async(&state.app, id).await,
-            None => None,
-        };
-        ResultTemplate::from_check(result, attestation)
-    };
-    template.render().map(Html).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 #[derive(Debug, Deserialize)]
@@ -676,13 +855,7 @@ pub(crate) struct GuardForm {
 
 pub(crate) async fn guard_page(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
     render_page(
-        guard_form_template(
-            &state,
-            String::new(),
-            "solana".to_owned(),
-            String::new(),
-            String::new(),
-        ),
+        guard_form_template(&state, String::new(), String::new(), String::new(), String::new()),
         false,
     )
 }
@@ -714,7 +887,7 @@ pub(crate) async fn guard_form_submit(
             }
         };
     if form.wallet.as_deref().is_none_or(|wallet| wallet.trim().is_empty()) {
-        let location = format!("/guard/{}/{}", guard_chain_slug(chain), document.address);
+        let location = format!("/guard/{}/{}", super::views::chain_slug(chain), document.address);
         return Ok(Redirect::to(&location).into_response());
     }
     render_page(
@@ -772,16 +945,6 @@ fn guard_form_error(
         false,
     )?;
     Ok((status, html).into_response())
-}
-
-fn guard_chain_slug(chain: Chain) -> &'static str {
-    match chain {
-        Chain::Solana => "solana",
-        Chain::RobinhoodChain => "robinhood",
-        Chain::Base => "base",
-        Chain::Ethereum => "ethereum",
-        Chain::Bnb => "bnb",
-    }
 }
 
 fn guard_error_message(error: &crate::app::guard::GuardError) -> &'static str {
@@ -853,7 +1016,7 @@ const LLM_FLOW_SVG: &str = r#"<div class="guide-flow-scroll">
 pub(crate) async fn docs_llm_page(
     State(state): State<AppState>,
 ) -> Result<Html<String>, StatusCode> {
-    let body = r#"QED exposes a stateless, read-only MCP server at `https://qed.web3-energy.com/mcp`. The [server card](https://qed.web3-energy.com/.well-known/mcp/server-card.json) describes its tools.
+    let body = r#"QED exposes a stateless, read-only MCP server at `https://qed.web3-energy.com/mcp`. The [server card](https://qed.web3-energy.com/.well-known/mcp/server-card.json) describes the seven tools.
 
 In Claude Code, connect with:
 
@@ -861,30 +1024,34 @@ In Claude Code, connect with:
 claude mcp add --transport http qed https://qed.web3-energy.com/mcp
 ```
 
-For ChatGPT, Cursor, and other MCP clients, add an HTTP MCP server in your client’s MCP settings using `https://qed.web3-energy.com/mcp`. Product labels and availability vary by client.
+For ChatGPT, Cursor, Claude Desktop, and other MCP clients, add an HTTP MCP server in your client’s MCP settings using `https://qed.web3-energy.com/mcp`. Product labels and availability vary by client.
 
 Tools:
-- `qed_check` compares a pool or token with its issuer registry entry.
-- `qed_guard` signs a read-only review of issuer identity, observed powers, source status, known pools, and optional wallet restrictions.
-- `qed_powers` reports observed token control signals for registry contracts.
-- `qed_wallet` checks known registry-token holdings for a wallet.
-- `qed_statement` signs selected wallets’ observed registry-token balances.
-- `qed_registry_lookup` finds issuer contracts by ticker.
-- `qed_verify` verifies a signed QED document.
+- `qed_check` answers whether a pool or token uses its issuer's published contract.
+- `qed_powers` answers what controls QED observed on the token.
+- `qed_wallet` answers which issuer-published holdings are visible in a wallet.
+- `qed_statement` answers what a selected wallet set held at a block height.
+- `qed_registry_lookup` answers which contracts an issuer published for a ticker.
+- `qed_verify` checks whether a signed QED document verifies.
+- `qed_guard` answers whether the token matches its issuer's published identity and what controls QED observed.
 
 Try asking:
-- “Is this pool the real NVDA token?”
-- “What can the issuer do to this token?”
-- “Sign a statement of what these wallets hold”
+- “Does this pool use the issuer's published stock-token contract?”
+- “What could the issuer change on this token?”
+- “Which contracts did this issuer publish for NVDA?”
+- “What did these wallets hold, provably?”
+
+Re-check certificates after expiry or when the issuer registry changes.
 
 QED does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement."#;
+
     docs_content_page(
         &state,
         "Use QED with an LLM",
         "GUIDE",
         "Use QED with an LLM",
-        "Connect an AI agent to QED’s issuer-match tools over MCP.",
-        "Connect read-only issuer-match tools over MCP.",
+        "Connect an AI agent to QED’s issuer-check, token-power, statement, registry, verification, and Guard tools over MCP.",
+        "Seven read-only tools answer plain questions about issuer publications, token controls, wallet holdings, and signed records.",
         "/docs/llm",
         "llm",
         format!("{}{LLM_FLOW_SVG}", content_adapter::render_markdown(body)),
@@ -1002,6 +1169,7 @@ fn statement_request_from_form(
     fields: Vec<(String, String)>,
 ) -> Result<crate::app::statement::StatementRequest, StatusCode> {
     let mut wallets = None;
+    let mut label = None;
     let mut chains = Vec::new();
     let mut block = None;
     for (name, value) in fields {
@@ -1026,6 +1194,12 @@ fn statement_request_from_form(
                 }
                 block = Some(value);
             }
+            "label" => {
+                if label.is_some() {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                label = Some(value);
+            }
             _ => {}
         }
     }
@@ -1036,7 +1210,12 @@ fn statement_request_from_form(
         .filter(|value| !value.is_empty())
         .map(|value| value.parse::<u64>().map_err(|_| StatusCode::BAD_REQUEST))
         .transpose()?;
-    Ok(crate::app::statement::StatementRequest { wallets, chains, block })
+    Ok(crate::app::statement::StatementRequest {
+        label: label.unwrap_or_default(),
+        wallets,
+        chains,
+        block,
+    })
 }
 
 const STATEMENT_PURPOSE: &str = "A signed, re-checkable record of what a wallet set holds in registry tokens at a block height — for audits, reporting and counterparties.";
@@ -1046,8 +1225,10 @@ pub(crate) async fn statements_page(
 ) -> Result<Html<String>, StatusCode> {
     let form = r#"<section class="lookup statement-form-card" aria-labelledby="statement-form-heading">
   <h2 id="statement-form-heading">Create a statement</h2>
-  <p class="lookup-note">Choose wallet addresses and chains; QED records registry-token balances at the observed height.</p>
+  <p class="lookup-note">QED records registry-token balances and chain positions at the observed height. Balances are on-chain facts, not proof of ownership.</p>
   <form class="statement-form" action="/statements" method="post" hx-boost="false">
+    <label for="statement-label">Label (optional)</label>
+    <input id="statement-label" name="label" type="text" maxlength="80" autocomplete="off" placeholder="e.g. Q3 holdings report">
     <label for="statement-wallets">Wallet addresses, one per line</label>
     <textarea id="statement-wallets" name="wallets" rows="5" placeholder="Paste wallet addresses here" required></textarea>
     <fieldset class="statement-chain-set">
@@ -1060,6 +1241,7 @@ pub(crate) async fn statements_page(
         <label class="statement-chain-option"><input type="checkbox" name="chains" value="bnb"><span>BNB Chain</span></label>
       </div>
     </fieldset>
+    <p class="lookup-note">Select Solana for a Solana address, or the EVM chains where you want balances checked.</p>
     <div class="statement-block-field">
       <label for="statement-block">Optional block or slot</label>
       <input id="statement-block" name="block" type="number" min="0" step="1">
@@ -1067,12 +1249,22 @@ pub(crate) async fn statements_page(
     </div>
     <button class="button primary-button" type="submit">Sign statement <span aria-hidden="true">→</span></button>
   </form>
-  <p class="lookup-note statement-nonclaims">QED does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Balances are on-chain facts at a height, not proof of ownership. Statement pages are public to anyone with their link.</p>
+  <p class="lookup-note statement-nonclaims">QED does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Statement pages are public to anyone with their link.</p>
+</section>
+<section class="lookup lookup-secondary statement-example" aria-labelledby="statement-example-heading">
+  <h2 id="statement-example-heading">One-click public example</h2>
+  <p>Generate a read-only statement for a public Robinhood pool contract address.</p>
+  <form action="/statements" method="post" hx-boost="false">
+    <input type="hidden" name="label" value="Public SPY pool address example">
+    <input type="hidden" name="wallets" value="0xDDCBBa3666f578E3F09516f21Ff85BFee859AB5e">
+    <input type="hidden" name="chains" value="robinhood">
+    <button class="button secondary-button" type="submit">Create the public example statement</button>
+  </form>
 </section>"#;
     content_page(
         &state,
         "Statement",
-        "Sign a wallet statement.",
+        "What did these wallets hold, provably?",
         "STATEMENT",
         STATEMENT_PURPOSE,
         "Create a signed, re-checkable statement of registry-token balances for selected wallets.",
@@ -1086,7 +1278,9 @@ pub(crate) async fn create_statement_form(
     Form(fields): Form<Vec<(String, String)>>,
 ) -> Result<Redirect, StatusCode> {
     let request = statement_request_from_form(fields)?;
-    let axum::Json(statement) = super::api_statement(State(state), axum::Json(request)).await?;
+    let axum::Json(statement) = super::api_statement(State(state), axum::Json(request))
+        .await
+        .map_err(|(status, _)| status)?;
     Ok(Redirect::to(&format!("/statements/{}", statement.id)))
 }
 
@@ -1148,9 +1342,15 @@ pub(crate) fn docs_content_page(
         false,
     )
 }
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct StatementPageQuery {
+    compare: Option<String>,
+}
+
 pub(crate) async fn statement_page(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<StatementPageQuery>,
 ) -> Result<Html<String>, StatusCode> {
     let statement =
         crate::app::statement::get(&state.app, &id).await.ok_or(StatusCode::NOT_FOUND)?;
@@ -1165,6 +1365,12 @@ pub(crate) async fn statement_page(
             )
         })
         .collect::<String>();
+    let wallet_count = statement
+        .wallets
+        .iter()
+        .map(|wallet| wallet.address.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
     let chains = statement
         .wallets
         .iter()
@@ -1213,10 +1419,8 @@ pub(crate) async fn statement_page(
                 asset.powers_summary.can_change_rules.len()
             );
             let issuer_match = if asset.issuer_match { "Match" } else { "Mismatch" };
-            let balance = super::views::format_wallet_amount(
-                &asset.balance,
-                Some(asset.decimals),
-            );
+            let balance =
+                super::views::format_wallet_amount(&asset.balance, Some(asset.decimals));
             let contract = html_escape(&asset.contract);
             let position_facts_html = statement_asset_position_html(asset);
             format!(
@@ -1237,6 +1441,29 @@ pub(crate) async fn statement_page(
     };
     let id = html_escape(&statement.id);
     let json_url = format!("/api/statement/{id}");
+    let csv_url = format!("/statements/{id}/download.csv");
+    let verify_url = format!("/statements/{id}/verify");
+    let recheck_url = format!("/statements/{id}/recheck");
+    let label =
+        if statement.label.trim().is_empty() { "Wallet statement" } else { statement.label.trim() };
+    let label = html_escape(label);
+    let rows_word = if statement.assets.len() == 1 { "row" } else { "rows" };
+    let wallets_word = if wallet_count == 1 { "wallet" } else { "wallets" };
+    let chain_count = chains.len();
+    let chains_word = if chain_count == 1 { "chain" } else { "chains" };
+    let fact_sentence = format!(
+        "This signed record reports {} registry-token balance {rows_word} for {wallet_count} {wallets_word} across {chain_count} {chains_word}, observed at {}.",
+        statement.assets.len(),
+        html_escape(&statement.observed_at)
+    );
+    let compare_html = if let Some(previous_id) = query.compare.as_deref() {
+        let previous = crate::app::statement::get(&state.app, previous_id)
+            .await
+            .ok_or(StatusCode::NOT_FOUND)?;
+        statement_comparison_html(&previous, &statement)
+    } else {
+        String::new()
+    };
 
     let signer = html_escape(&statement.signer);
     let signer_notice = if statement.dev {
@@ -1244,11 +1471,17 @@ pub(crate) async fn statement_page(
     } else {
         "Production signer."
     };
-    let body_html = format!(
-        "<section class=\"lookup statement-summary\" aria-labelledby=\"statement-summary-heading\"><div class=\"section-heading\"><h2 id=\"statement-summary-heading\">Statement summary</h2></div><dl class=\"statement-summary-grid\"><div><dt>Wallets</dt><dd><ul>{wallets_html}</ul></dd></div><div><dt>Chains</dt><dd><ul>{chains_html}</ul></dd></div><div><dt>Observed block and slot range</dt><dd><ul>{positions_html}</ul></dd></div><div><dt>Signer</dt><dd><code>{signer}</code><p class=\"lookup-note\">{signer_notice}</p></dd></div><div><dt>Statement ID</dt><dd><code>{id}</code></dd></div><div><dt>Observed at</dt><dd>{}</dd></div></dl><p class=\"statement-actions\"><a class=\"button secondary-button\" href=\"{json_url}\">JSON</a><a class=\"button secondary-button\" href=\"/api#api-post-verify\">Verify</a></p></section><section class=\"registry-panel statement-holdings\" aria-labelledby=\"statement-holdings-heading\"><div class=\"section-heading\"><h2 id=\"statement-holdings-heading\">Registered token holdings</h2><span class=\"count-badge\">{} assets</span></div><div class=\"table-wrap\"><table class=\"statement-table\"><thead><tr><th>Chain</th><th>Ticker</th><th>Contract</th><th>Balance</th><th>Issuer match</th><th>Powers summary</th><th>Slot / block</th></tr></thead><tbody>{assets_html}</tbody></table></div></section><p class=\"lookup-note statement-nonclaims\">Balances are on-chain facts at a height, not proof of ownership. QED does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Statement pages are public to anyone with their link.</p>",
+    let mut body_html = format!(
+        "<p class=\"statement-fact\">{fact_sentence}</p><section class=\"lookup statement-summary\" aria-labelledby=\"statement-summary-heading\"><div class=\"section-heading\"><h2 id=\"statement-summary-heading\">Statement summary</h2></div><p class=\"statement-label\"><strong>Label:</strong> {label}</p><dl class=\"statement-summary-grid\"><div><dt>Wallets</dt><dd><ul>{wallets_html}</ul></dd></div><div><dt>Chains</dt><dd><ul>{chains_html}</ul></dd></div><div><dt>Observed block and slot range</dt><dd><ul>{positions_html}</ul></dd></div><div><dt>Signer</dt><dd><code>{signer}</code><p class=\"lookup-note\">{signer_notice}</p></dd></div><div><dt>Statement ID</dt><dd><code>{id}</code></dd></div><div><dt>Observed at</dt><dd>{}</dd></div></dl><div class=\"statement-actions\"><a class=\"button secondary-button\" href=\"{json_url}\" download>Download JSON</a><a class=\"button secondary-button\" href=\"{csv_url}\" download>Download CSV</a><a class=\"button secondary-button\" href=\"{verify_url}\">Verify this record</a><button class=\"button secondary-button\" type=\"button\" data-print-statement>Print / Save as PDF</button><form action=\"{recheck_url}\" method=\"post\" hx-boost=\"false\"><button class=\"button primary-button\" type=\"submit\">Re-run and compare</button></form></div><p class=\"lookup-note\">Save the signed JSON for independent verification; cached statement pages are retained for up to 24 hours.</p></section>{compare_html}<section class=\"registry-panel statement-holdings\" aria-labelledby=\"statement-holdings-heading\"><div class=\"section-heading\"><h2 id=\"statement-holdings-heading\">Registered token holdings</h2><span class=\"count-badge\">{} assets</span></div><div class=\"table-wrap\"><table class=\"statement-table\"><thead><tr><th>Chain</th><th>Ticker</th><th>Contract</th><th>Balance</th><th>Issuer match</th><th>Powers summary</th><th>Slot / block</th></tr></thead><tbody>{assets_html}</tbody></table></div></section><p class=\"lookup-note statement-nonclaims\">Balances are on-chain facts at a height, not proof of ownership. QED does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Statement pages are public to anyone with their link.</p>",
         html_escape(&statement.observed_at),
         statement.assets.len()
     );
+    use std::fmt::Write as _;
+    write!(
+        &mut body_html,
+        "<p class=\"statement-print-verify\">Verify this record: <a href=\"{verify_url}\">{verify_url}</a></p>"
+    )
+    .expect("writing into a String cannot fail");
     let title = format!("Wallet statement {id}");
     let canonical_path = format!("/statements/{id}");
     content_page(
@@ -1263,6 +1496,330 @@ pub(crate) async fn statement_page(
     )
 }
 
+fn statement_comparison_html(
+    previous: &crate::domain::statement::Statement,
+    current: &crate::domain::statement::Statement,
+) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let previous_assets = previous
+        .assets
+        .iter()
+        .map(|asset| (statement_asset_key(asset), asset))
+        .collect::<BTreeMap<_, _>>();
+    let current_assets = current
+        .assets
+        .iter()
+        .map(|asset| (statement_asset_key(asset), asset))
+        .collect::<BTreeMap<_, _>>();
+    let keys =
+        previous_assets.keys().chain(current_assets.keys()).cloned().collect::<BTreeSet<_>>();
+    let total = keys.len();
+    let mut changes = Vec::new();
+    for key in keys {
+        let previous_asset = previous_assets.get(&key).copied();
+        let current_asset = current_assets.get(&key).copied();
+        let changed = match (previous_asset, current_asset) {
+            (Some(old), Some(new)) => {
+                old.balance != new.balance
+                    || old.decimals != new.decimals
+                    || old.issuer_match != new.issuer_match
+            }
+            _ => true,
+        };
+        if !changed {
+            continue;
+        }
+        let ticker =
+            current_asset.or(previous_asset).map(|asset| asset.ticker.as_str()).unwrap_or("token");
+        let before = previous_asset.map_or_else(
+            || "Not reported".to_owned(),
+            |asset| super::views::format_wallet_amount(&asset.balance, Some(asset.decimals)),
+        );
+        let after = current_asset.map_or_else(
+            || "Not reported".to_owned(),
+            |asset| super::views::format_wallet_amount(&asset.balance, Some(asset.decimals)),
+        );
+        changes.push(format!(
+            "<li><strong>{}</strong> on {} for <code>{}</code> at <code>{}</code>: {} → {}.</li>",
+            html_escape(ticker),
+            html_escape(&key.0),
+            html_escape(&key.1),
+            html_escape(&key.2),
+            html_escape(&before),
+            html_escape(&after)
+        ));
+    }
+    let summary = if changes.is_empty() {
+        format!("No listed balance rows changed across {total} compared contracts.")
+    } else {
+        format!(
+            "{} of {total} listed balance rows changed, were added, or were no longer reported.",
+            changes.len()
+        )
+    };
+    format!(
+        "<section class=\"lookup statement-comparison\" aria-labelledby=\"statement-comparison-heading\"><h2 id=\"statement-comparison-heading\">Comparison with the previous statement</h2><p>{}</p><p>Previous observation: {}. New observation: {}.</p>{}</section>",
+        html_escape(&summary),
+        html_escape(&previous.observed_at),
+        html_escape(&current.observed_at),
+        if changes.is_empty() { String::new() } else { format!("<ul>{}</ul>", changes.join("")) }
+    )
+}
+
+fn statement_asset_key(
+    asset: &crate::domain::statement::StatementAsset,
+) -> (String, String, String) {
+    (asset.chain.to_string(), asset.wallet.clone(), asset.contract.to_ascii_lowercase())
+}
+
+pub(crate) async fn verify_statement_page(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Html<String>, StatusCode> {
+    let statement =
+        crate::app::statement::get(&state.app, &id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let result = super::api::verify_statement_document(&state, statement.clone());
+    let cryptographic = result["cryptographic"].as_bool().unwrap_or(false);
+    let trusted = result["trusted_signer"].as_bool().unwrap_or(false);
+    let environment = result["environment_match"].as_bool().unwrap_or(false);
+    let summary = if cryptographic && trusted && environment {
+        "The statement hash and Ed25519 signature verify for this QED signer and environment."
+    } else if cryptographic && !trusted {
+        "The signature verifies, but this signing key is not trusted by this QED instance."
+    } else if cryptographic {
+        "The signature verifies, but this record was signed for a different QED environment."
+    } else {
+        "The statement signature or content hash does not verify; do not rely on this record."
+    };
+    let id = html_escape(&statement.id);
+    let verification_json = serde_json::to_string_pretty(&result)
+        .map(|value| html_escape(&value))
+        .unwrap_or_else(|_| "{}".to_owned());
+    let body = format!(
+        "<section class=\"lookup statement-verification\"><p>{}</p><dl><dt>Content hash and signature</dt><dd>{}</dd><dt>Trusted signer</dt><dd>{}</dd><dt>Environment match</dt><dd>{}</dd><dt>Current status</dt><dd>Not applicable: a wallet statement is a point-in-time snapshot.</dd></dl><p>QED public verification key: <a href=\"/.well-known/qed.json\">/.well-known/qed.json</a></p><p><a class=\"button secondary-button\" href=\"/statements/{id}\">Back to statement</a> <a class=\"button secondary-button\" href=\"/api/statement/{id}\" download>Download signed JSON</a></p><details><summary>Verification response</summary><pre><code>{verification_json}</code></pre></details></section>",
+        html_escape(summary),
+        cryptographic,
+        trusted,
+        environment
+    );
+    content_page(
+        &state,
+        "Statement verification",
+        "Verify this statement.",
+        "STATEMENT",
+        summary,
+        "Verify the signed statement hash, signature, trusted signer, and environment.",
+        &format!("/statements/{id}/verify"),
+        body,
+    )
+}
+
+pub(crate) async fn statement_csv(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, StatusCode> {
+    let statement =
+        crate::app::statement::get(&state.app, &id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let mut response = Response::new(axum::body::Body::from(statement_csv_body(&statement)));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
+    let disposition = format!("attachment; filename=\"qed-statement-{}.csv\"", statement.id);
+    let disposition = axum::http::HeaderValue::from_str(&disposition)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    response.headers_mut().insert(axum::http::header::CONTENT_DISPOSITION, disposition);
+    Ok(response)
+}
+fn statement_csv_body(statement: &crate::domain::statement::Statement) -> String {
+    let mut csv = String::with_capacity(512 + statement.assets.len().saturating_mul(160));
+    csv_row(
+        &mut csv,
+        &[
+            "record_type",
+            "statement_id",
+            "label",
+            "observed_at",
+            "signer",
+            "signature",
+            "dev",
+            "wallet",
+            "chain",
+            "block",
+            "min_slot",
+            "max_slot",
+            "slot",
+            "ticker",
+            "issuer",
+            "contract",
+            "balance",
+            "decimals",
+            "issuer_match",
+            "verify_url",
+        ],
+    );
+    let dev = statement.dev.to_string();
+    let verify_url = format!("/statements/{}/verify", statement.id);
+    csv_row(
+        &mut csv,
+        &[
+            "statement",
+            &statement.id,
+            &statement.label,
+            &statement.observed_at,
+            &statement.signer,
+            &statement.signature,
+            &dev,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            &verify_url,
+        ],
+    );
+    for position in &statement.positions {
+        let chain = position.chain.to_string();
+        let block = match position.block {
+            Some(0) => "not observed".to_owned(),
+            Some(value) => value.to_string(),
+            None => String::new(),
+        };
+        let min_slot = position.min_slot.map(|value| value.to_string()).unwrap_or_default();
+        let max_slot = position.max_slot.map(|value| value.to_string()).unwrap_or_default();
+        csv_row(
+            &mut csv,
+            &[
+                "position",
+                &statement.id,
+                &statement.label,
+                &statement.observed_at,
+                "",
+                "",
+                &dev,
+                &position.wallet,
+                &chain,
+                &block,
+                &min_slot,
+                &max_slot,
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ],
+        );
+    }
+    for asset in &statement.assets {
+        let chain = asset.chain.to_string();
+        let slot = asset.slot.map(|value| value.to_string()).unwrap_or_default();
+        let decimals = asset.decimals.to_string();
+        let issuer_match = asset.issuer_match.to_string();
+        csv_row(
+            &mut csv,
+            &[
+                "asset",
+                &statement.id,
+                &statement.label,
+                &statement.observed_at,
+                "",
+                "",
+                &dev,
+                &asset.wallet,
+                &chain,
+                "",
+                "",
+                "",
+                &slot,
+                &asset.ticker,
+                &asset.issuer,
+                &asset.contract,
+                &asset.balance,
+                &decimals,
+                &issuer_match,
+                "",
+            ],
+        );
+    }
+    csv
+}
+
+fn csv_row(output: &mut String, fields: &[&str]) {
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('"');
+        if csv_formula_injection(field) {
+            output.push('\'');
+        }
+        for character in field.chars() {
+            if character == '"' {
+                output.push_str("\"\"");
+            } else {
+                output.push(character);
+            }
+        }
+        output.push('"');
+    }
+    output.push_str("\r\n");
+}
+
+fn csv_formula_injection(field: &str) -> bool {
+    field
+        .trim_start_matches(|character: char| {
+            character.is_whitespace() && !matches!(character, '\t' | '\r')
+        })
+        .chars()
+        .next()
+        .is_some_and(|character| matches!(character, '=' | '+' | '-' | '@' | '\t' | '\r'))
+}
+
+pub(crate) async fn recheck_statement(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Redirect, StatusCode> {
+    use std::collections::BTreeSet;
+
+    let previous =
+        crate::app::statement::get(&state.app, &id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let wallets = previous
+        .wallets
+        .iter()
+        .map(|wallet| wallet.address.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let chains = previous
+        .wallets
+        .iter()
+        .map(|wallet| super::views::chain_slug(wallet.chain).to_owned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let label = if previous.label.trim().is_empty() {
+        let short_id = previous.id.chars().take(8).collect::<String>();
+        format!("Re-run of {short_id}")
+    } else {
+        format!("{} (re-run)", previous.label.trim())
+    };
+    let request = crate::app::statement::StatementRequest { label, wallets, chains, block: None };
+    let axum::Json(current) = super::api_statement(State(state), axum::Json(request))
+        .await
+        .map_err(|(status, _)| status)?;
+    Ok(Redirect::to(&format!("/statements/{}?compare={}", current.id, previous.id)))
+}
 fn statement_asset_position_html(asset: &crate::domain::statement::StatementAsset) -> String {
     use std::fmt::Write as _;
 
@@ -1274,7 +1831,11 @@ fn statement_asset_position_html(asset: &crate::domain::statement::StatementAsse
         if !facts.is_empty() {
             facts.push_str("<br>");
         }
-        write!(&mut facts, "Power block: {block}").expect("writing into a String cannot fail");
+        if block == 0 {
+            facts.push_str("Power block: not observed");
+        } else {
+            write!(&mut facts, "Power block: {block}").expect("writing into a String cannot fail");
+        }
     }
     if let Some(slot) = asset.powers_slot {
         if !facts.is_empty() {
@@ -1297,18 +1858,29 @@ fn statement_position_html(position: &crate::domain::statement::StatementPositio
         html_escape(&position.wallet),
     )
     .expect("writing into a String cannot fail");
-    match (position.block, position.min_slot, position.max_slot) {
+    let block = position.block.filter(|block| *block != 0);
+    match (block, position.min_slot, position.max_slot) {
         (Some(block), Some(min_slot), Some(max_slot)) => {
             write!(&mut row, "block {block}, slots {min_slot}–{max_slot}")
         }
         (Some(block), Some(slot), None) => write!(&mut row, "block {block}, minimum slot {slot}"),
         (Some(block), None, Some(slot)) => write!(&mut row, "block {block}, maximum slot {slot}"),
         (Some(block), None, None) => write!(&mut row, "block {block}"),
+        (None, Some(min_slot), Some(max_slot)) if position.block == Some(0) => {
+            write!(&mut row, "block not observed; slots {min_slot}–{max_slot}")
+        }
         (None, Some(min_slot), Some(max_slot)) => {
             write!(&mut row, "slots {min_slot}–{max_slot}")
         }
+        (None, Some(slot), None) if position.block == Some(0) => {
+            write!(&mut row, "block not observed; minimum slot {slot}")
+        }
         (None, Some(slot), None) => write!(&mut row, "minimum slot {slot}"),
+        (None, None, Some(slot)) if position.block == Some(0) => {
+            write!(&mut row, "block not observed; maximum slot {slot}")
+        }
         (None, None, Some(slot)) => write!(&mut row, "maximum slot {slot}"),
+        (None, None, None) if position.block == Some(0) => write!(&mut row, "not observed"),
         (None, None, None) => write!(&mut row, "no block or slot recorded"),
     }
     .expect("writing into a String cannot fail");
@@ -1340,6 +1912,52 @@ pub(crate) async fn certificate(
             certificate: CertificateView::from_attestation(attestation),
         },
         false,
+    )
+}
+
+pub(crate) async fn verify_certificate_page(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Html<String>, StatusCode> {
+    let attestation =
+        attest::get_certificate_async(&state.app, &id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let result = super::api::verify_attestation_document(&state, attestation.clone());
+    let cryptographic = result["cryptographic"].as_bool().unwrap_or(false);
+    let trusted = result["trusted_signer"].as_bool().unwrap_or(false);
+    let environment = result["environment_match"].as_bool().unwrap_or(false);
+    let fresh = result["fresh"].as_bool().unwrap_or(false);
+    let summary = if !cryptographic {
+        "The certificate signature or content hash does not verify; do not rely on this record."
+    } else if !trusted {
+        "The signature verifies, but this signing key is not trusted by this QED instance."
+    } else if !environment {
+        "The signature verifies, but this record was signed for a different QED environment."
+    } else if fresh {
+        "The certificate hash and Ed25519 signature verify, the signer and environment match, and its observation is within the recorded expiry interval."
+    } else {
+        "The certificate is a valid historical record, but it is outside its recorded expiry interval. Re-check to create a fresh observation before relying on current facts."
+    };
+    let id = html_escape(&attestation.id);
+    let verification_json = serde_json::to_string_pretty(&result)
+        .map(|value| html_escape(&value))
+        .unwrap_or_else(|_| "{}".to_owned());
+    let body = format!(
+        "<section class=\"lookup certificate-verification\"><p>{}</p><dl><dt>Content hash and signature</dt><dd>{}</dd><dt>Trusted signer</dt><dd>{}</dd><dt>Environment match</dt><dd>{}</dd><dt>Fresh</dt><dd>{}</dd></dl><p>Fresh means the check time is not in the future and the recorded expiry has not passed. It describes the record's time window, not current issuer-registry or chain state.</p><p>QED public verification key: <a href=\"/.well-known/qed.json\">/.well-known/qed.json</a></p><p><a class=\"button secondary-button\" href=\"/v/{id}\">Back to certificate</a> <a class=\"button secondary-button\" href=\"/api/attest/{id}\" download>Download JSON</a></p><details><summary>Verification response</summary><pre><code>{verification_json}</code></pre></details></section>",
+        html_escape(summary),
+        cryptographic,
+        trusted,
+        environment,
+        fresh
+    );
+    content_page(
+        &state,
+        "Certificate verification",
+        "Verify this record.",
+        "CERTIFICATE",
+        summary,
+        "Check a QED certificate signature, trusted signer, environment, and freshness.",
+        &format!("/v/{id}/verify"),
+        body,
     )
 }
 
@@ -1490,6 +2108,7 @@ mod tests {
                 last_checked: registry_adapter::now_rfc3339(),
                 removed_at: None,
                 stale_since: None,
+                official_deployments: Vec::new(),
             },
         );
         let response = tokio::time::timeout(
@@ -1557,6 +2176,7 @@ mod tests {
                 last_checked: registry_adapter::now_rfc3339(),
                 removed_at: None,
                 stale_since: None,
+                official_deployments: Vec::new(),
             },
         );
         let request = tokio::spawn(
@@ -1599,6 +2219,7 @@ mod tests {
                 last_checked: registry_adapter::now_rfc3339(),
                 removed_at: None,
                 stale_since: None,
+                official_deployments: Vec::new(),
             },
         );
         let key = (
@@ -1644,6 +2265,7 @@ mod tests {
                 last_checked: registry_adapter::now_rfc3339(),
                 removed_at: None,
                 stale_since: None,
+                official_deployments: Vec::new(),
             },
         );
         let _prefetch_permits = [
@@ -1682,6 +2304,7 @@ mod tests {
             last_checked: registry_adapter::now_rfc3339(),
             removed_at: None,
             stale_since: None,
+            official_deployments: Vec::new(),
         };
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let state = token_page_state(
@@ -1703,9 +2326,13 @@ mod tests {
             pool: "leaderboard-pool".to_owned(),
             base_symbol: "NVDA".to_owned(),
             quote_symbol: "USDC".to_owned(),
+            source: crate::adapters::discovery::MarketSource::Dexscreener,
             issuer: Some("Issuer".to_owned()),
             ticker: Some("NVDA".to_owned()),
+            issuer_on_base: Some(true),
             verdict: "verified".to_owned(),
+            read_status: "checked".to_owned(),
+            read_reason: None,
             price_usd: None,
             change_24h_pct: None,
             volume_24h_usd: None,
@@ -1803,6 +2430,7 @@ mod tests {
                 last_checked: registry_adapter::now_rfc3339(),
                 removed_at: None,
                 stale_since: None,
+                official_deployments: Vec::new(),
             },
         );
         *state.featured.write().await = vec![crate::adapters::discovery::FeaturedPool {
@@ -1883,6 +2511,7 @@ mod tests {
                 last_checked: registry_adapter::now_rfc3339(),
                 removed_at: None,
                 stale_since: None,
+                official_deployments: Vec::new(),
             },
         );
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -1907,8 +2536,12 @@ mod tests {
             base_symbol: "NVDA".to_owned(),
             quote_symbol: "USDC".to_owned(),
             issuer: Some("Issuer".to_owned()),
+            source: crate::adapters::discovery::MarketSource::Dexscreener,
             ticker: Some("NVDA".to_owned()),
+            issuer_on_base: Some(true),
             verdict: "verified".to_owned(),
+            read_status: "checked".to_owned(),
+            read_reason: None,
             price_usd: None,
             change_24h_pct: None,
             volume_24h_usd: None,
@@ -2012,6 +2645,7 @@ mod tests {
             last_checked: "2026-01-01T00:00:00Z".to_owned(),
             removed_at: None,
             stale_since: None,
+            official_deployments: Vec::new(),
         };
         assert_eq!(canonical_ticker(&vec![entry.clone()], " nvda "), Some("NVDA".to_owned()));
         let response =
@@ -2173,9 +2807,11 @@ mod tests {
 
     #[test]
     fn token_power_summary_renders_fact_availability_and_source_badges() {
-        for (field, expected_badge) in
-            [("seize", "Can seize"), ("block", "Can block"), ("rules", "Can change rules")]
-        {
+        for (field, expected_badge, expected_sentence) in [
+            ("seize", "Can seize", "the token can be seized"),
+            ("block", "Can block", "transfers can be blocked"),
+            ("rules", "Can change rules", "token rules can be changed"),
+        ] {
             let mut record = powers_record(crate::domain::powers::SourceVerified::None);
             let reason = crate::domain::powers::Reason::new("signal", "observed");
             match field {
@@ -2185,7 +2821,9 @@ mod tests {
             }
             let rendered = render_token_powers(powers_view(record));
             assert!(rendered.contains(expected_badge));
+            assert!(rendered.contains(&format!("Observed controls: {expected_sentence}.")));
             assert!(!rendered.contains("No control signals observed"));
+            assert!(rendered.contains("not a safety rating"));
         }
 
         let no_facts = render_token_powers(powers_view(powers_record(
@@ -2197,6 +2835,10 @@ mod tests {
             )
         );
         assert!(no_facts.contains("No control signals observed"));
+        assert!(no_facts.contains(
+            "On Base: No control signals were observed; this is not proof that no authority exists."
+        ));
+        assert!(no_facts.contains("Which contracts did each issuer publish for NVDA?"));
 
         let mut failed_read = powers_record(crate::domain::powers::SourceVerified::None);
         failed_read
@@ -2204,6 +2846,10 @@ mod tests {
             .push(crate::domain::powers::Reason::new("rpc", "temporarily unavailable"));
         let unavailable = render_token_powers(powers_view(failed_read));
         assert!(unavailable.contains("Signals unavailable (transient)"));
+        assert!(
+            unavailable
+                .contains("Some control checks were unavailable; retry for a complete reading.")
+        );
 
         for (source, expected_badge) in [
             (crate::domain::powers::SourceVerified::ExactMatch, "Source verified (exact match)"),
@@ -2221,17 +2867,101 @@ mod tests {
     }
 
     #[test]
-    fn statement_form_collects_repeated_chain_checkboxes() {
+    fn statement_form_collects_repeated_chain_checkboxes_and_label() {
         let request = statement_request_from_form(vec![
+            ("label".to_owned(), "Q3 2026 holdings".to_owned()),
             ("wallets".to_owned(), " wallet-one\nwallet-two ".to_owned()),
             ("chains".to_owned(), "solana".to_owned()),
             ("chains".to_owned(), "base".to_owned()),
             ("block".to_owned(), "123".to_owned()),
         ])
         .expect("valid statement form");
+        assert_eq!(request.label, "Q3 2026 holdings");
         assert_eq!(request.wallets, ["wallet-one", "wallet-two"]);
         assert_eq!(request.chains, ["solana", "base"]);
         assert_eq!(request.block, Some(123));
+    }
+
+    #[test]
+    fn statement_csv_quotes_metadata_and_exports_rows() {
+        let statement = crate::domain::statement::Statement {
+            id: "statement-id".to_owned(),
+            kind: "statement".to_owned(),
+            version: 1,
+            label: "Q3, \"draft\"".to_owned(),
+            wallets: Vec::new(),
+            assets: Vec::new(),
+            positions: vec![crate::domain::statement::StatementPosition {
+                chain: Chain::Base,
+                wallet: "wallet".to_owned(),
+                block: Some(0),
+                min_slot: None,
+                max_slot: None,
+            }],
+            block: None,
+            observed_at: "2026-10-07T00:00:00Z".to_owned(),
+            reads: Vec::new(),
+            reads_truncated: false,
+            signer: "signer".to_owned(),
+            signature: "signature".to_owned(),
+            dev: true,
+        };
+        let csv = statement_csv_body(&statement);
+        assert!(csv.starts_with("\"record_type\",\"statement_id\",\"label\",\"observed_at\""));
+        assert!(csv.contains(
+            "\"statement\",\"statement-id\",\"Q3, \"\"draft\"\"\",\"2026-10-07T00:00:00Z\""
+        ));
+        assert!(csv.contains("\"verify_url\""));
+        assert!(csv.contains("\"/statements/statement-id/verify\""));
+        assert!(csv.contains("\"not observed\""));
+    }
+
+    #[test]
+    fn formula_like_statement_fields_are_prefixed_in_csv_only() {
+        let statement = crate::domain::statement::Statement {
+            id: "statement-id".to_owned(),
+            kind: "statement".to_owned(),
+            version: 1,
+            label: "   =1+1".to_owned(),
+            wallets: Vec::new(),
+            assets: vec![crate::domain::statement::StatementAsset {
+                wallet: "wallet".to_owned(),
+                chain: crate::domain::chain::Chain::Base,
+                contract: "0x0000000000000000000000000000000000000001".to_owned(),
+                ticker: "\t=TOKEN".to_owned(),
+                issuer: "-TOKEN".to_owned(),
+                issuer_match: false,
+                balance: "0".to_owned(),
+                decimals: 18,
+                powers_observed_at: None,
+                powers_block: None,
+                powers_slot: None,
+                slot: None,
+                powers_summary: crate::domain::statement::PowersSummary {
+                    can_seize: Vec::new(),
+                    can_block: Vec::new(),
+                    can_change_rules: Vec::new(),
+                    unavailable: Vec::new(),
+                },
+            }],
+            positions: Vec::new(),
+            block: None,
+            observed_at: "2026-10-07T00:00:00Z".to_owned(),
+            reads: Vec::new(),
+            reads_truncated: false,
+            signer: "signer".to_owned(),
+            signature: "signed-original-payload".to_owned(),
+            dev: true,
+        };
+        let signed_json = serde_json::to_vec(&statement).expect("signed record JSON");
+        let csv = statement_csv_body(&statement);
+        assert!(csv.contains("\"'   =1+1\""));
+        assert!(csv.contains("\"'\t=TOKEN\""));
+        assert!(csv.contains("\"'-TOKEN\""));
+        assert_eq!(
+            serde_json::to_vec(&statement).expect("signed record remains unchanged"),
+            signed_json
+        );
     }
 
     #[test]
@@ -2239,6 +2969,8 @@ mod tests {
         let rendered = IndexTemplate {
             asset_version: 1,
             public_url: "https://qed.example".to_owned(),
+            stats_line: "0 pools checked · 0 issuer matches · 0 mismatches · 0 not read yet"
+                .to_owned(),
             leaderboard: super::super::views::LeaderboardPageView::from_value(serde_json::json!({
                 "entries": []
             })),
@@ -2256,6 +2988,49 @@ mod tests {
         assert!(rendered.contains(
             r#"<a href="/tokens/NVDA">QED also shows what the issuer can do to each token.</a>"#
         ));
+        assert!(rendered.contains(r#"<a href="/stats">Stats</a>"#));
+    }
+    #[tokio::test]
+    async fn homepage_does_not_embed_publisher_watch_candidate_records() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let state = AppState::for_tests(Vec::new(), Vec::new(), true);
+        state.leaderboard.write().await.impostors.unsupported_candidates.push(
+            crate::adapters::discovery::UnsupportedImpostorCandidate {
+                dex_chain_id: "unsupported".to_owned(),
+                ticker: "NVDA".to_owned(),
+                publisher: "Issuer".to_owned(),
+                symbol: "NVDAx".to_owned(),
+                name: "HOMEPAGE_WATCH_ROW_MUST_NOT_APPEAR".to_owned(),
+                address: "0x0000000000000000000000000000000000000001".to_owned(),
+                volume_24h_usd: None,
+                source: crate::adapters::discovery::MarketSource::Dexscreener,
+                first_seen_at: "2026-10-06T00:00:00Z".to_owned(),
+                last_seen_at: "2026-10-06T00:00:00Z".to_owned(),
+                evidence_truncated: false,
+            },
+        );
+        let response = crate::adapters::web::router(state)
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .expect("homepage response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body =
+            axum::body::to_bytes(response.into_body(), 1024 * 1024).await.expect("homepage body");
+        assert!(!String::from_utf8_lossy(&body).contains("HOMEPAGE_WATCH_ROW_MUST_NOT_APPEAR"));
+    }
+
+    #[test]
+    fn zero_statement_block_is_rendered_as_not_observed() {
+        let position = crate::domain::statement::StatementPosition {
+            chain: Chain::Ethereum,
+            wallet: "0x0000000000000000000000000000000000000001".to_owned(),
+            block: Some(0),
+            min_slot: None,
+            max_slot: None,
+        };
+        assert!(statement_position_html(&position).contains(": not observed</li>"));
     }
 
     #[test]
@@ -2281,6 +3056,7 @@ mod tests {
                     id: id.clone(),
                     kind: "statement".to_owned(),
                     version: 1,
+                    label: "Q3 <investor> report".to_owned(),
                     wallets: vec![
                         crate::domain::statement::StatementWallet {
                             chain: Chain::Solana,
@@ -2362,8 +3138,21 @@ mod tests {
                 },
             )
             .await;
+        let Html(verification) = verify_statement_page(State(state.clone()), Path(id.clone()))
+            .await
+            .expect("statement verification page");
+        assert!(
+            verification
+                .contains("Not applicable: a wallet statement is a point-in-time snapshot.")
+        );
+        assert!(verification.contains(
+            "QED public verification key: <a href=\"/.well-known/qed.json\">/.well-known/qed.json</a>"
+        ));
 
-        let Html(html) = statement_page(State(state), Path(id)).await.expect("statement page");
+        let Html(html) =
+            statement_page(State(state), Path(id), Query(StatementPageQuery::default()))
+                .await
+                .expect("statement page");
 
         assert!(html.contains("<code>wallet&lt;one&gt;</code>"));
         assert!(html.contains("rpc&lt;timeout&gt;</strong>: read &amp; retry"));
@@ -2387,6 +3176,14 @@ mod tests {
         ] {
             assert!(html.contains(&format!("<th>{heading}</th>")));
         }
+        assert!(html.contains("<strong>Label:</strong> Q3 &lt;investor&gt; report"));
+        assert!(html.contains("href=\"/statements/statement-id/download.csv\" download"));
+        assert!(html.contains("href=\"/statements/statement-id/verify\""));
+        assert!(html.contains(
+            "Verify this record: <a href=\"/statements/statement-id/verify\">/statements/statement-id/verify</a>"
+        ));
+        assert!(html.contains("action=\"/statements/statement-id/recheck\""));
+        assert!(html.contains("data-print-statement"));
         assert!(html.contains("Observed: 2026-10-04T00:00:00Z"));
         assert!(html.contains("slots 42–44"));
         assert!(html.contains("block 79879642"));
@@ -2401,8 +3198,160 @@ mod tests {
             "Development signer: this ephemeral signature is not a production trust signal."
         ));
         assert!(html.contains("/api/statement/statement-id"));
-        assert!(html.contains("href=\"/api#api-post-verify\">Verify</a>"));
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(!html.contains("<script>alert(1)</script>"));
+    }
+    #[tokio::test]
+    async fn certificate_verification_page_shows_freshness_and_public_key() {
+        let state = AppState::for_tests(Vec::new(), Vec::new(), true);
+        let subject = "0x0000000000000000000000000000000000000001".to_owned();
+        let now = chrono::Utc::now();
+        let mut attestation = crate::domain::attestation::Attestation {
+            id: String::new(),
+            version: 1,
+            chain: Chain::Base,
+            subject: subject.clone(),
+            verdict: crate::domain::check::Verdict::Unknown { reason: "test".to_owned() },
+            issuer: None,
+            ticker: None,
+            pool: crate::domain::pool::PoolInfo {
+                chain: Chain::Base,
+                pool: subject,
+                dex: "uniswap-v3".to_owned(),
+                base: crate::domain::pool::TokenSide {
+                    address: "0x0000000000000000000000000000000000000002".to_owned(),
+                    symbol: Some("BASE".to_owned()),
+                    decimals: Some(18),
+                    balance: None,
+                },
+                quote: crate::domain::pool::TokenSide {
+                    address: "0x0000000000000000000000000000000000000003".to_owned(),
+                    symbol: Some("QUOTE".to_owned()),
+                    decimals: Some(18),
+                    balance: None,
+                },
+            },
+            quote_share_of_supply: None,
+            registry_entry: None,
+            registry_hash: String::new(),
+            reads: Vec::new(),
+            block: Some(1),
+            slot: None,
+            checked_at: now.to_rfc3339(),
+            expires_at: (now + chrono::Duration::hours(1)).to_rfc3339(),
+            signer: attest::public_key_b58(&state.app),
+            signature: String::new(),
+            dev: true,
+        };
+        let payload = crate::domain::attestation::canonical_json(&attestation.payload()).unwrap();
+        let (id, signature) = attest::sign_document_payload(&state.app, &payload).unwrap();
+        attestation.id.clone_from(&id);
+        attestation.signature = signature;
+        state
+            .app
+            .attestations
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.clone(), attestation);
+
+        let Html(html) = verify_certificate_page(State(state), Path(id)).await.unwrap();
+        assert!(html.contains("<dt>Fresh</dt><dd>true</dd>"));
+        assert!(html.contains(
+            "Fresh means the check time is not in the future and the recorded expiry has not passed."
+        ));
+        assert!(html.contains(
+            "QED public verification key: <a href=\"/.well-known/qed.json\">/.well-known/qed.json</a>"
+        ));
+    }
+    #[test]
+    fn inverted_v4_pair_orders_issuer_token_first_on_certificate_homepage_and_token_page() {
+        let token_address = "0x0000000000000000000000000000000000000003";
+        let attestation = crate::domain::attestation::Attestation {
+            id: "inverted-v4-pair".to_owned(),
+            version: 1,
+            chain: Chain::Base,
+            subject: "0x0000000000000000000000000000000000000001".to_owned(),
+            verdict: crate::domain::check::Verdict::Unknown { reason: "fixture".to_owned() },
+            issuer: Some("Issuer".to_owned()),
+            ticker: Some("NVDA".to_owned()),
+            pool: crate::domain::pool::PoolInfo {
+                chain: Chain::Base,
+                pool: "0x0000000000000000000000000000000000000001".to_owned(),
+                dex: "uniswap-v4".to_owned(),
+                base: crate::domain::pool::TokenSide {
+                    address: "0x0000000000000000000000000000000000000002".to_owned(),
+                    symbol: Some("USDG".to_owned()),
+                    decimals: Some(18),
+                    balance: None,
+                },
+                quote: crate::domain::pool::TokenSide {
+                    address: token_address.to_owned(),
+                    symbol: Some("NVDA".to_owned()),
+                    decimals: Some(18),
+                    balance: None,
+                },
+            },
+            quote_share_of_supply: None,
+            registry_entry: Some(crate::domain::registry::Entry {
+                issuer: "Issuer".to_owned(),
+                ticker: "NVDA".to_owned(),
+                name: "NVIDIA".to_owned(),
+                chain: Chain::Base,
+                contract: token_address.to_owned(),
+                decimals: Some(18),
+                source: "fixture".to_owned(),
+                source_url: "https://issuer.example".to_owned(),
+                last_checked: "2026-10-07T00:00:00Z".to_owned(),
+                removed_at: None,
+                stale_since: None,
+                official_deployments: Vec::new(),
+            }),
+            registry_hash: String::new(),
+            reads: Vec::new(),
+            block: Some(1),
+            slot: None,
+            checked_at: "2026-10-07T00:00:00Z".to_owned(),
+            expires_at: "2026-10-07T01:00:00Z".to_owned(),
+            signer: String::new(),
+            signature: String::new(),
+            dev: true,
+        };
+        let board_entry = crate::adapters::discovery::LeaderboardEntry {
+            rank: 1,
+            chain: "base".to_owned(),
+            chain_label: "Base".to_owned(),
+            dex: "uniswap-v4".to_owned(),
+            pool: "0x0000000000000000000000000000000000000001".to_owned(),
+            base_symbol: "USDG".to_owned(),
+            quote_symbol: "NVDA".to_owned(),
+            issuer: Some("Issuer".to_owned()),
+            ticker: Some("NVDA".to_owned()),
+            issuer_on_base: Some(false),
+            verdict: "verified".to_owned(),
+            read_status: "checked".to_owned(),
+            read_reason: None,
+            price_usd: Some(1.0),
+            change_24h_pct: None,
+            volume_24h_usd: None,
+            liquidity_usd: None,
+            source: crate::adapters::discovery::MarketSource::Dexscreener,
+            txns_24h: None,
+            detail_url: "/validated/base/pool".to_owned(),
+            trade_url: "https://dexscreener.com/base/pool".to_owned(),
+            explorer_url: String::new(),
+            attestation_id: None,
+            checked_at: None,
+        };
+        let certificate = super::super::views::CertificateView::from_attestation(attestation);
+        let homepage = super::super::views::LeaderboardPageView::from_value(serde_json::json!({
+            "entries": [serde_json::to_value(&board_entry).unwrap()],
+            "refreshing": false,
+            "empty_successful": false
+        }));
+
+        assert_eq!(certificate.pair, "NVDA / USDG");
+        assert_eq!(homepage.rows[0].base_symbol, "NVDA");
+        assert_eq!(homepage.rows[0].quote_symbol, "USDG");
+        assert_eq!(pool_view(&board_entry).pair, "NVDA / USDG");
     }
 }

@@ -314,6 +314,11 @@ tr:last-child td {
   justify-content: space-between;
   gap: 16px;
 }
+.leaderboard-stats-line {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: .72rem;
+}
 .page-intro {
   max-width: 680px;
   margin: 0 0 24px;
@@ -2745,5 +2750,54 @@ pre.code-block code {
 @media (max-width: 900px) {
   .docs-path-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media print {
+  body {
+    background: #fff;
+    color: #111;
+  }
+
+  .ambient-background,
+  .site-header,
+  .site-footer,
+  .statement-actions {
+    display: none !important;
+  }
+
+  .page-shell {
+    width: auto;
+    max-width: none;
+    padding-right: 0;
+    padding-left: 0;
+  }
+
+  .page-content {
+    margin: 0;
+  }
+
+  .statement-summary,
+  .statement-comparison,
+  .statement-holdings {
+    box-shadow: none;
+    break-inside: avoid;
+  }
+
+  .statement-holdings .table-wrap {
+    overflow: visible;
+  }
+
+  .statement-table {
+    font-size: 8pt;
+  }
+
+  .statement-table th,
+  .statement-table td {
+    padding: 0.25rem;
+  }
+
+  a {
+    color: inherit;
+    text-decoration: none;
   }
 }

@@ -32,6 +32,8 @@ flowchart TB
     R --> ISS[Issuer registries]
     D --> DEX[DexScreener]
     P --> DEX
+    D -->|on error or unavailable five-minute USDC canary| GT[GeckoTerminal]
+    P -->|on error or unavailable five-minute USDC canary| GT
 
     C --> RPC[Solana and EVM RPC providers]
     W --> RPC
@@ -51,6 +53,8 @@ Complete on-chain records remain cached for 30 minutes even when `source_verifie
 Complete observations use the 30-minute cache, while incomplete RPC reads and hard failures are retained for 30 seconds before retry.
 
 The shared discovery pass fetches candidate pairs once and derives both the leaderboard and featured-pool candidates from that response. Results common to both lists reuse the same on-chain check result. A failed refresh preserves the previous valid snapshot.
+
+Transient leaderboard read failures are marked `not_read_yet` separately from token verdicts and are retried only on the next discovery refresh; the refresh uses the existing 300-candidate bound and 200 ms interval between checks.
 
 | Work | Normal cadence | Failure behavior |
 | --- | --- | --- |
@@ -102,7 +106,12 @@ QED bounds work before contacting external services:
 - EVM providers are limited to 8 requests per second per chain;
 - Solana is limited to 4 requests per second;
 - DexScreener requests share a 240-per-minute process budget and a 120-second endpoint backoff after a `429`;
+- GeckoTerminal requests use an awaited 10-per-minute process budget, a 60-second backoff before one retry on `429`, a 10-second timeout, and the shared 4 MiB response cap;
+- GeckoTerminal registry discovery caps each refresh at 30 HTTP attempts and 300 distinct validated pools; publisher-watch fallback caps each scan at 70 HTTP attempts across distinct top-ticker product names and seven networks.
+- The 30-attempt registry budget is divided across the five supported networks: at most four `/tokens/multi` and two `/pools/multi` HTTP attempts each, with at most 60 distinct pool IDs per network.
 - upstream HTTP requests have a 30-second timeout.
+
+Discovery, price refresh, and publisher-watch queries use DexScreener first. GeckoTerminal is used only after a DexScreener error or when the cached USDC canary returns no pairs; valid empty query results do not fan out. Each market row records its provider and links to that provider's pool page. Market values are source-reported, and the stats page and site footer attribute “Market data: DexScreener / GeckoTerminal”; see the [CoinGecko API Terms](https://www.coingecko.com/en/api_terms).
 
 `POST /api/statement` and the plain HTML `POST /statements` form use the shared 60-requests-per-client window and expensive-work semaphore; the form calls the same statement API handler and redirects to its signed page. The semaphore remains held through the complete chain read and signing response. `POST /mcp` uses the same router middleware and expensive-work concurrency boundary for tools that perform chain reads. `GET /api/guard/{address}`, `POST /api/guard`, `GET /guard/{chain}/{address}`, and `POST /guard` use that same boundary and the shared Guard application flow; each review has a 15-second deadline that includes reader selection, pool detection, cache and lock waits, power/source probes, and wallet restriction reads. Guard uses route-level expensive concurrency without acquiring a second power-prefetch permit. `GET /api/powers/{address}` and `qed_powers` accept any supported-chain token contract and apply a 15-second deadline to chain detection, cache and lock waits, source probes, and the shared permit.
 
@@ -114,11 +123,13 @@ The wallet path scans supported chains concurrently under one 20-second request 
 - `src/ports.rs` defines chain, registry, signer, cache, storage, and source-verification boundaries.
 - `src/domain/` owns chain/data models and pure matching, power, Guard, attestation, and statement rules.
 - `src/app/` owns check, wallet, powers, Guard, attestation, and statement application flows; `warm.rs` schedules powers observations.
-- `src/adapters/evm.rs` and `solana.rs` implement chain reads; `registry.rs` fetches and atomically publishes issuer data.
+- `src/adapters/evm.rs` and `solana.rs` implement chain reads; `registry.rs` fetches and atomically publishes issuer data, retaining all supplied xStocks deployments and wrapper addresses.
+- `src/adapters/discovery.rs` runs bounded leaderboard discovery and rotates rate-limited publisher-ticker searches; supported-chain candidates go through the shared Guard flow, while unsupported chains are counted without a verdict.
 - `src/adapters/state.rs` composes runtime state, caches, rate limits, and concurrency controls.
-- `src/adapters/web.rs` owns routes and middleware; `/docs`, `/docs/llm`, `/docs/api-quick-start`, `/api`, `/statements`, `/guard`, `/mcp`, `/api/statement`, `/api/guard`, `/api/guard/{address}`, `/api/powers/{address}`, and `/verify` use this shared router.
+- `src/adapters/web.rs` owns routes and middleware; `/docs`, `/docs/llm`, `/docs/api-quick-start`, `/api`, `/stats`, `/stats.json`, `/stats.csv`, `/api/stats?page={page}`, `/statements`, `/guard`, `/mcp`, `/api/statement`, `/api/guard`, `/api/guard/{address}`, `/api/powers/{address}`, and `/verify` use this shared router.
+- The statement route family also includes `GET /statements/{id}/download.csv`, `GET /statements/{id}/verify`, and `POST /statements/{id}/recheck`; these use the shared router middleware, and re-check submits through the same statement application flow. `GET /v/{id}/verify` renders certificate verification.
 - `src/adapters/web/api.rs` and `pages.rs` adapt REST and HTML requests; `views.rs` owns presentation models and formatting.
-- `src/adapters/web/mcp.rs` implements the Streamable HTTP JSON-RPC transport and QED tools, including `qed_guard`.
+- `src/adapters/web/mcp.rs` implements stateless Streamable HTTP JSON-RPC and seven read-only QED tools: issuer check, token powers, wallet holdings, signed statements, registry lookup, document verification, and combined Guard review.
 - `src/adapters/web/docs.rs` serves discoverability, API guidance, and OpenAPI; `src/adapters/content.rs` renders Markdown and blog and changelog feeds; `src/bin/qed-healthcheck.rs` is the standalone probe.
 
 Dependency rule: `domain` depends on neither `app` nor adapters; `app` depends on domain models and ports, never on HTTP, templates, chain SDKs, or concrete adapters; adapters implement ports and compose application behavior.

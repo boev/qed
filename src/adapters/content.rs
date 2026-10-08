@@ -7,9 +7,10 @@ const SECURITY: &str = include_str!("../../SECURITY.md");
 
 pub(crate) struct ChangelogEntry {
     pub(crate) anchor: String,
-    version: String,
-    date: Option<String>,
+    pub(crate) label: String,
     pub(crate) headline: String,
+    legacy_anchor: Option<String>,
+    date: Option<String>,
     summary_html: String,
     details_html: Option<String>,
 }
@@ -234,13 +235,14 @@ fn parse_changelog_entries(source: &str) -> Vec<ChangelogEntry> {
     let mut current: Option<(String, Option<String>, String)> = None;
 
     for line in source.lines() {
-        if let Some(header) = line.strip_prefix("## [Release ") {
+        if let Some(header) = line.strip_prefix("## [") {
             finish_changelog_entry(&mut entries, current.take());
             let Some((version, date_label)) = header.split_once(']') else {
                 continue;
             };
             let version = version.trim();
-            let mut components = version.split('.');
+            let numeric_version = version.strip_prefix("RC-").unwrap_or(version);
+            let mut components = numeric_version.split('.');
             let major_valid = components.next().is_some_and(|part| {
                 !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
             });
@@ -293,17 +295,21 @@ fn finish_changelog_entry(
             summary_markdown.push_str(line);
             summary_markdown.push('\n');
         }
-        let headline = headline.unwrap_or_else(|| format!("Release {version}"));
+        let headline = headline.unwrap_or_else(|| format!("Version {version}"));
         let summary_html = render_markdown(summary_markdown.trim());
         let details_html = details_source
             .map(str::trim)
             .filter(|details| !details.is_empty())
             .map(render_markdown);
+        let numeric_version = version.strip_prefix("RC-").unwrap_or(&version);
+        let anchor = format!("release-{numeric_version}");
+        let legacy_anchor = (numeric_version == "1.0").then(|| "release-9".to_owned());
         entries.push(ChangelogEntry {
-            anchor: format!("release-{version}"),
-            version,
-            date,
+            anchor,
+            label: version,
             headline,
+            legacy_anchor,
+            date,
             summary_html,
             details_html,
         });
@@ -328,6 +334,13 @@ fn changelog_entry_html(entry: &ChangelogEntry) -> String {
             )
         })
         .unwrap_or_default();
+    let legacy_anchor_html = entry
+        .legacy_anchor
+        .as_deref()
+        .map(|anchor| {
+            format!("<span id=\"{}\" class=\"legacy-release-anchor\"></span>", html_escape(anchor))
+        })
+        .unwrap_or_default();
     let details_html = entry
         .details_html
         .as_deref()
@@ -338,9 +351,9 @@ fn changelog_entry_html(entry: &ChangelogEntry) -> String {
         })
         .unwrap_or_default();
     format!(
-        "<section class=\"changelog-entry\" id=\"{}\"><header class=\"changelog-entry-meta\"><span class=\"release-version\">Release {}</span>{date_html}</header><h2><a href=\"#{}\">{}</a></h2>{}{details_html}</section>",
+        "{legacy_anchor_html}<section class=\"changelog-entry\" id=\"{}\"><header class=\"changelog-entry-meta\"><span class=\"release-version\">{}</span>{date_html}</header><h2><a href=\"#{}\">{}</a></h2>{}{details_html}</section>",
         html_escape(&entry.anchor),
-        html_escape(&entry.version),
+        html_escape(&entry.label),
         html_escape(&entry.anchor),
         html_escape(&entry.headline),
         entry.summary_html,
@@ -363,7 +376,7 @@ pub(crate) fn changelog_atom(base: &str) -> String {
                 .unwrap_or_else(current_atom_date);
             format!(
                 "<entry><title>{}</title><id>{}</id><link href=\"{}\"/><updated>{}</updated><content type=\"html\">{}</content></entry>",
-                xml_escape(&entry.headline),
+                xml_escape(&format!("{} — {}", entry.label, entry.headline)),
                 xml_escape(&link),
                 xml_escape(&link),
                 xml_escape(&updated),
@@ -619,22 +632,28 @@ mod tests {
     #[test]
     fn released_changelog_entries_render_in_reverse_chronological_order() {
         let entries = changelog_entries();
-        assert_eq!(entries[0].anchor, "release-8.1");
-        assert_eq!(entries[0].headline, "Pages open at the top; changelog gets shorter.");
+        assert_eq!(entries[0].anchor, "release-1.0");
+        assert_eq!(entries[0].label, "1.0");
+        assert_eq!(entries[0].headline, "Impostor watch, reliable reads, and easier QED workflows");
         let page = changelog_html();
         let feed = changelog_atom("https://qed.example");
-        assert!(page.contains("id=\"release-8.1\""));
+        assert!(page.contains("id=\"release-1.0\""));
+        assert!(page.contains("id=\"release-9\""));
         assert!(page.contains("id=\"release-1\""));
-        assert!(page.contains("Release 8.1"));
+        assert!(page.contains(">RC-8.1</span>"));
+        assert!(feed.contains("<title>1.0 — Impostor watch"));
+        assert!(feed.contains("<title>RC-8.1 — Pages open"));
         assert!(!page.contains("Unreleased"));
         assert!(!feed.contains("Unreleased"));
-        assert_eq!(feed.matches("<entry>").count(), 9);
+        assert!(!page.contains("RC-8.2"));
+        assert_eq!(feed.matches("<entry>").count(), 10);
     }
     #[test]
     fn changelog_details_are_collapsed_and_excluded_from_the_atom_feed() {
-        let source = "## [Release 8.1] - 2026-10-06\n\n**Short headline**\n\n- **Feature** — short summary.\n\n### Details\n\nLong implementation detail.";
+        let source = "## [RC-8.1] - 2026-10-06\n\n**Short headline**\n\n- **Feature** — short summary.\n\n### Details\n\nLong implementation detail.";
         let entry = parse_changelog_entries(source).into_iter().next().expect("parsed release");
-        assert_eq!(entry.version, "8.1");
+        assert_eq!(entry.label, "RC-8.1");
+        assert_eq!(entry.anchor, "release-8.1");
         assert_eq!(entry.headline, "Short headline");
         assert!(entry.summary_html.contains("<strong>Feature</strong>"));
         assert!(!entry.summary_html.contains("Long implementation detail"));
@@ -661,9 +680,10 @@ mod tests {
 
     #[test]
     fn latest_released_changelog_entry_skips_unreleased() {
-        let source = "## [Release 9] - Unreleased\n\n**Work in progress**\n\n## [Release 8] - 2026-10-05\n\n**Released headline**\n";
+        let source = "## [1.1] - Unreleased\n\n**Work in progress**\n\n## [RC-8] - 2026-10-05\n\n**Released headline**\n";
         let entry = parse_changelog_entries(source).into_iter().next().expect("released entry");
         assert_eq!(entry.anchor, "release-8");
+        assert_eq!(entry.label, "RC-8");
         assert_eq!(entry.headline, "Released headline");
     }
 

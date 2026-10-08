@@ -79,6 +79,10 @@ pub enum PoolError {
     InvalidAddress,
     #[error("pool is unknown: {0}")]
     Unknown(String),
+    #[error("pool venue is not supported: {0}")]
+    UnsupportedVenue(String),
+    #[error("RPC log-query budget exhausted: {0}")]
+    RpcLimit(&'static str),
     #[error("RPC provider does not support bytecode detection")]
     CodeLookupUnsupported,
     #[error("pool discovery budget exhausted: {0}")]

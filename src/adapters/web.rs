@@ -22,13 +22,14 @@ mod views;
 pub(crate) use api::{
     admin_stats, api_attestation, api_check, api_featured, api_guard, api_guard_post,
     api_leaderboard, api_powers, api_prices, api_registry, api_statement, api_statement_get,
-    api_status, api_wallet, healthz, verify_attestation, well_known,
+    api_stats, api_status, api_wallet, healthz, refresh_stats_snapshot, stats_snapshot_csv,
+    stats_snapshot_json, verify_attestation, well_known,
 };
 pub(crate) use docs::{api_docs, imprint, llms, llms_full, privacy, terms, validated_feed};
 pub(crate) use pages::{
-    certificate, chain_page, check_form, check_page, featured, glossary_page, guide_verify_page,
-    index, recheck_certificate, registry_page, registry_table, token_lookup, token_page, validated,
-    validated_detail, wallet_holdings_page, wallet_page,
+    certificate, chain_page, featured, glossary_page, guide_verify_page, index,
+    recheck_certificate, registry_page, registry_table, stats_page, token_lookup, token_page,
+    validated, validated_detail, wallet_holdings_page, wallet_page,
 };
 pub(crate) fn wallet_error_status(error: crate::app::wallet::WalletError) -> StatusCode {
     match error {
@@ -75,7 +76,10 @@ const fn asset_version() -> u64 {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
-        .route("/check", get(check_page).post(check_form))
+        .route("/stats", get(stats_page))
+        .route("/stats.json", get(stats_snapshot_json))
+        .route("/stats.csv", get(stats_snapshot_csv))
+        .route("/check", get(|| async { axum::response::Redirect::permanent("/guard") }))
         .route("/guard", get(pages::guard_page).post(pages::guard_form_submit))
         .route("/guard/{chain}/{address}", get(pages::guard_result_page))
         .route("/registry", get(registry_page))
@@ -116,6 +120,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/registry", get(api_registry))
         .route("/api/pools/featured", get(api_featured))
         .route("/api/leaderboard", get(api_leaderboard))
+        .route("/api/stats", get(api_stats))
         .route("/api/prices", get(api_prices))
         .route("/api/status", get(api_status))
         .route("/api/check/{address}", get(api_check))
@@ -126,20 +131,70 @@ pub fn router(state: AppState) -> Router {
         .route("/api/statement/{id}", get(api_statement_get))
         .route("/api/statement", post(api_statement))
         .route("/statements", get(pages::statements_page).post(pages::create_statement_form))
+        .route("/statements/{id}/download.csv", get(pages::statement_csv))
+        .route("/statements/{id}/verify", get(pages::verify_statement_page))
+        .route("/statements/{id}/recheck", post(pages::recheck_statement))
         .route("/statements/{id}", get(pages::statement_page))
         .route("/api/attest/{id}", get(api_attestation))
-        .route("/verify", post(verify_attestation))
+        .route(
+            "/verify",
+            post(verify_attestation)
+                .layer(axum::extract::DefaultBodyLimit::disable())
+                .layer(middleware::from_fn(api::verify_body_size_limit)),
+        )
         .route("/v/{id}", get(certificate))
+        .route("/v/{id}/verify", get(pages::verify_certificate_page))
         .route("/v/{id}/recheck", post(recheck_certificate))
         .route("/.well-known/qed.json", get(well_known))
         .nest_service("/static", ServeDir::new("static"))
         .with_state(state.clone())
+        .layer(middleware::from_fn(format_api_bad_request))
         .layer(CompressionLayer::new())
         .layer(middleware::from_fn(cache_static))
         .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn_with_state(state.clone(), admin_auth))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .layer(middleware::from_fn_with_state(state, usage_metrics))
+}
+
+async fn format_api_bad_request(request: axum::extract::Request, next: Next) -> Response {
+    let path = request.uri().path();
+    let is_json_api = path.starts_with("/api/") || path == "/verify";
+    let response = next.run(request).await;
+    if !is_json_api || response.status() != StatusCode::BAD_REQUEST {
+        return response;
+    }
+
+    let (mut parts, body) = response.into_parts();
+    let body = axum::body::to_bytes(body, 16 * 1024).await.unwrap_or_default();
+    let detail = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("detail")
+                .or_else(|| value.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            let text = String::from_utf8_lossy(&body).trim().to_owned();
+            (!text.is_empty()).then_some(text)
+        })
+        .unwrap_or_else(|| "The request is missing or contains invalid fields.".to_owned());
+    let body = serde_json::to_vec(&serde_json::json!({
+        "error": "Bad request",
+        "detail": detail,
+    }))
+    .expect("API error response serializes");
+
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts
+        .headers
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json; charset=utf-8"));
+    let mut response = Response::new(axum::body::Body::from(body));
+    *response.status_mut() = parts.status;
+    *response.headers_mut() = parts.headers;
+    response
 }
 async fn admin_auth(
     State(state): State<AppState>,
@@ -241,8 +296,16 @@ async fn rate_limit(
         || (request.method() == Method::GET
             && (path.starts_with("/validated/") || path.starts_with("/v/")))
         || (request.method() == Method::POST
-            && path.starts_with("/v/")
-            && path.ends_with("/recheck"));
+            && (path.starts_with("/v/") || path.starts_with("/statements/"))
+            && path.ends_with("/recheck"))
+        || (request.method() == Method::GET
+            && (path == "/stats"
+                || path == "/stats.json"
+                || path == "/stats.csv"
+                || path == "/api/stats"
+                || path.starts_with("/api/statement/")
+                || path.starts_with("/api/attest/")
+                || path.starts_with("/statements/")));
     let is_read_limited = path.starts_with("/api/attest/")
         || path == "/.well-known/qed.json"
         || path == "/admin/stats"
@@ -718,7 +781,6 @@ mod tests {
     async fn new_pages_have_metadata_nav_and_draft_exclusions() {
         let app = router(AppState::for_tests(Vec::new(), Vec::new(), false));
         let pages = [
-            ("/check", "QED | Check a pool"),
             ("/registry", "QED | Issuer registry"),
             ("/guard", "QED | Guard review"),
             ("/docs", "QED | Documentation"),
@@ -774,9 +836,9 @@ mod tests {
                 .split("</nav>")
                 .next()
                 .expect("navigation close");
-            assert_eq!(nav.matches("<a ").count(), 5, "{path}");
+            assert_eq!(nav.matches("<a ").count(), 7, "{path}");
             let mut previous = 0;
-            for label in ["Check", "Registry", "Guard", "Statement", "Docs"] {
+            for label in ["Guard", "Registry", "Statement", "Docs", "API", "MCP", "llms.txt"] {
                 let position = nav.find(&format!(">{label}</a>")).expect("navigation label");
                 assert!(position >= previous, "{path}: {label}");
                 previous = position;
@@ -788,14 +850,24 @@ mod tests {
                 .split("</nav>")
                 .next()
                 .expect("footer navigation close");
-            assert_eq!(footer.matches("<a ").count(), 8, "{path}");
-            for label in
-                ["Changelog", "Blog", "About", "Security", "Imprint", "Privacy", "Terms", "GitHub"]
-            {
+            assert_eq!(footer.matches("<a ").count(), 9, "{path}");
+            for label in [
+                "Changelog",
+                "Glossary",
+                "Blog",
+                "About",
+                "Security",
+                "Imprint",
+                "Privacy",
+                "Terms",
+                "GitHub",
+            ] {
                 assert!(footer.contains(&format!(">{label}</a>")), "{path}: {label}");
             }
             if path == "/statements" {
-                assert!(body.contains("<h1 class=\"page-title\">Sign a wallet statement.</h1>"));
+                assert!(body.contains(
+                    "<h1 class=\"page-title\">What did these wallets hold, provably?</h1>"
+                ));
                 assert!(body.contains(
                     "A signed, re-checkable record of what a wallet set holds in registry tokens at a block height — for audits, reporting and counterparties."
                 ));
@@ -809,6 +881,14 @@ mod tests {
                 assert!(body.contains("Sign statement"));
             }
         }
+        let legacy_check = app
+            .clone()
+            .oneshot(Request::get("/check").body(Body::empty()).expect("legacy check request"))
+            .await
+            .expect("legacy check redirect");
+        assert_eq!(legacy_check.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(legacy_check.headers()["location"], "/guard");
+
         let posts = crate::adapters::content::blog_posts().expect("blog sources parse");
         let published_slugs = posts
             .iter()
@@ -942,7 +1022,6 @@ mod tests {
         assert!(!sitemap.contains("/blog/what-a-qed-statement-is"));
 
         for path in [
-            "/check",
             "/registry",
             "/statements",
             "/docs",
@@ -980,9 +1059,9 @@ mod tests {
                     .split("</nav>")
                     .next()
                     .expect("API navigation close");
-                assert_eq!(nav.matches("<a ").count(), 5);
+                assert_eq!(nav.matches("<a ").count(), 7);
                 let mut previous = 0;
-                for label in ["Check", "Registry", "Guard", "Statement", "Docs"] {
+                for label in ["Guard", "Registry", "Statement", "Docs", "API", "MCP", "llms.txt"] {
                     let position =
                         nav.find(&format!(">{label}</a>")).expect("API navigation label");
                     assert!(position >= previous);
@@ -1027,21 +1106,15 @@ mod tests {
         for tool in [
             "qed_check",
             "qed_powers",
-            "qed_guard",
             "qed_wallet",
             "qed_statement",
             "qed_registry_lookup",
             "qed_verify",
+            "qed_guard",
         ] {
             assert!(llm.contains(tool), "missing {tool}");
         }
-        for prompt in [
-            "Is this pool the real NVDA token?",
-            "What can the issuer do to this token?",
-            "Sign a statement of what these wallets hold",
-        ] {
-            assert!(llm.contains(prompt), "missing prompt: {prompt}");
-        }
+        assert!(llm.contains("Does this pool use the issuer's published stock-token contract?"));
 
         let verification = app
             .clone()
@@ -1102,8 +1175,7 @@ mod tests {
         let entry = crate::adapters::content::latest_released_changelog_entry()
             .expect("changelog is readable")
             .expect("a released changelog entry exists");
-        let release_number = entry.anchor.strip_prefix("release-").expect("release anchor");
-        let expected_news = format!("New in release {release_number}: {}", entry.headline);
+        let expected_news = format!("New in {}: {}", entry.label, entry.headline);
         let posts = crate::adapters::content::blog_posts().expect("blog posts are readable");
         let latest_blog = crate::adapters::content::latest_published_blog_post(&posts);
 
@@ -1137,7 +1209,7 @@ mod tests {
             let banner_end =
                 body[banner_start..].find("</p>").expect("release banner end") + banner_start;
             let banner = &body[banner_start..banner_end];
-            assert!(banner.contains(&expected_news));
+            assert!(banner.contains(&expected_news), "expected {expected_news:?} in {banner:?}");
             assert!(!banner.contains("Navigation"));
             assert!(!banner.contains("Release notes"));
             assert!(body.contains(&format!("/changelog#{}", entry.anchor)));
@@ -1169,7 +1241,7 @@ mod tests {
         }
         for example in [
             "/guard/ethereum/0xc845b2894dBddd03858fd2D643B4eF725fE0849d",
-            "/guard/robinhood/0xeE6F200063a53Fe9450578d99c0F8eAD4952c97a",
+            "/guard/robinhood/0x6444a8e0b267406a15db74ca00c4a24bdfa81ed3180f5b6d0851f8ed6f4f29c5",
             "/tokens/NVDA",
             "/statements",
             "/validated",
@@ -1266,24 +1338,6 @@ mod tests {
         assert_eq!(first.status(), StatusCode::SEE_OTHER);
         let location = first.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_owned();
         assert!(location.starts_with("/statements/"));
-        let statement_page = app
-            .clone()
-            .oneshot(Request::get(&location).body(Body::empty()).expect("statement page request"))
-            .await
-            .expect("statement page response");
-        assert_eq!(statement_page.status(), StatusCode::OK);
-        let statement_page =
-            axum::body::to_bytes(statement_page.into_body(), usize::MAX).await.unwrap();
-        let statement_page = String::from_utf8(statement_page.to_vec()).unwrap();
-        assert!(statement_page.contains("<p class=\"eyebrow\">STATEMENT</p>"));
-        assert!(statement_page.contains("<h1 class=\"page-title\">Wallet statement</h1>"));
-        assert!(statement_page.contains(
-            "A signed, re-checkable record of what a wallet set holds in registry tokens at a block height — for audits, reporting and counterparties."
-        ));
-        assert!(statement_page.contains("Statement summary"));
-        assert!(statement_page.contains("Observed block and slot range"));
-        assert!(statement_page.contains("Registered token holdings"));
-        assert!(statement_page.contains("href=\"/api#api-post-verify\">Verify</a>"));
 
         let ip = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
         for _ in 0..58 {
@@ -1292,5 +1346,86 @@ mod tests {
         let rate_limited =
             app.oneshot(statement_form_request()).await.expect("rate-limited form response");
         assert_eq!(rate_limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn guard_requires_an_explicit_chain_and_api_bad_requests_are_readable() {
+        let app = router(AppState::for_tests(Vec::new(), Vec::new(), false));
+        let guard_page = app
+            .clone()
+            .oneshot(Request::get("/guard").body(Body::empty()).unwrap())
+            .await
+            .expect("Guard page response");
+        assert_eq!(guard_page.status(), StatusCode::OK);
+        let guard_page = axum::body::to_bytes(guard_page.into_body(), usize::MAX).await.unwrap();
+        let guard_page = String::from_utf8(guard_page.to_vec()).unwrap();
+        assert!(
+            guard_page.contains(r#"<option value="" selected disabled>Select a chain</option>"#)
+        );
+        assert!(!guard_page.contains(r#"value="solana" selected"#));
+
+        let guard_error = app
+            .clone()
+            .oneshot(
+                Request::get("/api/guard/0x0000000000000000000000000000000000000001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("Guard API response");
+        assert_eq!(guard_error.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            guard_error
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("application/json")
+        );
+        let guard_error = axum::body::to_bytes(guard_error.into_body(), usize::MAX).await.unwrap();
+        let guard_error: serde_json::Value = serde_json::from_slice(&guard_error).unwrap();
+        assert_eq!(guard_error["error"], "Bad request");
+        assert!(guard_error["detail"].as_str().is_some_and(|detail| !detail.trim().is_empty()));
+
+        let statement_error = app
+            .oneshot(
+                Request::post("/api/statement")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"wallets":[],"chains":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .expect("Statement API response");
+        assert_eq!(statement_error.status(), StatusCode::BAD_REQUEST);
+        let statement_error =
+            axum::body::to_bytes(statement_error.into_body(), usize::MAX).await.unwrap();
+        let statement_error: serde_json::Value = serde_json::from_slice(&statement_error).unwrap();
+        assert_eq!(statement_error["error"], "Bad request");
+        assert!(
+            statement_error["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("wallet addresses"))
+        );
+    }
+    #[tokio::test]
+    async fn export_and_recheck_routes_share_the_expensive_permit() {
+        let mut state = AppState::for_tests(Vec::new(), Vec::new(), false);
+        state.expensive_concurrency = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let app = router(state);
+        let requests = [
+            Request::get("/stats").body(Body::empty()).unwrap(),
+            Request::get("/stats.json").body(Body::empty()).unwrap(),
+            Request::get("/stats.csv").body(Body::empty()).unwrap(),
+            Request::get("/api/stats").body(Body::empty()).unwrap(),
+            Request::get("/api/statement/missing").body(Body::empty()).unwrap(),
+            Request::get("/statements/missing/download.csv").body(Body::empty()).unwrap(),
+            Request::get("/statements/missing/verify").body(Body::empty()).unwrap(),
+            Request::post("/statements/missing/recheck").body(Body::empty()).unwrap(),
+        ];
+        for request in requests {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
     }
 }

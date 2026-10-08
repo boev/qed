@@ -322,6 +322,8 @@ async fn main() -> Result<()> {
         leaderboard_check_cache,
         board_store,
         registry_api_cache: Arc::new(RwLock::new(None)),
+        stats_snapshot: Arc::new(RwLock::new(None)),
+        stats_snapshot_refresh: Arc::new(tokio::sync::Mutex::new(())),
         public_url: Arc::new(config.public_url.clone()),
         admin_auth,
         usage_stats,
@@ -334,6 +336,10 @@ async fn main() -> Result<()> {
     app::attestation::hydrate_attestations(&state.app)
         .await
         .context("loading recent persisted attestations")?;
+    adapters::web::refresh_stats_snapshot(&state)
+        .await
+        .map_err(anyhow::Error::msg)
+        .context("building initial statistics snapshot")?;
 
     let warm_state = state.clone();
     let warm_notify = Arc::clone(&powers_warm_notify);

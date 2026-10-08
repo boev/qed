@@ -14,9 +14,9 @@
       </div>
       <div class="certificate-heading">
         <p class="eyebrow">{{ certificate.verdict_label }}</p>
-        <h1 class="page-title">{{ certificate.pair }}</h1>
+        <h1 class="page-title">Does {{ certificate.pair }} match its issuer's published contract?</h1>
         <p>{{ certificate.sentence }}</p>
-        {% if certificate.verdict_class == "is-verified" %}<small class="contract-match-note">contract match only, not proof of backing or custody, reserves, price, or endorsement</small>{% endif %}
+        {% if certificate.verdict_class == "is-verified" %}<p class="contract-match-note">Verified means the observed quote-token contract matches an issuer-published registry entry on {{ certificate.chain }}. Only the quote-side contract is checked.</p><small class="contract-match-note">This does not prove backing, custody, reserves, price, safety, solvency, or endorsement.</small>{% endif %}
         <p class="certificate-status {{ certificate.signature_status_class }}">
           <span class="status-dot" aria-hidden="true"></span>
           {{ certificate.signature_status_label }}
@@ -78,6 +78,7 @@
         <dd>QED (key id <code>{{ certificate.signer_key_id }}</code>)</dd>
       </div>
     </dl>
+    <p class="certificate-expiry-help">After this time the certificate remains a historical record, but it no longer establishes current pool or registry state. Re-check to create a fresh observation before relying on current facts.</p>
     <p class="address-compare-note">Compare this address with the one you were given before you trade.</p>
     <div class="backing-bar" aria-label="Quote share of supply">
       <progress class="share-progress" max="100" value="{{ certificate.share_value }}">{{ certificate.share_label }}</progress>
@@ -95,12 +96,14 @@
       {% endif %}
     </nav>
     <p class="anti-phishing">Only trust an address you pasted here or opened from this page.</p>
-    <div class="certificate-actions">
+    <nav class="certificate-actions">
+      <a class="button secondary-button" href="/v/{{ certificate.id }}/verify">Verify this record</a>
+      <a class="button secondary-button" href="{{ certificate.attestation_api_url }}" download>Download JSON</a>
       <button class="button secondary-button" type="button" data-nerd-toggle aria-expanded="false">Nerd mode</button>
       <form hx-post="/v/{{ certificate.id }}/recheck{% if certificate.is_live %}?live=true{% endif %}" hx-target="#certificate-result" hx-swap="outerHTML">
         <button class="button primary-button" type="submit">Re-check now</button>
       </form>
-    </div>
+    </nav>
     <details class="verify-details">
       <summary>How to verify this yourself</summary>
       <p>QED signs a canonical JSON payload. Fetch the public key from <a href="{{ certificate.public_key_url }}">{{ certificate.public_key_url }}</a>, then check the signature against this payload.</p>

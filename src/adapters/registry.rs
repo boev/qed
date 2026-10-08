@@ -147,6 +147,9 @@ pub(crate) async fn refresh_registry(state: &AppState) {
     }
     if changed {
         state.powers_warm_notify.notify_one();
+        if let Err(error) = crate::adapters::web::refresh_stats_snapshot(state).await {
+            tracing::warn!(%error, "could not refresh prepared statistics snapshot after registry update");
+        }
     }
 }
 
@@ -237,7 +240,7 @@ pub(crate) mod registries {
         use super::Entry;
         #[cfg(test)]
         use super::ONDO_URL;
-        use crate::domain::chain::Chain;
+        use crate::domain::{chain::Chain, registry::OfficialDeployment};
         use reqwest::Client;
         use serde_json::{Map, Value};
         use thiserror::Error;
@@ -299,14 +302,12 @@ pub(crate) mod registries {
                     &record,
                     &["underlyingName", "displayName", "name", "tokenName", "description"],
                 );
-                let inherited_chain = chain(
-                    record
-                        .get("chain")
-                        .or_else(|| record.get("network"))
-                        .or_else(|| record.get("networkChainId"))
-                        .or_else(|| record.get("blockchain"))
-                        .or_else(|| record.get("chainId")),
+                let inherited_network = network_value(
+                    &record,
+                    &["chain", "network", "networkChainId", "blockchain", "chainId"],
                 );
+                let inherited_chain =
+                    inherited_network.as_deref().and_then(Chain::from_network_name);
                 let inherited_decimals = number(&record, &["decimals", "tokenDecimals"])
                     .and_then(|value| u8::try_from(value).ok());
                 let deployments = record
@@ -315,6 +316,33 @@ pub(crate) mod registries {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_else(|| vec![Value::Object(record.clone())]);
+                let official_deployments = deployments
+                    .iter()
+                    .filter_map(|value| {
+                        let deployment = value.as_object()?;
+                        let address = string(
+                            deployment,
+                            &["address", "contract", "contractAddress", "tokenAddress"],
+                        )?;
+                        let network = network_value(
+                            deployment,
+                            &["chain", "network", "networkChainId", "blockchain", "chainId"],
+                        )
+                        .or_else(|| inherited_network.clone())?;
+                        Some(OfficialDeployment {
+                            network,
+                            address,
+                            wrapper_address: string(
+                                deployment,
+                                &["wrapperAddress", "wrapper_address", "wrapperTokenAddress"],
+                            ),
+                            wrapper_address_v2: string(
+                                deployment,
+                                &["wrapperAddressV2", "wrapper_address_v2"],
+                            ),
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 for deployment in deployments {
                     let Some(deployment) = deployment.as_object() else {
                         continue;
@@ -330,15 +358,13 @@ pub(crate) mod registries {
                     let Some(ticker) = ticker else {
                         continue;
                     };
-                    let chain = chain(
-                        deployment
-                            .get("chain")
-                            .or_else(|| deployment.get("network"))
-                            .or_else(|| deployment.get("networkChainId"))
-                            .or_else(|| deployment.get("blockchain"))
-                            .or_else(|| deployment.get("chainId")),
+                    let network = network_value(
+                        deployment,
+                        &["chain", "network", "networkChainId", "blockchain", "chainId"],
                     )
-                    .or(inherited_chain);
+                    .or_else(|| inherited_network.clone());
+                    let chain =
+                        network.as_deref().and_then(Chain::from_network_name).or(inherited_chain);
                     let Some(chain) = chain else {
                         continue;
                     };
@@ -363,6 +389,7 @@ pub(crate) mod registries {
                         last_checked: checked_at.to_owned(),
                         removed_at: None,
                         stale_since: None,
+                        official_deployments: official_deployments.clone(),
                     });
                 }
             }
@@ -396,31 +423,14 @@ pub(crate) mod registries {
             })
         }
 
-        fn chain(value: Option<&Value>) -> Option<Chain> {
-            match value {
-                Some(Value::Number(number)) => match number.as_u64()? {
-                    1 => Some(Chain::Ethereum),
-                    56 => Some(Chain::Bnb),
-                    8453 => Some(Chain::Base),
-                    4663 => Some(Chain::RobinhoodChain),
+        fn network_value(object: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+            keys.iter().find_map(|key| {
+                object.get(*key).and_then(|value| match value {
+                    Value::String(network) => Some(network.clone()),
+                    Value::Number(network) => Some(network.to_string()),
                     _ => None,
-                },
-                Some(Value::String(string)) => {
-                    match string.to_ascii_lowercase().replace([' ', '_', '-'], "").as_str() {
-                        "ethereum" | "ethereum1" | "mainnet" | "eth" => Some(Chain::Ethereum),
-                        "bnb" | "bnbchain" | "binancesmartchain" | "bsc" | "bsc56" => {
-                            Some(Chain::Bnb)
-                        }
-                        "base" => Some(Chain::Base),
-                        "robinhoodchain" => Some(Chain::RobinhoodChain),
-                        "solana" | "solana900" => Some(Chain::Solana),
-                        _ => {
-                            string.parse::<u64>().ok().and_then(|id| chain(Some(&Value::from(id))))
-                        }
-                    }
-                }
-                _ => None,
-            }
+                })
+            })
         }
 
         #[cfg(test)]
@@ -441,11 +451,28 @@ pub(crate) mod registries {
                 assert_eq!(entries[0].name, "Apple");
                 assert_eq!(entries[0].chain, Chain::Ethereum);
                 assert_eq!(entries[0].decimals, Some(18));
+                assert_eq!(entries[0].official_deployments.len(), 3);
+                assert!(entries[0].official_deployments.iter().any(|deployment| {
+                    deployment.network == "solana-900"
+                        && deployment.address == "So11111111111111111111111111111111111111112"
+                }));
                 assert_eq!(entries[1].chain, Chain::Bnb);
                 assert_eq!(entries[2].chain, Chain::Solana);
                 assert_eq!(entries[3].ticker, "OUSG");
                 assert_eq!(entries[3].chain, Chain::Ethereum);
                 assert_eq!(entries[4].chain, Chain::Bnb);
+            }
+
+            #[test]
+            fn retains_official_deployments_across_chains() {
+                let payload = r#"{"assets":[{"tokenSymbol":"NVDA","tokenName":"NVIDIA • Robinhood Token","tokenDecimals":18,"deployments":[{"chainId":4663,"contractAddress":"0xAbCd000000000000000000000000000000000001"},{"chainId":8453,"contractAddress":"0xAbCd000000000000000000000000000000000002"}]}]}"#;
+                let entries = map_payload(payload, "2026-09-21T00:00:00Z").unwrap();
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].official_deployments.len(), 2);
+                assert!(entries[0].official_deployments.iter().any(|deployment| {
+                    deployment.network == "8453"
+                        && deployment.address == "0xAbCd000000000000000000000000000000000002"
+                }));
             }
 
             #[tokio::test]
@@ -540,6 +567,10 @@ pub(crate) mod registries {
             contract_address: String,
             #[serde(rename = "chainId")]
             chain_id: u64,
+            #[serde(default, rename = "wrapperAddress")]
+            wrapper_address: Option<String>,
+            #[serde(default, rename = "wrapperAddressV2")]
+            wrapper_address_v2: Option<String>,
         }
 
         pub async fn fetch(client: &Client, endpoint_url: &str) -> Result<Vec<Entry>, Error> {
@@ -574,25 +605,39 @@ pub(crate) mod registries {
                     .strip_suffix(" • Robinhood Token")
                     .unwrap_or(&asset.token_name)
                     .to_owned();
+                let official_deployments = asset
+                    .deployments
+                    .iter()
+                    .map(|deployment| {
+                        let network = Chain::from_network_name(&deployment.chain_id.to_string())
+                            .map(|chain| chain.to_string())
+                            .unwrap_or_else(|| format!("Chain ID {}", deployment.chain_id));
+                        crate::domain::registry::OfficialDeployment {
+                            network,
+                            address: deployment.contract_address.clone(),
+                            wrapper_address: deployment.wrapper_address.clone(),
+                            wrapper_address_v2: deployment.wrapper_address_v2.clone(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
                 for deployment in asset.deployments {
-                    if deployment.chain_id != Chain::ROBINHOOD_CHAIN_ID {
+                    let Some(chain) = Chain::from_network_name(&deployment.chain_id.to_string())
+                    else {
                         continue;
-                    }
+                    };
                     entries.push(Entry {
                         issuer: "Robinhood".to_owned(),
                         ticker: asset.token_symbol.clone(),
                         name: name.clone(),
-                        chain: Chain::RobinhoodChain,
-                        contract: super::canonical_contract(
-                            Chain::RobinhoodChain,
-                            deployment.contract_address,
-                        ),
+                        chain,
+                        contract: super::canonical_contract(chain, deployment.contract_address),
                         decimals: asset.token_decimals,
                         source: "robinhood-registry".to_owned(),
                         source_url: source_url.to_owned(),
                         last_checked: checked_at.to_owned(),
                         removed_at: None,
                         stale_since: None,
+                        official_deployments: official_deployments.clone(),
                     });
                 }
             }
@@ -613,6 +658,36 @@ pub(crate) mod registries {
                 assert_eq!(entries[0].name, "NVIDIA");
                 assert_eq!(entries[0].decimals, Some(18));
             }
+            #[test]
+            fn retains_every_robinhood_deployment_and_wrapper_on_each_entry() {
+                let payload = r#"{"assets":[{"tokenSymbol":"NVDA","tokenName":"NVIDIA • Robinhood Token","tokenDecimals":18,"deployments":[{"chainId":4663,"contractAddress":"0x0000000000000000000000000000000000000001","wrapperAddress":"0x0000000000000000000000000000000000000002","wrapperAddressV2":"0x0000000000000000000000000000000000000003"},{"chainId":8453,"contractAddress":"0x0000000000000000000000000000000000000004","wrapperAddress":"0x0000000000000000000000000000000000000005"},{"chainId":99999,"contractAddress":"0x0000000000000000000000000000000000000006"}]}]}"#;
+                let entries = map_payload(payload, "2026-09-21T00:00:00Z").unwrap();
+
+                assert_eq!(entries.len(), 2);
+                for entry in &entries {
+                    assert_eq!(entry.official_deployments.len(), 3);
+                    assert!(entry.official_deployments.iter().any(|deployment| {
+                        deployment.network == "Robinhood Chain"
+                            && deployment.address == "0x0000000000000000000000000000000000000001"
+                            && deployment.wrapper_address.as_deref()
+                                == Some("0x0000000000000000000000000000000000000002")
+                            && deployment.wrapper_address_v2.as_deref()
+                                == Some("0x0000000000000000000000000000000000000003")
+                    }));
+                    assert!(entry.official_deployments.iter().any(|deployment| {
+                        deployment.network == "Base"
+                            && deployment.address == "0x0000000000000000000000000000000000000004"
+                            && deployment.wrapper_address.as_deref()
+                                == Some("0x0000000000000000000000000000000000000005")
+                    }));
+                    assert!(
+                        entry
+                            .official_deployments
+                            .iter()
+                            .any(|deployment| deployment.network == "Chain ID 99999")
+                    );
+                }
+            }
         }
     }
 
@@ -621,6 +696,7 @@ pub(crate) mod registries {
         #[cfg(test)]
         use super::XSTOCKS_URL;
         use crate::domain::chain::Chain;
+        use crate::domain::registry::OfficialDeployment;
         use reqwest::Client;
         use serde::Deserialize;
         use thiserror::Error;
@@ -659,14 +735,32 @@ pub(crate) mod registries {
         }
 
         #[derive(Debug, Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct Deployment {
             address: String,
             network: String,
             decimals: Option<u8>,
+            #[serde(default)]
+            wrapper_address: Option<String>,
+            #[serde(default)]
+            wrapper_address_v2: Option<String>,
+        }
+
+        const MAX_PAGES: usize = 20;
+
+        fn page_has_more(response: &Response, page: usize) -> Result<bool, Error> {
+            let Some(info) = response.page.as_ref() else {
+                return Err(Error::Body("pagination metadata was missing".to_owned()));
+            };
+            if page + 1 == MAX_PAGES && info.has_next_page {
+                return Err(Error::Body(
+                    "source still has pages beyond the configured limit".to_owned(),
+                ));
+            }
+            Ok(info.has_next_page)
         }
 
         pub async fn fetch(client: &Client, endpoint_url: &str) -> Result<Vec<Entry>, Error> {
-            const MAX_PAGES: usize = 20;
             let checked_at = super::now_rfc3339();
             let mut nodes = Vec::new();
             for page in 0..MAX_PAGES {
@@ -679,14 +773,14 @@ pub(crate) mod registries {
                     .error_for_status()?;
                 let body = crate::adapters::net::body(response).await.map_err(Error::Body)?;
                 let response: Response = serde_json::from_slice(&body)?;
-                let has_next_page = response.page.as_ref().is_some_and(|page| page.has_next_page);
+                let has_next_page = page_has_more(&response, page)?;
                 nodes.extend(response.nodes);
                 if !has_next_page {
-                    break;
+                    return map_nodes_with_source(nodes, &checked_at, endpoint_url);
                 }
                 sleep(Duration::from_millis(50)).await;
             }
-            map_nodes_with_source(nodes, &checked_at, endpoint_url)
+            unreachable!("the last page fails if the source is incomplete")
         }
 
         #[cfg(test)]
@@ -710,9 +804,26 @@ pub(crate) mod registries {
                 let ticker =
                     node.underlying_symbol.filter(|value| !value.is_empty()).unwrap_or(node.symbol);
                 let name = node.name.strip_suffix(" xStock").unwrap_or(&node.name).to_owned();
+                let official_deployments = node
+                    .deployments
+                    .iter()
+                    .map(|deployment| OfficialDeployment {
+                        network: deployment.network.clone(),
+                        address: deployment.address.clone(),
+                        wrapper_address: deployment.wrapper_address.clone(),
+                        wrapper_address_v2: deployment.wrapper_address_v2.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let mut official_list_attached = false;
                 for deployment in node.deployments {
                     let Some(chain) = chain_for_network(&deployment.network) else {
                         continue;
+                    };
+                    let attached = if official_list_attached {
+                        Vec::new()
+                    } else {
+                        official_list_attached = true;
+                        official_deployments.clone()
                     };
                     entries.push(Entry {
                         issuer: "Backed xStocks".to_owned(),
@@ -726,6 +837,7 @@ pub(crate) mod registries {
                         last_checked: checked_at.to_owned(),
                         removed_at: None,
                         stale_since: None,
+                        official_deployments: attached,
                     });
                 }
             }
@@ -733,14 +845,7 @@ pub(crate) mod registries {
         }
 
         fn chain_for_network(network: &str) -> Option<Chain> {
-            match network.to_ascii_lowercase().replace([' ', '_', '-'], "").as_str() {
-                "solana" => Some(Chain::Solana),
-                "robinhoodchain" => Some(Chain::RobinhoodChain),
-                "base" => Some(Chain::Base),
-                "ethereum" | "mainnet" => Some(Chain::Ethereum),
-                "binancesmartchain" | "bsc" | "bnb" | "bnbchain" => Some(Chain::Bnb),
-                _ => None,
-            }
+            Chain::from_network_name(network)
         }
 
         #[cfg(test)]
@@ -752,11 +857,41 @@ pub(crate) mod registries {
             fn maps_supported_deployments() {
                 let payload = include_str!("../../tests/fixtures/xstocks.json");
                 let entries = map_payload(payload, "2026-09-21T00:00:00Z").unwrap();
-                assert_eq!(entries.len(), 2);
+                assert_eq!(entries.len(), 3);
                 assert_eq!(entries[0].issuer, "Backed xStocks");
                 assert_eq!(entries[0].ticker, "NVDA");
                 assert_eq!(entries[0].chain, Chain::Solana);
                 assert_eq!(entries[1].chain, Chain::Ethereum);
+                assert_eq!(entries[2].chain, Chain::Bnb);
+                assert_eq!(entries[2].contract, "0x0000000000000000000000000000000000000102");
+                assert_eq!(entries[0].official_deployments.len(), 12);
+                let ethereum = entries[0]
+                    .official_deployments
+                    .iter()
+                    .find(|deployment| deployment.network == "Ethereum")
+                    .expect("official Ethereum deployment retained");
+                assert_eq!(
+                    ethereum.wrapper_address.as_deref(),
+                    Some("0xAbCd000000000000000000000000000000000002")
+                );
+                assert_eq!(
+                    ethereum.wrapper_address_v2.as_deref(),
+                    Some("0xAbCd000000000000000000000000000000000003")
+                );
+            }
+
+            #[test]
+            fn xstocks_requires_explicit_complete_pagination() {
+                let missing: super::Response = serde_json::from_str(r#"{"nodes":[]}"#).unwrap();
+                assert!(super::page_has_more(&missing, 0).is_err());
+
+                let capped: super::Response =
+                    serde_json::from_str(r#"{"nodes":[],"page":{"hasNextPage":true}}"#).unwrap();
+                assert!(super::page_has_more(&capped, super::MAX_PAGES - 1).is_err());
+
+                let complete: super::Response =
+                    serde_json::from_str(r#"{"nodes":[],"page":{"hasNextPage":false}}"#).unwrap();
+                assert_eq!(super::page_has_more(&complete, 0).unwrap(), false);
             }
 
             #[test]
@@ -808,6 +943,7 @@ mod tests {
                 .to_rfc3339_opts(SecondsFormat::Secs, true),
             removed_at: None,
             stale_since: None,
+            official_deployments: Vec::new(),
         };
         save_to_file(&path, &vec![old]).expect("write registry");
 

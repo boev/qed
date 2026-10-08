@@ -11,8 +11,8 @@
 <script type="application/ld+json">{{ json_ld|safe }}</script>
 <section class="page-intro directory-intro">
   <p class="eyebrow">Token registry</p>
-  <h1 class="page-title">{{ ticker }} tokenized.</h1>
-  <p>These are the issuer contracts QED compares on every supported chain. A ticker alone is not evidence of a contract match.</p>
+  <h1 class="page-title">Which contracts did each issuer publish for {{ ticker }}?</h1>
+  <p>These are the registry addresses QED compares against; a ticker alone is not evidence of a contract match.</p>
 </section>
 <section class="directory-section" aria-labelledby="contracts-title">
   <div class="section-heading"><div><p class="eyebrow">Issuer contracts</p><h2 id="contracts-title">{{ ticker }} on every chain</h2></div></div>
@@ -45,6 +45,8 @@
         {% for badge in contract.powers.summary_badges %}<span class="count-badge">{{ badge }}</span>{% endfor %}
         <span class="count-badge">{{ contract.powers.source_badge }}</span>
       </div>
+      <p class="lookup-note">{{ contract.powers.summary_sentence }}</p>
+      <p class="lookup-note">Legend: control badges describe capabilities QED observed on this chain. “Source verified” means published source matched the observed contract; it is not a safety rating.</p>
       <details class="powers-panel">
         <summary>Observed token-control signals</summary>
         {% if contract.powers.available %}

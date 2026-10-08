@@ -1,0 +1,46 @@
+{
+  "data": [
+    {
+      "id": "robinhood_0x6444a8e0b267406a15db74ca00c4a24bdfa81ed3180f5b6d0851f8ed6f4f29c5",
+      "type": "pool",
+      "attributes": {
+        "address": "0x6444a8e0b267406a15db74ca00c4a24bdfa81ed3180f5b6d0851f8ed6f4f29c5",
+        "name": "NVDAx / USDC",
+        "base_token_price_usd": "134.25",
+        "volume_usd": { "h24": "12345.67" },
+        "reserve_in_usd": "456789.01",
+        "pool_created_at": "2026-10-07T00:00:00Z"
+      },
+      "relationships": {
+        "base_token": { "data": { "id": "robinhood_0x0000000000000000000000000000000000000011", "type": "token" } },
+        "quote_token": { "data": { "id": "robinhood_0x0000000000000000000000000000000000000022", "type": "token" } },
+        "dex": { "data": { "id": "robinhood_uniswap-v4", "type": "dex" } }
+      }
+    }
+  ],
+  "included": [
+    {
+      "id": "robinhood_0x0000000000000000000000000000000000000011",
+      "type": "token",
+      "attributes": {
+        "address": "0x0000000000000000000000000000000000000011",
+        "name": "NVIDIA xStock",
+        "symbol": "NVDAx"
+      }
+    },
+    {
+      "id": "robinhood_0x0000000000000000000000000000000000000022",
+      "type": "token",
+      "attributes": {
+        "address": "0x0000000000000000000000000000000000000022",
+        "name": "USD Coin",
+        "symbol": "USDC"
+      }
+    },
+    {
+      "id": "robinhood_uniswap-v4",
+      "type": "dex",
+      "attributes": { "name": "Uniswap V4", "identifier": "uniswap-v4" }
+    }
+  ]
+}

@@ -2,6 +2,52 @@ use crate::domain::chain::Chain;
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct OfficialDeployment {
+    pub network: String,
+    pub address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapper_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapper_address_v2: Option<String>,
+}
+
+pub fn official_deployment_matches(entry: &Entry, chain: Chain, contract: &str) -> bool {
+    entry.official_deployments.iter().any(|deployment| {
+        deployment_network_matches(&deployment.network, chain)
+            && [
+                Some(deployment.address.as_str()),
+                deployment.wrapper_address.as_deref(),
+                deployment.wrapper_address_v2.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|address| {
+                normalize_contract(chain, address) == normalize_contract(chain, contract)
+            })
+    })
+}
+
+pub fn official_networks(entry: &Entry) -> Vec<String> {
+    let mut networks = entry
+        .official_deployments
+        .iter()
+        .map(|deployment| {
+            Chain::from_network_name(&deployment.network)
+                .map(|chain| chain.to_string())
+                .unwrap_or_else(|| deployment.network.clone())
+        })
+        .collect::<Vec<_>>();
+    networks.sort_by_key(|network| network.to_ascii_lowercase());
+    networks.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    networks
+}
+
+fn deployment_network_matches(network: &str, chain: Chain) -> bool {
+    Chain::from_network_name(network) == Some(chain)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Entry {
     pub issuer: String,
     pub ticker: String,
@@ -16,6 +62,8 @@ pub struct Entry {
     pub removed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_since: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub official_deployments: Vec<OfficialDeployment>,
 }
 
 pub type Registry = Vec<Entry>;
@@ -122,7 +170,8 @@ pub fn match_status(registry: &[Entry], chain: Chain, contract: &str) -> MatchSt
     let mut removed = None;
     let mut stale = None;
     for entry in registry.iter().filter(|entry| {
-        entry.chain == chain && normalize_contract(entry.chain, &entry.contract) == contract
+        (entry.chain == chain && normalize_contract(entry.chain, &entry.contract) == contract)
+            || official_deployment_matches(entry, chain, &contract)
     }) {
         if matchable(entry) {
             return MatchStatus::Active;
@@ -162,8 +211,8 @@ pub fn active_issuers(registry: &Registry) -> usize {
 pub fn lookup<'a>(registry: &'a [Entry], chain: Chain, contract: &str) -> Option<&'a Entry> {
     let contract = normalize_contract(chain, contract);
     registry.iter().find(|entry| {
-        entry.chain == chain
-            && normalize_contract(entry.chain, &entry.contract) == contract
+        ((entry.chain == chain && normalize_contract(entry.chain, &entry.contract) == contract)
+            || official_deployment_matches(entry, chain, &contract))
             && matchable(entry)
     })
 }
@@ -196,7 +245,31 @@ mod tests {
             last_checked: "2026-09-21T00:00:00Z".to_owned(),
             removed_at: None,
             stale_since: None,
+            official_deployments: Vec::new(),
         }
+    }
+    #[test]
+    fn official_deployment_wrappers_match_only_on_their_published_chain() {
+        let mut published = entry("0x0000000000000000000000000000000000000001", "NVDA");
+        published.official_deployments = vec![super::OfficialDeployment {
+            network: "Ethereum".to_owned(),
+            address: "0x0000000000000000000000000000000000000001".to_owned(),
+            wrapper_address: Some("0x0000000000000000000000000000000000000002".to_owned()),
+            wrapper_address_v2: Some("0x0000000000000000000000000000000000000003".to_owned()),
+        }];
+        let registry = vec![published];
+
+        assert!(
+            lookup(&registry, Chain::Ethereum, "0x0000000000000000000000000000000000000002")
+                .is_some()
+        );
+        assert_eq!(
+            match_status(&registry, Chain::Ethereum, "0x0000000000000000000000000000000000000003"),
+            MatchStatus::Active
+        );
+        assert!(
+            lookup(&registry, Chain::Base, "0x0000000000000000000000000000000000000002").is_none()
+        );
     }
     fn fresh_entry(contract: &str, ticker: &str) -> Entry {
         let mut result = entry(contract, ticker);

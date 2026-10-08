@@ -20,8 +20,10 @@
     <p class="problem-copy">A ticker is not a contract. Compare the pool with the issuer's published stock-token contract.</p>
     <h1 id="home-title">QED checks whether a pool uses the stock-token contract published by its issuer.</h1>
     <p class="problem-copy"><a href="/tokens/NVDA">QED also shows what the issuer can do to each token.</a></p>
+  <p class="home-audience">For traders, app builders, and compliance teams: a pool is a contract where two tokens trade; the issuer registry lists contracts each issuer has published.</p>
   </div>
-  <a class="home-lookup-link" href="/check" hx-boost="true" hx-target="main" hx-select="main" hx-swap="innerHTML show:window:top">Find an issuer contract <span aria-hidden="true">→</span></a>
+  <a class="home-lookup-link" href="/guard" hx-boost="true" hx-target="main" hx-select="main" hx-swap="innerHTML show:window:top">Review a token or pool <span aria-hidden="true">→</span></a>
+  <a class="home-example-link" href="/guard/robinhood/0x6444a8e0b267406a15db74ca00c4a24bdfa81ed3180f5b6d0851f8ed6f4f29c5">Try the NVDA pool example</a>
 </section>
 {% if whats_new.available %}
   <p class="release-whats-new"><strong>New in {{ whats_new.release_label }}: {{ whats_new.headline }}</strong> <a href="{{ whats_new.changelog_href }}">→ Changelog</a>{% if whats_new.has_latest_blog %} <span class="latest-blog-link">· Latest post: <a href="{{ whats_new.latest_blog_href }}">{{ whats_new.latest_blog_title }}</a></span>{% endif %}</p>
@@ -31,6 +33,7 @@
     <div>
       <p class="eyebrow">Live market</p>
       <h2 id="leaderboard-title">Stock-paired token leaderboard</h2>
+      <p class="leaderboard-stats-line">{{ stats_line }} · <a href="/stats">Stats</a></p>
     </div>
     <span class="live-pill"><span class="live-dot" aria-hidden="true"></span>Live</span>
   </div>
@@ -64,11 +67,11 @@
             </td>
             <td class="chain-cell" data-label="Chain"><span class="chain-label"><svg aria-hidden="true"><use href="/static/icons.svg#{{ row.chain_icon }}"></use></svg><span>{{ row.chain_label }}</span></span></td>
             <td class="venue-cell" data-label="Venue">{{ row.dex }}</td>
-            <td data-label="Verdict"><span class="seal-label is-{{ row.verdict }}"{% if row.verdict == "verified" %} title="contract match only, not proof of backing or custody, reserves, price, safety or endorsement"{% endif %}><svg class="seal-icon" aria-hidden="true"><use href="/static/icons.svg#{{ row.seal_icon }}"></use></svg><span>{{ row.verdict_label }}</span></span></td>
+            <td data-label="Verdict"><span class="seal-label is-{{ row.verdict }}"{% if row.verdict == "verified" %} title="Only the quote-side contract is checked; this is not proof of backing or custody, reserves, price, safety or endorsement"{% endif %}><svg class="seal-icon" aria-hidden="true"><use href="/static/icons.svg#{{ row.seal_icon }}"></use></svg><span>{{ row.verdict_label }}</span></span>{% if row.verdict == "verified" %}<small class="verdict-scope">Quote-side contract only</small>{% endif %}</td>
             <td class="number-cell" data-label="Price">{{ row.price }}</td>
             <td class="number-cell change-cell {{ row.change_class }}" data-label="24h change">{{ row.change }}</td>
-            <td class="number-cell" data-label="24h volume">{{ row.volume }}</td>
-            <td class="number-cell" data-label="Liquidity">{{ row.liquidity }}</td>
+            <td class="number-cell" data-label="24h volume">{{ row.volume }}<small class="market-source">reported by {{ row.source_label }}</small></td>
+            <td class="number-cell" data-label="Liquidity">{{ row.liquidity }}<small class="market-source">reported by {{ row.source_label }}</small></td>
             <td class="trade-cell" data-label="Market"><a href="{{ row.trade_url }}"{% if row.verdict == "verified" %} title="contract match only, not proof of backing or custody, reserves, price, safety or endorsement"{% endif %} target="_blank" rel="noopener noreferrer">Market<span aria-hidden="true"> ↗</span></a><small class="trade-limit">External market page; QED checks contract match only.</small></td>
           </tr>
         {% endfor %}

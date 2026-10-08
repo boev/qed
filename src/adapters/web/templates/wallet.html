@@ -5,8 +5,8 @@
 {% block content %}
 <section class="page-intro wallet-intro" hx-history="false">
   <p class="eyebrow">QED</p>
-  <h1 class="page-title">Check stock-token holdings</h1>
-  <p>QED only looks for issuer contracts and known stock-paired pools. It does not identify every asset in a wallet.</p>
+  <h1 class="page-title">Which issuer stock tokens does this wallet hold?</h1>
+  <p>QED checks registry contracts on the selected or detected chains. It does not identify every asset in a wallet.</p>
 </section>
 <section class="wallet-lookup" aria-labelledby="wallet-heading" hx-history="false">
   <h2 id="wallet-heading">Paste your address, any of the five chains</h2>
@@ -20,5 +20,13 @@
   <div class="wallet-picker" data-wallet-picker hidden aria-label="Wallet choices"></div>
   <p class="wallet-empty" data-wallet-empty hidden>No wallet detected. Paste your address.</p>
   <p class="wallet-safety">Connecting only reads your address. QED never asks for a signature or a transaction.</p>
+</section>
+<section class="lookup lookup-secondary wallet-example" aria-labelledby="wallet-example-heading">
+  <h2 id="wallet-example-heading">One-click public example</h2>
+  <p>Try the well-known public burn address. It is not a personal wallet and requires no connection.</p>
+  <form method="post" action="/wallet" hx-boost="false">
+    <input type="hidden" name="address" value="0x000000000000000000000000000000000000dead">
+    <button class="button secondary-button" type="submit">Check the public burn address</button>
+  </form>
 </section>
 {% endblock %}
