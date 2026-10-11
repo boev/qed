@@ -31,6 +31,8 @@ pub(crate) struct Context {
     pub(crate) check_cache: Arc<dyn Cache<String, CachedCheckResult>>,
     pub(crate) statement_cache: Arc<dyn Cache<String, Statement>>,
     pub(crate) powers_cache: Arc<dyn Cache<PowersCacheKey, PowersRecord>>,
+    pub(crate) publisher_metadata_cache:
+        Arc<dyn Cache<(Chain, String), crate::domain::pool::TokenMeta>>,
     pub(crate) powers_retry_cache: Arc<dyn Cache<PowersCacheKey, PowersRecord>>,
     pub(crate) powers_failure_cache: Arc<dyn Cache<PowersCacheKey, ()>>,
     pub(crate) powers_locks: Arc<dyn Cache<PowersCacheKey, Arc<tokio::sync::Mutex<()>>>>,
@@ -43,6 +45,7 @@ pub(crate) struct Context {
     pub(crate) dev_signer: bool,
     pub(crate) attest_store: Arc<dyn AttestationStore>,
     pub(crate) registry_hash: Arc<RwLock<String>>,
+    pub(crate) publisher_catalog_complete: Arc<RwLock<HashSet<String>>>,
     pub(crate) registry_version: Arc<AtomicU64>,
     pub(crate) source_verifier: Arc<dyn SourceVerifier>,
     pub(crate) clock: Arc<dyn Clock>,
@@ -101,6 +104,11 @@ pub(crate) mod test_support {
         seed: [u8; 32],
         trusted_signers: HashSet<String>,
     ) -> TestContext {
+        let publisher_catalog_complete = entries
+            .iter()
+            .filter(|entry| !entry.official_deployments.is_empty())
+            .map(|entry| entry.issuer.clone())
+            .collect::<HashSet<_>>();
         let registry = Arc::new(tokio::sync::RwLock::new(Arc::new(entries)));
         let pool_index = Arc::new(MemoryPoolIndex::default());
         let store = Arc::new(MemoryAttestationStore::default());
@@ -111,6 +119,10 @@ pub(crate) mod test_support {
             check_cache: Arc::new(MemoryCache::<String, CachedCheckResult>::default()),
             statement_cache: Arc::new(MemoryCache::<String, Statement>::default()),
             powers_cache: Arc::new(MemoryCache::<PowersCacheKey, PowersRecord>::default()),
+            publisher_metadata_cache: Arc::new(MemoryCache::<
+                (Chain, String),
+                crate::domain::pool::TokenMeta,
+            >::default()),
             powers_retry_cache: Arc::new(MemoryCache::<PowersCacheKey, PowersRecord>::default()),
             powers_failure_cache: Arc::new(MemoryCache::<PowersCacheKey, ()>::default()),
             powers_locks: Arc::new(
@@ -125,6 +137,7 @@ pub(crate) mod test_support {
             dev_signer,
             attest_store: store.clone(),
             registry_hash: Arc::new(RwLock::new(String::new())),
+            publisher_catalog_complete: Arc::new(RwLock::new(publisher_catalog_complete)),
             registry_version: Arc::new(AtomicU64::new(0)),
             source_verifier: Arc::new(TestSourceVerifier),
             clock: Arc::new(TestClock),

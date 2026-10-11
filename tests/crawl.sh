@@ -150,7 +150,6 @@ while IFS=$'\t' read -r path label; do
   request "$path" "$label"
 done <<ROUTES
 /	home
-/wallet	wallet
 /check	check
 /guard	guard
 /registry	registry
@@ -178,36 +177,23 @@ api_html="$(curl -fsS "$BASE/api")"
 }
 printf 'api guide link check passed\n'
 
-wallet_html="$(curl -fsS "$BASE/wallet")"
-[[ "$wallet_html" == *'Paste your address, any of the five chains'* ]] || {
-  printf 'FAIL /wallet: address prompt missing\n' >&2
+wallet_page_code="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/wallet")"
+[[ "$wallet_page_code" == "404" ]] || {
+  printf 'FAIL GET /wallet: expected 404, got %s\n' "$wallet_page_code" >&2
   exit 1
 }
-[[ "$wallet_html" == *'Connecting only reads your address. QED never asks for a signature or a transaction.'* ]] || {
-  printf 'FAIL /wallet: safety copy missing\n' >&2
-  exit 1
-}
-[[ "$wallet_html" == *'No wallet detected. Paste your address.'* ]] || {
-  printf 'FAIL /wallet: no-provider fallback copy missing\n' >&2
-  exit 1
-}
-printf 'wallet landing copy and read-only safety check passed\n'
 wallet_post_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST --data-urlencode 'address=' "$BASE/wallet")"
 [[ "$wallet_post_code" == "404" ]] || {
-  printf 'FAIL POST /wallet: expected body-form validation HTTP 404, got %s\n' "$wallet_post_code" >&2
+  printf 'FAIL POST /wallet: expected 404, got %s\n' "$wallet_post_code" >&2
   exit 1
 }
+printf 'removed /wallet page routes return 404\n'
 api_wallet_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' --data '{"address":""}' "$BASE/api/wallet")"
 [[ "$api_wallet_code" == "404" ]] || {
   printf 'FAIL POST /api/wallet: expected JSON-body validation HTTP 404, got %s\n' "$api_wallet_code" >&2
   exit 1
 }
-old_wallet_code="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/wallet/0x0000000000000000000000000000000000000000")"
-[[ "$old_wallet_code" == "404" ]] || {
-  printf 'FAIL /wallet/<address>: address-in-URL route unexpectedly exists (%s)\n' "$old_wallet_code" >&2
-  exit 1
-}
-printf 'wallet POST-body routes and address privacy check passed\n'
+printf 'wallet API request check passed\n'
 
 # HTMX requests still return complete documents so direct navigation and
 # browser refreshes cannot produce a fragment-only page.

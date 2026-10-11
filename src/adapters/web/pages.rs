@@ -1,21 +1,20 @@
+#[cfg(test)]
+use super::views::format_wallet_amount;
 use super::views::{
     CertificateResultTemplate, CertificateTemplate, CertificateView, ChainTemplate,
     ContentPageTemplate, DirectoryContractView, DirectoryPoolView, DirectoryPowersView,
     DocsPageTemplate, FeaturedTemplate, FeaturedView, GlossaryTemplate, GuardResultTemplate,
-    GuardTemplate, GuideVerifyTemplate, IndexTemplate, RegistryTableQuery, RegistryTableTemplate,
-    RegistryTemplate, TokenTemplate, ValidatedCardView, ValidatedTemplate, WalletHoldingsTemplate,
-    WalletTemplate, WhatsNewView,
+    GuardTemplate, GuideVerifyTemplate, IndexTemplate, IntegrationChipView, RegistryTableQuery,
+    RegistryTableTemplate, RegistryTemplate, TokenTemplate, ValidatedCardView, ValidatedTemplate,
 };
-#[cfg(test)]
-use super::views::{WalletHoldingView, WalletTradeLinkView, format_wallet_amount};
-use super::{ASSET_VERSION, render_page};
+use super::{ASSET_VERSION, render_page, wants_fragment};
 #[cfg(test)]
 use crate::adapters::registry as registry_adapter;
 #[cfg(test)]
 use crate::app::wallet::wallet_chains;
 use crate::{
     adapters::{content as content_adapter, state::AppState},
-    app::{attestation as attest, wallet::wallet_holdings},
+    app::attestation as attest,
     domain::{
         chain::Chain,
         registry::{self, Entry},
@@ -24,13 +23,23 @@ use crate::{
 use askama::Template;
 use axum::{
     extract::{Form, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
 };
 use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
 const POWERS_PAGE_DEADLINE: Duration = Duration::from_millis(2500);
+const BLOG_PAGE_SIZE: usize = 6;
+#[derive(Clone, Copy)]
+pub(crate) struct PageMetadata<'a> {
+    pub(crate) page_title: &'a str,
+    pub(crate) heading: &'a str,
+    pub(crate) eyebrow: &'a str,
+    pub(crate) intro: &'a str,
+    pub(crate) meta_description: &'a str,
+    pub(crate) canonical_path: &'a str,
+}
 pub(crate) async fn index(
     State(state): State<AppState>,
     _headers: HeaderMap,
@@ -38,6 +47,193 @@ pub(crate) async fn index(
     let leaderboard = state.leaderboard.read().await.clone();
     let mut value =
         serde_json::to_value(&leaderboard).unwrap_or_else(|_| serde_json::json!({ "entries": [] }));
+    let registry = state.registry.read().await.clone();
+    let version = state.app.registry_version.load(std::sync::atomic::Ordering::Acquire);
+    let mut sourcify_verified = 0;
+    for entry in
+        registry.iter().filter(|entry| entry.removed_at.is_none() && entry.stale_since.is_none())
+    {
+        let key = (entry.chain, entry.contract.clone(), version);
+        if state.app.powers_cache.get(&key).await.is_some_and(|record| {
+            matches!(
+                record.source_verified,
+                crate::domain::powers::SourceVerified::ExactMatch
+                    | crate::domain::powers::SourceVerified::Match
+            )
+        }) {
+            sourcify_verified += 1;
+        }
+    }
+    let stats = super::api::leaderboard_stats(&leaderboard, &registry);
+    let source_count = |source: crate::adapters::discovery::MarketSource| {
+        leaderboard
+            .entries
+            .iter()
+            .filter(|entry| entry.source == source && entry.price_usd.is_some_and(f64::is_finite))
+            .count()
+    };
+    let chain_count = |chain: Chain| {
+        let label = crate::adapters::discovery::chain_label(chain);
+        stats
+            .by_chain
+            .iter()
+            .find(|entry| entry.chain_label == label)
+            .map(|entry| entry.counts.pools_checked)
+            .unwrap_or_default()
+    };
+    let issuer_count = |issuer: &str| {
+        stats
+            .registry
+            .by_issuer
+            .iter()
+            .find(|entry| entry.issuer == issuer)
+            .map(|entry| entry.entries)
+            .unwrap_or_default()
+    };
+    let uniswap_count = leaderboard
+        .entries
+        .iter()
+        .filter(|entry| entry.dex.to_ascii_lowercase().contains("uniswap"))
+        .count();
+    let positive_count = |count: usize| (count > 0).then(|| count.to_string());
+    let integrations = vec![
+        IntegrationChipView {
+            category: "Chain",
+            name: "Solana",
+            href: "https://solana.com/",
+            mark: "",
+            icon: "solana",
+            logo_src: "",
+            number: positive_count(chain_count(Chain::Solana)),
+            unit: "pools checked",
+            empty_unit: "supported chain",
+        },
+        IntegrationChipView {
+            category: "Chain",
+            name: "Robinhood Chain",
+            href: "https://docs.robinhood.com/chain/connecting/",
+            mark: "",
+            icon: "robinhood",
+            logo_src: "",
+            number: positive_count(chain_count(Chain::RobinhoodChain)),
+            unit: "pools checked",
+            empty_unit: "supported chain",
+        },
+        IntegrationChipView {
+            category: "Chain",
+            name: "Ethereum",
+            href: "https://ethereum.org/",
+            mark: "",
+            icon: "ethereum",
+            logo_src: "",
+            number: positive_count(chain_count(Chain::Ethereum)),
+            unit: "pools checked",
+            empty_unit: "supported chain",
+        },
+        IntegrationChipView {
+            category: "Chain",
+            name: "Base",
+            href: "https://base.org/",
+            mark: "",
+            icon: "base",
+            logo_src: "",
+            number: positive_count(chain_count(Chain::Base)),
+            unit: "pools checked",
+            empty_unit: "supported chain",
+        },
+        IntegrationChipView {
+            category: "Chain",
+            name: "BNB Chain",
+            href: "https://www.bnbchain.org/",
+            mark: "",
+            icon: "bnb",
+            logo_src: "",
+            number: positive_count(chain_count(Chain::Bnb)),
+            unit: "pools checked",
+            empty_unit: "supported chain",
+        },
+        IntegrationChipView {
+            category: "Issuer",
+            name: "Backed xStocks",
+            href: "https://xstocks.fi/",
+            mark: "",
+            icon: "xstocks",
+            logo_src: "/static/brand/xstocks-mark.svg",
+            number: positive_count(issuer_count("Backed xStocks")),
+            unit: "contracts tracked",
+            empty_unit: "issuer catalog",
+        },
+        IntegrationChipView {
+            category: "Issuer",
+            name: "Robinhood",
+            href: "https://robinhood.com/us/en/",
+            mark: "",
+            icon: "robinhood-logo",
+            logo_src: "/static/brand/robinhood-mark.ico",
+            number: positive_count(issuer_count("Robinhood")),
+            unit: "contracts tracked",
+            empty_unit: "issuer catalog",
+        },
+        IntegrationChipView {
+            category: "Issuer",
+            name: "Ondo",
+            href: "https://ondo.finance/",
+            mark: "",
+            icon: "ondo",
+            logo_src: "/static/brand/ondo-mark.svg",
+            number: positive_count(issuer_count("Ondo")),
+            unit: "contracts tracked",
+            empty_unit: "issuer catalog",
+        },
+        IntegrationChipView {
+            category: "Source",
+            name: "DexScreener",
+            href: "https://dexscreener.com/",
+            mark: "",
+            icon: "dexscreener",
+            logo_src: "/static/brand/dexscreener-mark.ico",
+            number: positive_count(source_count(
+                crate::adapters::discovery::MarketSource::Dexscreener,
+            )),
+            unit: "pools priced",
+            empty_unit: "price source",
+        },
+        IntegrationChipView {
+            category: "Source",
+            name: "GeckoTerminal",
+            href: "https://www.geckoterminal.com/",
+            mark: "",
+            icon: "geckoterminal",
+            logo_src: "/static/brand/geckoterminal-mark.ico",
+            number: positive_count(source_count(
+                crate::adapters::discovery::MarketSource::Geckoterminal,
+            )),
+            unit: "pools priced",
+            empty_unit: "price source",
+        },
+        IntegrationChipView {
+            category: "Verifier",
+            name: "Sourcify",
+            href: "https://sourcify.dev/",
+            mark: "",
+            icon: "sourcify",
+            logo_src: "/static/brand/sourcify-mark.png",
+            number: positive_count(sourcify_verified),
+            unit: "contracts verified",
+            empty_unit: "source verification",
+        },
+        IntegrationChipView {
+            category: "Venue",
+            name: "Uniswap",
+            href: "https://uniswap.org/",
+            mark: "",
+            icon: "uniswap",
+            logo_src: "/static/brand/uniswap-mark.ico",
+            number: positive_count(uniswap_count),
+            unit: "pools listed",
+            empty_unit: "trading venue",
+        },
+    ];
     if let Some(object) = value.as_object_mut() {
         object.remove("impostors");
         object.insert(
@@ -45,28 +241,12 @@ pub(crate) async fn index(
             serde_json::Value::String(state.prices.read().await.updated_at.clone()),
         );
     }
-    let registry = state.registry.read().await.clone();
-    let stats = super::api::leaderboard_stats(&leaderboard, &registry);
-    let watch = &stats.publisher_catalog_watch;
-    let stats_line = format!(
-        "{} top pools · {} issuer matches · {} mismatches · {} unsupported venues · {} not read yet · {} currently flagged (seen in the last 7 days) · {} new this UTC week · {} unsupported-chain sightings · catalog scan {}",
-        stats.listed_pools,
-        stats.issuer_matches,
-        stats.mismatches,
-        stats.unsupported_venue,
-        stats.not_read_yet.count,
-        watch.currently_flagged_last_7_days,
-        watch.first_flagged_this_week,
-        watch.unsupported_chain_candidates_seen,
-        if watch.last_scanned_at.is_empty() { "not yet run" } else { &watch.last_scanned_at }
-    );
     render_page(
         IndexTemplate {
             asset_version: ASSET_VERSION,
             public_url: state.public_url.to_string(),
-            stats_line,
             leaderboard: super::views::LeaderboardPageView::from_value(value),
-            whats_new: release_news_view()?,
+            integration_chips: integrations,
         },
         false,
     )
@@ -90,7 +270,9 @@ pub(crate) async fn stats_page(State(state): State<AppState>) -> Result<Response
 pub(crate) fn render_stats_page(
     state: &AppState,
     stats: &super::api::LeaderboardStats,
-    catalog_entries: &[&crate::adapters::discovery::ImpostorEntry],
+    all_catalog_entries: &[&crate::adapters::discovery::ImpostorEntry],
+    board: &crate::adapters::discovery::Leaderboard,
+    registry: &[crate::domain::registry::Entry],
 ) -> Result<bytes::Bytes, StatusCode> {
     let chain_rows = stats
         .by_chain
@@ -129,83 +311,118 @@ pub(crate) fn render_stats_page(
         })
         .collect::<String>();
     let watch = &stats.publisher_catalog_watch;
-    let mut catalog_rows = catalog_entries
+    let recent_entries = all_catalog_entries;
+    let confirmed_entries = recent_entries
         .iter()
-        .map(|entry| {
-            let volume = entry
-                .volume_24h_usd
-                .map(|volume| {
-                    format!("${volume:.2} · reported by {}", entry.source.label())
-                })
-                .unwrap_or_else(|| "not reported".to_owned());
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{} ({})</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}\">Guard</a></td><td>{}</td></tr>",
-                html_escape(&entry.chain_label),
-                html_escape(&entry.ticker),
-                html_escape(&entry.publisher),
-                html_escape(&entry.symbol),
-                html_escape(&entry.name),
-                html_escape(&entry.address),
-                html_escape(&volume),
-                html_escape(&entry.first_seen_at),
-                html_escape(&entry.last_seen_at),
-                html_escape(&entry.guard_url),
-                html_escape(&entry.reason),
-            )
-        })
-        .collect::<String>();
-    if catalog_rows.is_empty() {
-        catalog_rows.push_str(
-            "<tr><td colspan=\"10\">No catalog observations were seen during the last 7 days.</td></tr>",
-        );
-    }
+        .copied()
+        .filter(|entry| entry.tier == crate::domain::guard::PublisherProductTier::Confirmed)
+        .collect::<Vec<_>>();
+    let caution_entries = recent_entries
+        .iter()
+        .copied()
+        .filter(|entry| entry.tier == crate::domain::guard::PublisherProductTier::Caution)
+        .collect::<Vec<_>>();
+    let confirmed_volume = reported_volume(&confirmed_entries);
+    let caution_volume = reported_volume(&caution_entries);
+    let total_volume_line = format!(
+        "<p class=\"stats-flagged-total\">Reported 24h volume across all flagged tokens: {} (DexScreener/GeckoTerminal, not verified)</p>",
+        format_reported_usd(reported_volume(recent_entries)),
+    );
+    let confirmed_table = render_flagged_table(
+        &confirmed_entries,
+        crate::domain::guard::PublisherProductTier::Confirmed,
+        registry,
+        &board.entries,
+    );
+    let caution_table = render_flagged_table(
+        &caution_entries,
+        crate::domain::guard::PublisherProductTier::Caution,
+        registry,
+        &board.entries,
+    );
     let last_scanned_at = if watch.last_scanned_at.is_empty() {
-        "Not yet scanned"
+        "Not yet scanned".to_owned()
     } else {
-        watch.last_scanned_at.as_str()
-    };
-    let catalog_table_note = if watch.catalog_absent_tokens_truncated {
-        "Showing the 20 most recently seen observations; the count includes all retained entries seen in the last 7 days."
-    } else {
-        "All retained observations seen in the last 7 days are shown."
+        super::timestamp_html(&watch.last_scanned_at)
     };
     let source_note = watch
         .source_unavailable_since
         .as_deref()
         .map(|since| {
             format!(
-                "<p>The impostor search source has been unavailable since <time>{}</time>; the observations below are from the last successful search.</p>\n",
-                html_escape(since)
+                "<p>The impostor search source has been unavailable since {}; the observations below are from the last successful search.</p>",
+                super::timestamp_html(since)
             )
         })
         .unwrap_or_default();
+    let generated_at = super::timestamp_html(&stats.generated_at);
+    let method = html_escape(&watch.method);
+    let confirmed_card = format!(
+        "<article class=\"stats-number-card stats-number-card--deny\"><p class=\"stats-number\"><span class=\"deny-badge\">Deny</span><span class=\"deny-icon\" role=\"img\" aria-label=\"Deny — claims a product its publisher does not list\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M12 2.5 21.5 21H2.5L12 2.5Z\"/><path d=\"M12 8v6m0 3h.01\"/></svg></span> {}</p><p>Confirmed mismatches</p><p class=\"stats-number-context\">{} reported 24h volume</p></article>",
+        confirmed_entries.len(),
+        format_card_reported_usd(confirmed_volume),
+    );
+    let caution_card = format!(
+        "<article class=\"stats-number-card stats-number-card--caution\"><p class=\"stats-number\"><span class=\"caution-badge\">Caution</span> {}</p><p>Near matches</p><p class=\"stats-number-context\">{} reported 24h volume</p></article>",
+        caution_entries.len(),
+        format_card_reported_usd(caution_volume),
+    );
+    let unread_card = format!(
+        "<article class=\"stats-number-card\"><p class=\"stats-number\">{}</p><p>Pools not checked: {} not read yet · {} unsupported venues</p></article>",
+        stats.not_read_yet.count + stats.unsupported_venue,
+        stats.not_read_yet.count,
+        stats.unsupported_venue
+    );
     let body_html = format!(
-        r#"<section class="statement-summary">
-<p>Generated at <time>{}</time>.</p>
-<p><a href="/stats.json">Download signed JSON</a> · <a href="/stats.csv">Download signed CSV</a></p>
-<p>Market data: <a href="https://dexscreener.com" target="_blank" rel="noopener noreferrer">DexScreener</a> / <a href="https://www.geckoterminal.com" target="_blank" rel="noopener noreferrer">GeckoTerminal</a> · <a href="https://www.coingecko.com/en/api_terms" target="_blank" rel="noopener noreferrer">Powered by CoinGecko</a></p>
-<dl class="statement-summary-grid">
-  <div><dt>Listed pools</dt><dd>{}</dd></div>
-  <div><dt>Pools checked</dt><dd>{}</dd></div>
-  <div><dt>Issuer matches</dt><dd>{}</dd></div>
-  <div><dt>Mismatches</dt><dd>{}</dd></div>
-  <div><dt>Unsupported venues</dt><dd>{}</dd></div>
-  <div><dt>Not read yet</dt><dd>{} total: {} RPC limit, {} transient, {} unsupported</dd></div>
-</dl>
-<h2>Leaderboard by chain</h2>
-<ul>{}</ul>
-<h2>Active registry coverage</h2>
-<p>{} active registry entries across the tracked issuers.</p>
-<ul>{}</ul>
-<h2>Publisher deployment catalog watch</h2>
-{}<p>Last searched at <time>{}</time>. {} catalog observations are currently flagged (seen in the last 7 days); {} were first seen this UTC week. {} candidates on unsupported chains were seen but not judged; {} official deployments on unsupported chains were counted separately and excluded from candidates. {} supported and {} unsupported candidates were evicted; {} invalid supported and {} invalid unsupported candidates were rejected.</p>
-<p>Method: {}</p>
-<table><caption>Catalog observations currently flagged (last seen within the last 7 days); ticker, symbol, name, and 24-hour volume are reported by the source recorded for each row. On-chain identity reads are available from the linked Guard review. {}</caption>
-<thead><tr><th>Chain</th><th>Ticker reported by source</th><th>Publisher</th><th>Listing symbol and name</th><th>Address</th><th>Reported 24h volume</th><th>First seen</th><th>Last seen</th><th>Guard</th><th>Reason</th></tr></thead>
-<tbody>{}</tbody></table>
-<p>These are point-in-time pool reads. These exact symbol-and-name matches are catalog-absence observations, not conclusions about intent. A contract match does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.</p>
-</section>"#,
-        html_escape(&stats.generated_at),
+        r#"<section class="stats-overview" aria-label="Leaderboard statistics at a glance">
+  <article class="stats-number-card"><p class="stats-number">{} of {}</p><p>Pools matching issuer-published contract</p></article>
+  {}
+  {}
+  {}
+</section>
+<section class="stats-evidence" aria-labelledby="stats-evidence-title">
+  <h2 id="stats-evidence-title">Currently flagged tokens</h2>
+  {total_volume_line}
+  <h3>Confirmed mismatches</h3>
+  <p class="stats-evidence-note">On-chain symbol and name exactly match an issuer product; the address is absent from the issuer's catalog.</p>
+  {confirmed_table}
+  <h3>Caution — near matches</h3>
+  <p class="stats-evidence-note">Similar to an issuer product, but QED could not confirm a mismatch.</p>
+  {caution_table}
+</section>
+<details class="stats-details">
+  <summary>Method, counts and downloads</summary>
+  <h3>Publisher deployment catalog watch</h3>
+  <p>Generated at {}. <a href="/stats.json">Download signed JSON</a> · <a href="/stats.csv">Download signed CSV</a></p>
+  <p>Last searched at {}. {} catalog observations are currently flagged (seen in the last 7 days); {} were first seen this UTC week. {} candidates on unsupported chains were seen but not judged; {} official deployments on unsupported chains were counted separately and excluded from candidates. {} supported and {} unsupported candidates were evicted; {} invalid supported and {} invalid unsupported candidates were rejected.</p>
+  {}<p>Method: {}</p>
+  <h3>Leaderboard counts by chain</h3><ul>{}</ul>
+  <h3>Active registry coverage</h3>
+  <p>{} active registry entries across the tracked issuers.</p><ul>{}</ul>
+  <p>Other counts: {} listed pools, {} pools checked, {} issuer matches, {} mismatches, {} unsupported venues, and {} not read yet ({} RPC limit, {} transient, {} unsupported).</p>
+  <p>Market data: <a href="https://dexscreener.com" target="_blank" rel="noopener noreferrer">DexScreener</a> / <a href="https://www.geckoterminal.com" target="_blank" rel="noopener noreferrer">GeckoTerminal</a> · <a href="https://www.coingecko.com/en/api_terms" target="_blank" rel="noopener noreferrer">Powered by CoinGecko</a>.</p>
+  <p>These are point-in-time pool reads. A contract match does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.</p>
+</details>"#,
+        stats.issuer_matches,
+        stats.listed_pools,
+        confirmed_card,
+        caution_card,
+        unread_card,
+        generated_at,
+        last_scanned_at,
+        watch.currently_flagged_last_7_days,
+        watch.first_flagged_this_week,
+        watch.unsupported_chain_candidates_seen,
+        watch.official_on_unsupported_chain,
+        watch.evicted_entries,
+        watch.evicted_unsupported_candidates,
+        watch.rejected_oversize_entries,
+        watch.rejected_oversize_unsupported_candidates,
+        source_note,
+        method,
+        chain_rows,
+        stats.registry.active_entries,
+        issuer_rows,
         stats.listed_pools,
         stats.pools_checked,
         stats.issuer_matches,
@@ -215,55 +432,261 @@ pub(crate) fn render_stats_page(
         stats.not_read_yet.rpc_limit,
         stats.not_read_yet.transient,
         stats.not_read_yet.unsupported,
-        chain_rows,
-        stats.registry.active_entries,
-        issuer_rows,
-        source_note,
-        html_escape(last_scanned_at),
-        watch.currently_flagged_last_7_days,
-        watch.first_flagged_this_week,
-        watch.unsupported_chain_candidates_seen,
-        watch.official_on_unsupported_chain,
-        watch.evicted_entries,
-        watch.evicted_unsupported_candidates,
-        watch.rejected_oversize_entries,
-        watch.rejected_oversize_unsupported_candidates,
-        html_escape(&watch.method),
-        html_escape(catalog_table_note),
-        catalog_rows,
     );
     docs_content_page(
-        &state,
-        "Leaderboard statistics",
-        "REFERENCE",
-        "Leaderboard statistics",
-        &stats.headline,
-        "Point-in-time counts from QED's current leaderboard checks and active issuer registry.",
-        "/stats",
+        state,
+        PageMetadata {
+            page_title: "Leaderboard statistics",
+            heading: "Leaderboard statistics",
+            eyebrow: "REFERENCE",
+            intro: "Pool checks, flagged catalog observations, and work not read yet.",
+            meta_description: "Point-in-time counts from QED's current leaderboard checks and active issuer registry.",
+            canonical_path: "/stats",
+        },
         "stats",
         body_html,
     )
     .map(|Html(body)| bytes::Bytes::from(body))
 }
-fn release_news_view() -> Result<WhatsNewView, StatusCode> {
-    let Some(entry) = content_adapter::latest_released_changelog_entry()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    else {
-        return Ok(WhatsNewView::default());
+
+fn reported_volume(entries: &[&crate::adapters::discovery::ImpostorEntry]) -> f64 {
+    entries
+        .iter()
+        .filter_map(|entry| entry.volume_24h_usd.filter(|value| value.is_finite() && *value >= 0.0))
+        .sum()
+}
+
+fn render_flagged_table(
+    entries: &[&crate::adapters::discovery::ImpostorEntry],
+    tier: crate::domain::guard::PublisherProductTier,
+    registry: &[crate::domain::registry::Entry],
+    leaderboard: &[crate::adapters::discovery::LeaderboardEntry],
+) -> String {
+    let visible = entries.iter().take(super::api::IMPOSTOR_STATS_TABLE_LIMIT);
+    let rows =
+        visible.map(|entry| render_flagged_row(entry, registry, leaderboard)).collect::<String>();
+    let rows = if rows.is_empty() {
+        let label = match tier {
+            crate::domain::guard::PublisherProductTier::Confirmed => "confirmed mismatches",
+            crate::domain::guard::PublisherProductTier::Caution => "caution near matches",
+        };
+        format!("<tr><td colspan=\"5\">No {label} are currently shown.</td></tr>")
+    } else {
+        rows
     };
-    let posts = content_adapter::blog_posts().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let latest_blog = content_adapter::latest_published_blog_post(&posts);
-    Ok(WhatsNewView {
-        available: true,
-        release_label: entry.label,
-        headline: entry.headline,
-        changelog_href: format!("/changelog#{}", entry.anchor),
-        has_latest_blog: latest_blog.is_some(),
-        latest_blog_title: latest_blog.map(|post| post.title.clone()).unwrap_or_default(),
-        latest_blog_href: latest_blog
-            .map(|post| format!("/blog/{}", post.slug))
-            .unwrap_or_default(),
-    })
+    let showing = if entries.len() > super::api::IMPOSTOR_STATS_TABLE_LIMIT {
+        format!(" Showing {} of {}.", super::api::IMPOSTOR_STATS_TABLE_LIMIT, entries.len())
+    } else {
+        String::new()
+    };
+    format!(
+        "<div class=\"table-wrap\"><table class=\"stats-table\"><thead><tr><th scope=\"col\">Chain</th><th scope=\"col\">Token name and symbol</th><th scope=\"col\">Address</th><th scope=\"col\">Reported 24h volume</th><th scope=\"col\">First seen</th></tr></thead><tbody>{rows}</tbody><tfoot><tr><td colspan=\"5\">Total reported 24h volume ({} tokens): {}{} (DexScreener/GeckoTerminal, not verified)</td></tr></tfoot></table></div>",
+        entries.len(),
+        format_reported_usd(reported_volume(entries)),
+        showing,
+    )
+}
+
+fn display_catalog_reason(reason: &str) -> String {
+    if reason.len() >= crate::adapters::discovery::MAX_IMPOSTOR_REASON_BYTES
+        && !reason.ends_with('…')
+    {
+        format!("{reason}…")
+    } else {
+        reason.to_owned()
+    }
+}
+
+fn render_flagged_row(
+    entry: &crate::adapters::discovery::ImpostorEntry,
+    registry: &[crate::domain::registry::Entry],
+    leaderboard: &[crate::adapters::discovery::LeaderboardEntry],
+) -> String {
+    let source = match entry.source {
+        crate::adapters::discovery::MarketSource::Dexscreener => "DexScreener",
+        crate::adapters::discovery::MarketSource::Geckoterminal => "GeckoTerminal",
+    };
+    let ticker_registry = registry.iter().filter(|candidate| {
+        crate::domain::registry::matchable(candidate)
+            && candidate.issuer.eq_ignore_ascii_case(&entry.publisher)
+            && candidate.ticker.eq_ignore_ascii_case(&entry.ticker)
+    });
+    let official_networks = ticker_registry
+        .flat_map(crate::domain::registry::official_networks)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let reason = match (entry.on_chain_symbol.as_deref(), entry.on_chain_name.as_deref()) {
+        (Some(symbol), Some(name))
+            if !symbol.is_empty()
+                && !name.is_empty()
+                && !entry.ticker.is_empty()
+                && !entry.publisher.is_empty()
+                && !official_networks.is_empty() =>
+        {
+            let identity = format!(
+                "on-chain symbol “{}” and name “{}”",
+                html_escape(symbol),
+                html_escape(name),
+            );
+            match entry.tier {
+                crate::domain::guard::PublisherProductTier::Confirmed => format!(
+                    "The {identity} exactly match the {} product published by {}. The publisher catalog lists official deployments on {}; this address is absent from those deployments.",
+                    html_escape(&entry.ticker),
+                    html_escape(&entry.publisher),
+                    html_escape(&official_networks.join(", ")),
+                ),
+                crate::domain::guard::PublisherProductTier::Caution => format!(
+                    "The {identity} resemble a product listed by {} for {}. QED could not confirm a mismatch because the match is not byte-exact or the publisher catalog snapshot is incomplete.",
+                    html_escape(&entry.publisher),
+                    html_escape(&entry.ticker),
+                ),
+            }
+        }
+        _ => html_escape(&display_catalog_reason(&entry.reason)),
+    };
+    let (row_class, status_mark) = match entry.tier {
+        crate::domain::guard::PublisherProductTier::Confirmed => (
+            "stats-token-row--deny",
+            "<span class=\"deny-icon\" role=\"img\" aria-label=\"Deny — claims a product its publisher does not list\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M12 2.5 21.5 21H2.5L12 2.5Z\"/><path d=\"M12 8v6m0 3h.01\"/></svg></span>",
+        ),
+        crate::domain::guard::PublisherProductTier::Caution => {
+            ("stats-token-row--caution", "<span class=\"caution-badge\">Caution</span>")
+        }
+    };
+    let listed_name = html_escape(&entry.name);
+    let listed_symbol = html_escape(&entry.symbol);
+    let address = html_escape(&entry.address);
+    let short = html_escape(&short_address(&entry.address));
+    let volume = entry.volume_24h_usd.filter(|value| value.is_finite() && *value >= 0.0);
+    let volume_html = volume.map_or_else(
+        || format!("—<small>reported by {source}</small>"),
+        |value| format!("{}<small>reported by {source}</small>", format_reported_usd(value)),
+    );
+    let guard_url = html_escape(&entry.guard_url);
+    let explorer_url = crate::domain::chain::Chain::from_network_name(&entry.chain)
+        .map(|chain| super::views::explorer_link(chain, &entry.address))
+        .unwrap_or_default();
+    let explorer_html = if explorer_url.is_empty() {
+        format!("<code>{address}</code>")
+    } else {
+        format!(
+            "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"><code>{address}</code><span aria-hidden=\"true\"> ↗</span></a>",
+            html_escape(&explorer_url)
+        )
+    };
+    let first_seen = human_utc_time(&entry.first_seen_at);
+    let liquidity_html =
+        entry.liquidity_24h_usd.filter(|value| value.is_finite() && *value >= 0.0).map_or_else(
+            || "Not retained in this observation".to_owned(),
+            |value| format!("{} reported by {source}", format_reported_usd(value)),
+        );
+    let pool_count_html = entry.pool_count.map_or_else(
+        || "Not retained in this observation".to_owned(),
+        |count| format!("{count} reported in this observation"),
+    );
+    let last_seen = human_utc_time(&entry.last_seen_at);
+
+    let volume_value = volume.map_or("—".to_owned(), format_reported_usd);
+    let diagram = flagged_volume_diagram(volume, entry, leaderboard);
+    format!(
+        "<tr class=\"stats-token-row {row_class}\"><td>{status_mark} {}</td><td><strong>Listed as {}</strong><small>{} · reported by {}</small></td><td class=\"stats-address\"><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"><code title=\"Full address: {address}\">{short}</code><span aria-hidden=\"true\"> ↗</span></a></td><td class=\"stats-market-value\">{volume_html}</td><td>{}</td></tr><tr class=\"stats-expansion-row\"><td colspan=\"5\"><details class=\"stats-row-details\"><summary>Details</summary><div class=\"stats-row-detail-content\"><p><strong>Why flagged:</strong> {reason}</p><p><strong>Full address:</strong> {explorer_html}</p><p><strong>First seen:</strong> {} · <strong>Last seen:</strong> {}</p><p><strong>Reported 24h volume:</strong> {} · reported by {}</p><p><strong>Liquidity:</strong> {} · <strong>Pool count:</strong> {}</p>{diagram}<p><a href=\"{}\">Open Guard</a></p></div></details></td></tr>",
+        html_escape(&entry.chain_label),
+        listed_name,
+        listed_symbol,
+        source,
+        html_escape(&explorer_url),
+        first_seen,
+        first_seen,
+        last_seen,
+        volume_value,
+        source,
+        liquidity_html,
+        pool_count_html,
+        guard_url,
+    )
+}
+
+fn flagged_volume_diagram(
+    token_volume: Option<f64>,
+    entry: &crate::adapters::discovery::ImpostorEntry,
+    leaderboard: &[crate::adapters::discovery::LeaderboardEntry],
+) -> String {
+    let official_volumes = leaderboard
+        .iter()
+        .filter(|pool| {
+            pool.verdict == "verified"
+                && pool
+                    .ticker
+                    .as_deref()
+                    .is_some_and(|ticker| ticker.eq_ignore_ascii_case(&entry.ticker))
+                && pool
+                    .issuer
+                    .as_deref()
+                    .is_some_and(|issuer| issuer.eq_ignore_ascii_case(&entry.publisher))
+        })
+        .filter_map(|pool| pool.volume_24h_usd)
+        .filter(|volume| volume.is_finite() && *volume >= 0.0)
+        .collect::<Vec<_>>();
+    let token_value = token_volume.map_or("—".to_owned(), format_reported_usd);
+    let token_bar = token_volume.unwrap_or(0.0);
+    if official_volumes.is_empty() {
+        let width = if token_bar > 0.0 { 100.0 } else { 0.0 };
+        return format!(
+            "<figure class=\"stats-volume-chart\"><figcaption>Reported 24h volume comparison</figcaption><svg viewBox=\"0 0 400 58\" role=\"img\" aria-label=\"Token reported 24h volume {}; no official pool volume data available on the QED leaderboard for this ticker\"><text x=\"0\" y=\"15\">Flagged token</text><rect x=\"112\" y=\"5\" width=\"{width}\" height=\"12\" rx=\"3\"/><text x=\"396\" y=\"15\" text-anchor=\"end\">{}</text></svg><p>No official pool volume data available on the QED leaderboard for this ticker.</p></figure>",
+            html_escape(&token_value),
+            html_escape(&token_value),
+        );
+    }
+    let official_volume = official_volumes.iter().sum::<f64>();
+    let max_value = token_bar.max(official_volume);
+    let token_width = if max_value > 0.0 { token_bar / max_value * 150.0 } else { 0.0 };
+    let official_width = if max_value > 0.0 { official_volume / max_value * 150.0 } else { 0.0 };
+    let official_label = format_reported_usd(official_volume);
+    format!(
+        "<figure class=\"stats-volume-chart\"><figcaption>Reported 24h volume comparison</figcaption><svg viewBox=\"0 0 400 58\" role=\"img\" aria-label=\"Flagged token volume {}; official publisher pool volume {}\"><text x=\"0\" y=\"15\">Flagged token</text><rect x=\"112\" y=\"5\" width=\"{token_width:.1}\" height=\"12\" rx=\"3\"/><text x=\"396\" y=\"15\" text-anchor=\"end\">{}</text><text x=\"0\" y=\"43\">Official pools</text><rect x=\"112\" y=\"33\" width=\"{official_width:.1}\" height=\"12\" rx=\"3\"/><text x=\"396\" y=\"43\" text-anchor=\"end\">{}</text></svg><p>Reported volumes; not verified.</p></figure>",
+        html_escape(&token_value),
+        html_escape(&official_label),
+        html_escape(&token_value),
+        html_escape(&official_label),
+    )
+}
+
+fn format_reported_usd(value: f64) -> String {
+    if value.is_finite() { super::views::usd_label(Some(value)) } else { "—".to_owned() }
+}
+
+fn format_card_reported_usd(value: f64) -> String {
+    if !value.is_finite() {
+        return "—".to_owned();
+    }
+    if value >= 1_000_000.0 {
+        format!("${:.1}m", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("${:.1}k", value / 1_000.0)
+    } else {
+        format_reported_usd(value)
+    }
+}
+
+fn human_utc_time(value: &str) -> String {
+    let escaped = html_escape(value);
+    let display = chrono::DateTime::parse_from_rfc3339(value)
+        .map(|time| time.with_timezone(&chrono::Utc).format("%-d %b %Y, %H:%M UTC").to_string())
+        .unwrap_or_else(|_| escaped.clone());
+    format!("<time datetime=\"{escaped}\">{display}</time>")
+}
+
+fn short_address(address: &str) -> String {
+    let length = address.chars().count();
+    if length <= 18 {
+        return address.to_owned();
+    }
+    format!(
+        "{}…{}",
+        address.chars().take(8).collect::<String>(),
+        address.chars().skip(length - 6).collect::<String>()
+    )
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -305,41 +728,6 @@ pub(crate) async fn token_lookup(
 ) -> Result<Redirect, StatusCode> {
     let registry = state.registry.read().await;
     token_redirect(&registry, query.ticker.as_deref())
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub(crate) struct WalletRequest {
-    pub(crate) address: String,
-}
-
-pub(crate) async fn wallet_page(
-    State(state): State<AppState>,
-    _headers: HeaderMap,
-) -> Result<Response, StatusCode> {
-    render_page(
-        WalletTemplate { asset_version: ASSET_VERSION, public_url: state.public_url.to_string() },
-        false,
-    )
-    .map(IntoResponse::into_response)
-}
-
-pub(crate) async fn wallet_holdings_page(
-    State(state): State<AppState>,
-    Form(request): Form<WalletRequest>,
-) -> Result<Html<String>, StatusCode> {
-    let address = request.address;
-    let holdings = super::views::wallet_holding_views(
-        wallet_holdings(&state.app, &address).await.map_err(super::wallet_error_status)?,
-    );
-    render_page(
-        WalletHoldingsTemplate {
-            asset_version: ASSET_VERSION,
-            public_url: state.public_url.to_string(),
-            address,
-            holdings,
-        },
-        false,
-    )
 }
 
 pub(crate) async fn registry_page(
@@ -540,7 +928,6 @@ pub(crate) async fn glossary_page(
             meta_description: "Plain-language definitions for stock-paired pools, issuer registries, tokenized stocks, and QED verdicts.".to_owned(),
             canonical_path: "/glossary".to_owned(),
             active_sidebar: String::new(),
-            whats_new: super::views::WhatsNewView::default(),
         },
         false,
     )
@@ -579,7 +966,6 @@ fn guide_verify_template(
             },
             canonical_path: canonical_path.to_owned(),
             active_sidebar: if is_docs_landing { "overview" } else { "verify" }.to_owned(),
-            whats_new: if is_docs_landing { release_news_view()? } else { WhatsNewView::default() },
         },
         false,
     )
@@ -828,7 +1214,7 @@ pub(crate) async fn registry_table(
     let registry = state.registry.read().await.clone();
     RegistryTableTemplate::from_registry(&registry, query)
         .render()
-        .map(Html)
+        .map(|html| Html(super::format_html_timestamps(&html)))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -969,7 +1355,7 @@ pub(crate) async fn featured(State(state): State<AppState>) -> Result<Html<Strin
     let featured = state.featured.read().await;
     FeaturedTemplate { pools: featured.iter().take(4).map(FeaturedView::from_pool).collect() }
         .render()
-        .map(Html)
+        .map(|html| Html(super::format_html_timestamps(&html)))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
@@ -1047,12 +1433,14 @@ QED does not prove backing, custody, reserves, solvency, safety, price, liquidit
 
     docs_content_page(
         &state,
-        "Use QED with an LLM",
-        "GUIDE",
-        "Use QED with an LLM",
-        "Connect an AI agent to QED’s issuer-check, token-power, statement, registry, verification, and Guard tools over MCP.",
-        "Seven read-only tools answer plain questions about issuer publications, token controls, wallet holdings, and signed records.",
-        "/docs/llm",
+        PageMetadata {
+            page_title: "Use QED with an LLM",
+            heading: "Use QED with an LLM",
+            eyebrow: "GUIDE",
+            intro: "Connect an AI agent to QED’s issuer-check, token-power, statement, registry, verification, and Guard tools over MCP.",
+            meta_description: "Seven read-only tools answer plain questions about issuer publications, token controls, wallet holdings, and signed records.",
+            canonical_path: "/docs/llm",
+        },
         "llm",
         format!("{}{LLM_FLOW_SVG}", content_adapter::render_markdown(body)),
     )
@@ -1072,28 +1460,58 @@ curl -sS "$BASE/api/status"
 The check endpoint returns a point-in-time issuer-contract comparison. Registry lookup returns the issuer entries for a ticker; status reports service freshness. See the [generated API reference](/api), [OpenAPI document](/openapi.json), or [MCP guide](/docs/llm) for complete contracts."#;
     docs_content_page(
         &state,
-        "API quick start",
-        "GUIDE",
-        "API quick start",
-        "Make your first QED requests with three curl commands.",
-        "Three curl examples for checks, registry lookup, and service status.",
-        "/docs/api-quick-start",
+        PageMetadata {
+            page_title: "API quick start",
+            heading: "API quick start",
+            eyebrow: "GUIDE",
+            intro: "Make your first QED requests with three curl commands.",
+            meta_description: "Three curl examples for checks, registry lookup, and service status.",
+            canonical_path: "/docs/api-quick-start",
+        },
         "api-quick-start",
         content_adapter::render_markdown(body),
+    )
+}
+
+fn about_project_content() -> String {
+    let release_date = content_adapter::changelog_entries()
+        .first()
+        .and_then(|release| release.date.as_deref())
+        .map(html_escape)
+        .unwrap_or_default();
+    let version = env!("CARGO_PKG_VERSION");
+    format!(
+        r#"<section class="lookup lookup-secondary" aria-labelledby="about-facts-title">
+  <h2 id="about-facts-title">Project facts</h2>
+  <dl class="certificate-facts about-facts">
+    <div><dt>Version</dt><dd><a href="/changelog">v{version} · released {release_date}</a></dd></div>
+    <div><dt>Source code</dt><dd><a href="https://github.com/boev/qed" target="_blank" rel="noopener noreferrer">github.com/boev/qed</a></dd></div>
+    <div><dt>Contact</dt><dd><a href="mailto:contact@web3-energy.com">contact@web3-energy.com</a></dd></div>
+    <div><dt>Security</dt><dd><a href="/security">Security policy</a></dd></div>
+  </dl>
+</section>
+<section class="lookup lookup-secondary about-contact" aria-labelledby="about-contact-title">
+  <h2 id="about-contact-title">Contact</h2>
+  <p>Questions, issuer corrections or takedown requests: <a href="mailto:contact@web3-energy.com">contact@web3-energy.com</a>.</p>
+</section>
+{}"#,
+        content_adapter::render_markdown(ABOUT_MARKDOWN),
     )
 }
 
 pub(crate) async fn about_page(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
     docs_content_page(
         &state,
-        "About",
-        "ABOUT",
-        "About QED",
-        "What QED checks, what it does not claim, and who operates the service.",
-        "QED checks whether a pool uses the stock-token contract published by its issuer and states the limits of that check.",
-        "/about",
+        PageMetadata {
+            page_title: "About",
+            heading: "About QED",
+            eyebrow: "ABOUT",
+            intro: "What QED checks, what it does not claim, and who operates the service.",
+            meta_description: "QED checks whether a pool uses the stock-token contract published by its issuer and states the limits of that check.",
+            canonical_path: "/about",
+        },
         "about",
-        content_adapter::render_markdown(ABOUT_MARKDOWN),
+        about_project_content(),
     )
 }
 
@@ -1102,12 +1520,14 @@ pub(crate) async fn security_page(
 ) -> Result<Html<String>, StatusCode> {
     docs_content_page(
         &state,
-        "Security",
-        "SECURITY",
-        "Security",
-        "How to report suspected QED security issues and coordinate disclosure.",
-        "How to report suspected QED security issues and coordinate disclosure.",
-        "/security",
+        PageMetadata {
+            page_title: "Security",
+            heading: "Security",
+            eyebrow: "SECURITY",
+            intro: "How to report suspected QED security issues and coordinate disclosure.",
+            meta_description: "How to report suspected QED security issues and coordinate disclosure.",
+            canonical_path: "/security",
+        },
         "security",
         content_adapter::security_html(),
     )
@@ -1118,30 +1538,101 @@ pub(crate) async fn changelog_page(
 ) -> Result<Html<String>, StatusCode> {
     docs_content_page(
         &state,
-        "Changelog",
-        "CHANGELOG",
-        "Changelog",
-        "Release history for QED routes, observations, and documentation.",
-        "Release history for QED routes, observations, and documentation.",
-        "/changelog",
+        PageMetadata {
+            page_title: "Changelog",
+            heading: "Changelog",
+            eyebrow: "CHANGELOG",
+            intro: "Release history for QED routes, observations, and documentation.",
+            meta_description: "Release history for QED routes, observations, and documentation.",
+            canonical_path: "/changelog",
+        },
         "changelog",
         content_adapter::changelog_html(),
     )
 }
 
-pub(crate) async fn blog_page(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct BlogPageQuery {
+    page: Option<usize>,
+}
+
+pub(crate) async fn blog_page(
+    State(state): State<AppState>,
+    Query(query): Query<BlogPageQuery>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
     let posts = content_adapter::blog_posts().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let posts = content_adapter::published_blog_posts(posts);
+    let html = render_blog_page(&state, &posts, query.page, wants_fragment(&headers))?;
+    let mut response = html.into_response();
+    response
+        .headers_mut()
+        .append(header::VARY, HeaderValue::from_static("HX-Request, HX-History-Restore-Request"));
+    Ok(response)
+}
+
+pub(crate) fn render_blog_page(
+    state: &AppState,
+    posts: &[content_adapter::BlogPost],
+    requested_page: Option<usize>,
+    htmx_request: bool,
+) -> Result<Html<String>, StatusCode> {
+    let page = requested_page.unwrap_or(1).max(1);
+    let page_count = posts.len().div_ceil(BLOG_PAGE_SIZE).max(1);
+    if page > page_count {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let start = page.saturating_sub(1).saturating_mul(BLOG_PAGE_SIZE);
+    let end = start.saturating_add(BLOG_PAGE_SIZE).min(posts.len());
+    let page_posts = posts.get(start..end).unwrap_or(&[]);
+    let has_next = end < posts.len();
+    let items = content_adapter::blog_index_html(page_posts);
+    let sentinel = if has_next {
+        format!(
+            "<div class=\"blog-scroll-sentinel\" hx-get=\"/blog?page={}\" hx-trigger=\"revealed\" hx-push-url=\"false\" hx-swap=\"outerHTML\" aria-hidden=\"true\"></div>",
+            page.saturating_add(1)
+        )
+    } else {
+        String::new()
+    };
+    let fragment = format!("{items}{sentinel}");
+    if requested_page.is_some() && htmx_request {
+        return Ok(Html(super::format_html_timestamps(&fragment)));
+    }
+
+    let pagination = if page > 1 || has_next {
+        format!(
+            "<nav class=\"blog-pagination\" aria-label=\"Blog pages\">{}<span>Page {page} of {page_count}</span>{}</nav>",
+            if page > 1 {
+                format!("<a href=\"/blog?page={}\" hx-boost=\"false\">Previous posts</a>", page - 1)
+            } else {
+                String::new()
+            },
+            if has_next {
+                format!(
+                    "<a href=\"/blog?page={}\" hx-boost=\"false\">Next posts</a>",
+                    page.saturating_add(1)
+                )
+            } else {
+                String::new()
+            }
+        )
+    } else {
+        String::new()
+    };
+    let body = format!("<div class=\"blog-list\" id=\"blog-list\">{fragment}</div>{pagination}");
     docs_content_page(
-        &state,
-        "Blog",
-        "BLOG",
-        "Blog",
-        "Published factual notes about QED checks, powers observations, and signed statements.",
-        "Published factual notes about QED checks, powers observations, and signed statements.",
-        "/blog",
+        state,
+        PageMetadata {
+            page_title: "Blog",
+            heading: "Blog",
+            eyebrow: "BLOG",
+            intro: "Published factual notes about QED checks, powers observations, and signed statements.",
+            meta_description: "Published factual notes about QED checks, powers observations, and signed statements.",
+            canonical_path: "/blog",
+        },
         "blog",
-        content_adapter::blog_index_html(&posts),
+        body,
     )
 }
 
@@ -1154,12 +1645,14 @@ pub(crate) async fn blog_post_page(
         posts.iter().find(|post| post.slug == slug && !post.draft).ok_or(StatusCode::NOT_FOUND)?;
     docs_content_page(
         &state,
-        &post.title,
-        "BLOG",
-        &post.title,
-        &post.summary,
-        &post.summary,
-        &format!("/blog/{}", post.slug),
+        PageMetadata {
+            page_title: &post.title,
+            heading: &post.title,
+            eyebrow: "BLOG",
+            intro: &post.summary,
+            meta_description: &post.summary,
+            canonical_path: &format!("/blog/{}", post.slug),
+        },
         "blog",
         content_adapter::blog_post_html(post),
     )
@@ -1263,12 +1756,14 @@ pub(crate) async fn statements_page(
 </section>"#;
     content_page(
         &state,
-        "Statement",
-        "What did these wallets hold, provably?",
-        "STATEMENT",
-        STATEMENT_PURPOSE,
-        "Create a signed, re-checkable statement of registry-token balances for selected wallets.",
-        "/statements",
+        PageMetadata {
+            page_title: "Statement",
+            heading: "What did these wallets hold, provably?",
+            eyebrow: "STATEMENT",
+            intro: STATEMENT_PURPOSE,
+            meta_description: "Create a signed, re-checkable statement of registry-token balances for selected wallets.",
+            canonical_path: "/statements",
+        },
         form.to_owned(),
     )
 }
@@ -1286,24 +1781,19 @@ pub(crate) async fn create_statement_form(
 
 fn content_page(
     state: &AppState,
-    page_title: &str,
-    heading: &str,
-    eyebrow: &str,
-    intro: &str,
-    meta_description: &str,
-    canonical_path: &str,
+    metadata: PageMetadata<'_>,
     body_html: String,
 ) -> Result<Html<String>, StatusCode> {
     render_page(
         ContentPageTemplate {
             asset_version: ASSET_VERSION,
             public_url: state.public_url.to_string(),
-            page_title: page_title.to_owned(),
-            heading: heading.to_owned(),
-            eyebrow: eyebrow.to_owned(),
-            intro: intro.to_owned(),
-            meta_description: meta_description.to_owned(),
-            canonical_path: canonical_path.to_owned(),
+            page_title: metadata.page_title.to_owned(),
+            heading: metadata.heading.to_owned(),
+            eyebrow: metadata.eyebrow.to_owned(),
+            intro: metadata.intro.to_owned(),
+            meta_description: metadata.meta_description.to_owned(),
+            canonical_path: metadata.canonical_path.to_owned(),
             body_html,
         },
         false,
@@ -1312,12 +1802,7 @@ fn content_page(
 
 pub(crate) fn docs_content_page(
     state: &AppState,
-    page_title: &str,
-    eyebrow: &str,
-    heading: &str,
-    intro: &str,
-    meta_description: &str,
-    canonical_path: &str,
+    metadata: PageMetadata<'_>,
     active_sidebar: &str,
     body_html: String,
 ) -> Result<Html<String>, StatusCode> {
@@ -1325,19 +1810,14 @@ pub(crate) fn docs_content_page(
         DocsPageTemplate {
             asset_version: ASSET_VERSION,
             public_url: state.public_url.to_string(),
-            page_title: page_title.to_owned(),
-            heading: heading.to_owned(),
-            eyebrow: eyebrow.to_owned(),
-            intro: intro.to_owned(),
-            meta_description: meta_description.to_owned(),
-            canonical_path: canonical_path.to_owned(),
+            page_title: metadata.page_title.to_owned(),
+            heading: metadata.heading.to_owned(),
+            eyebrow: metadata.eyebrow.to_owned(),
+            intro: metadata.intro.to_owned(),
+            meta_description: metadata.meta_description.to_owned(),
+            canonical_path: metadata.canonical_path.to_owned(),
             active_sidebar: active_sidebar.to_owned(),
             body_html,
-            whats_new: if canonical_path == "/docs" {
-                release_news_view()?
-            } else {
-                WhatsNewView::default()
-            },
         },
         false,
     )
@@ -1410,7 +1890,7 @@ pub(crate) async fn statement_page(
             let powers_observed_at = asset
                 .powers_observed_at
                 .as_deref()
-                .map(html_escape)
+                .map(super::timestamp_html)
                 .unwrap_or_else(|| "Not cached".to_owned());
             let powers = format!(
                 "<p>{} seize · {} block · {} rule-change signals</p><p>Observed: {powers_observed_at}</p>{unavailable_html}",
@@ -1424,7 +1904,7 @@ pub(crate) async fn statement_page(
             let contract = html_escape(&asset.contract);
             let position_facts_html = statement_asset_position_html(asset);
             format!(
-                "<tr><td>{}</td><td class=\"statement-ticker\"><strong>{}</strong><small>{}</small></td><td class=\"statement-contract\"><code title=\"{contract}\">{contract}</code></td><td><strong>{}</strong><small>Raw {} · {} decimals</small></td><td>{issuer_match}</td><td>{powers}</td><td>{position_facts_html}</td></tr>",
+                "<tr class=\"statement-holding-row\"><td>{}</td><td class=\"statement-ticker\"><strong>{}</strong><small>{}</small></td><td class=\"statement-contract\"><code title=\"{contract}\">{contract}</code></td><td><strong>{}</strong><small>Raw {} · {} decimals</small></td><td>{issuer_match}</td></tr><tr class=\"statement-detail-row\"><td colspan=\"5\"><div class=\"statement-row-details\"><div><strong>Token powers</strong>{powers}</div><div><strong>Position and method notes</strong>{position_facts_html}</div></div></td></tr>",
                 html_escape(&asset.chain.to_string()),
                 html_escape(&asset.ticker),
                 html_escape(&asset.issuer),
@@ -1435,7 +1915,7 @@ pub(crate) async fn statement_page(
         })
         .collect::<String>();
     let assets_html = if assets_html.is_empty() {
-        "<tr><td colspan=\"7\">No registered token holdings were reported.</td></tr>".to_owned()
+        "<tr><td colspan=\"5\">No registered token holdings were reported.</td></tr>".to_owned()
     } else {
         assets_html
     };
@@ -1454,7 +1934,7 @@ pub(crate) async fn statement_page(
     let fact_sentence = format!(
         "This signed record reports {} registry-token balance {rows_word} for {wallet_count} {wallets_word} across {chain_count} {chains_word}, observed at {}.",
         statement.assets.len(),
-        html_escape(&statement.observed_at)
+        super::timestamp_html(&statement.observed_at)
     );
     let compare_html = if let Some(previous_id) = query.compare.as_deref() {
         let previous = crate::app::statement::get(&state.app, previous_id)
@@ -1472,9 +1952,29 @@ pub(crate) async fn statement_page(
         "Production signer."
     };
     let mut body_html = format!(
-        "<p class=\"statement-fact\">{fact_sentence}</p><section class=\"lookup statement-summary\" aria-labelledby=\"statement-summary-heading\"><div class=\"section-heading\"><h2 id=\"statement-summary-heading\">Statement summary</h2></div><p class=\"statement-label\"><strong>Label:</strong> {label}</p><dl class=\"statement-summary-grid\"><div><dt>Wallets</dt><dd><ul>{wallets_html}</ul></dd></div><div><dt>Chains</dt><dd><ul>{chains_html}</ul></dd></div><div><dt>Observed block and slot range</dt><dd><ul>{positions_html}</ul></dd></div><div><dt>Signer</dt><dd><code>{signer}</code><p class=\"lookup-note\">{signer_notice}</p></dd></div><div><dt>Statement ID</dt><dd><code>{id}</code></dd></div><div><dt>Observed at</dt><dd>{}</dd></div></dl><div class=\"statement-actions\"><a class=\"button secondary-button\" href=\"{json_url}\" download>Download JSON</a><a class=\"button secondary-button\" href=\"{csv_url}\" download>Download CSV</a><a class=\"button secondary-button\" href=\"{verify_url}\">Verify this record</a><button class=\"button secondary-button\" type=\"button\" data-print-statement>Print / Save as PDF</button><form action=\"{recheck_url}\" method=\"post\" hx-boost=\"false\"><button class=\"button primary-button\" type=\"submit\">Re-run and compare</button></form></div><p class=\"lookup-note\">Save the signed JSON for independent verification; cached statement pages are retained for up to 24 hours.</p></section>{compare_html}<section class=\"registry-panel statement-holdings\" aria-labelledby=\"statement-holdings-heading\"><div class=\"section-heading\"><h2 id=\"statement-holdings-heading\">Registered token holdings</h2><span class=\"count-badge\">{} assets</span></div><div class=\"table-wrap\"><table class=\"statement-table\"><thead><tr><th>Chain</th><th>Ticker</th><th>Contract</th><th>Balance</th><th>Issuer match</th><th>Powers summary</th><th>Slot / block</th></tr></thead><tbody>{assets_html}</tbody></table></div></section><p class=\"lookup-note statement-nonclaims\">Balances are on-chain facts at a height, not proof of ownership. QED does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Statement pages are public to anyone with their link.</p>",
-        html_escape(&statement.observed_at),
-        statement.assets.len()
+        concat!(
+            "<p class=\"statement-fact\">{fact_sentence}</p><section class=\"lookup statement-summary\" aria-labelledby=\"statement-summary-heading\"><div class=\"section-heading\"><h2 id=\"statement-summary-heading\">Statement summary</h2></div><p class=\"statement-label\"><strong>Label:</strong> {label}</p><dl class=\"statement-summary-grid\"><div><dt>Wallets</dt><dd><ul>{wallets_html}</ul></dd></div><div><dt>Chains</dt><dd><ul>{chains_html}</ul></dd></div><div><dt>Observed block and slot range</dt><dd><ul>{positions_html}</ul></dd></div>",
+            "<div><dt>Signer</dt><dd><code>{signer}</code><p class=\"lookup-note\">{signer_notice}</p></dd></div><div><dt>Statement ID</dt><dd><code>{id}</code></dd></div><div><dt>Observed at</dt><dd>{}</dd></div></dl>",
+            "<div class=\"statement-actions\"><a class=\"button secondary-button\" href=\"{json_url}\" download>Download JSON</a><a class=\"button secondary-button\" href=\"{csv_url}\" download>Download CSV</a><a class=\"button secondary-button\" href=\"{verify_url}\">Verify this record</a><button class=\"button secondary-button\" type=\"button\" data-print-statement>Print / Save as PDF</button><form action=\"{recheck_url}\" method=\"post\" hx-boost=\"false\"><button class=\"button primary-button\" type=\"submit\">Re-run and compare</button></form></div><p class=\"lookup-note\">Save the signed JSON for independent verification; cached statement pages are retained for up to 24 hours.</p></section>{compare_html}",
+            "<section class=\"registry-panel statement-holdings\" aria-labelledby=\"statement-holdings-heading\"><div class=\"section-heading\"><h2 id=\"statement-holdings-heading\">Registered token holdings</h2><span class=\"count-badge\">{} assets</span></div><div class=\"table-wrap\"><table class=\"statement-table\"><thead><tr><th>Chain</th><th>Ticker</th><th>Contract</th><th>Balance</th><th>Issuer match</th></tr></thead><tbody>{assets_html}</tbody></table></div></section>",
+            "<p class=\"lookup-note statement-nonclaims\">Balances are on-chain facts at a height, not proof of ownership. QED does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Statement pages are public to anyone with their link.</p>"
+        ),
+        super::timestamp_html(&statement.observed_at),
+        statement.assets.len(),
+        fact_sentence = fact_sentence,
+        label = label,
+        wallets_html = wallets_html,
+        chains_html = chains_html,
+        positions_html = positions_html,
+        signer = signer,
+        signer_notice = signer_notice,
+        id = id,
+        json_url = json_url,
+        csv_url = csv_url,
+        verify_url = verify_url,
+        recheck_url = recheck_url,
+        compare_html = compare_html,
+        assets_html = assets_html
     );
     use std::fmt::Write as _;
     write!(
@@ -1486,12 +1986,14 @@ pub(crate) async fn statement_page(
     let canonical_path = format!("/statements/{id}");
     content_page(
         &state,
-        &title,
-        "Wallet statement",
-        "STATEMENT",
-        STATEMENT_PURPOSE,
-        "Signed point-in-time token balances and chain positions for selected wallets.",
-        &canonical_path,
+        PageMetadata {
+            page_title: &title,
+            heading: "Wallet statement",
+            eyebrow: "STATEMENT",
+            intro: STATEMENT_PURPOSE,
+            meta_description: "Signed point-in-time token balances and chain positions for selected wallets.",
+            canonical_path: &canonical_path,
+        },
         body_html,
     )
 }
@@ -1561,8 +2063,8 @@ fn statement_comparison_html(
     format!(
         "<section class=\"lookup statement-comparison\" aria-labelledby=\"statement-comparison-heading\"><h2 id=\"statement-comparison-heading\">Comparison with the previous statement</h2><p>{}</p><p>Previous observation: {}. New observation: {}.</p>{}</section>",
         html_escape(&summary),
-        html_escape(&previous.observed_at),
-        html_escape(&current.observed_at),
+        super::timestamp_html(&previous.observed_at),
+        super::timestamp_html(&current.observed_at),
         if changes.is_empty() { String::new() } else { format!("<ul>{}</ul>", changes.join("")) }
     )
 }
@@ -1605,12 +2107,14 @@ pub(crate) async fn verify_statement_page(
     );
     content_page(
         &state,
-        "Statement verification",
-        "Verify this statement.",
-        "STATEMENT",
-        summary,
-        "Verify the signed statement hash, signature, trusted signer, and environment.",
-        &format!("/statements/{id}/verify"),
+        PageMetadata {
+            page_title: "Statement verification",
+            heading: "Verify this statement.",
+            eyebrow: "STATEMENT",
+            intro: summary,
+            meta_description: "Verify the signed statement hash, signature, trusted signer, and environment.",
+            canonical_path: &format!("/statements/{id}/verify"),
+        },
         body,
     )
 }
@@ -1951,12 +2455,14 @@ pub(crate) async fn verify_certificate_page(
     );
     content_page(
         &state,
-        "Certificate verification",
-        "Verify this record.",
-        "CERTIFICATE",
-        summary,
-        "Check a QED certificate signature, trusted signer, environment, and freshness.",
-        &format!("/v/{id}/verify"),
+        PageMetadata {
+            page_title: "Certificate verification",
+            heading: "Verify this record.",
+            eyebrow: "CERTIFICATE",
+            intro: summary,
+            meta_description: "Check a QED certificate signature, trusted signer, environment, and freshness.",
+            canonical_path: &format!("/v/{id}/verify"),
+        },
         body,
     )
 }
@@ -1985,13 +2491,148 @@ pub(crate) async fn recheck_certificate(
     };
     CertificateResultTemplate { certificate }
         .render()
-        .map(Html)
+        .map(|html| Html(super::format_html_timestamps(&html)))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::pool::PoolError;
+    #[test]
+    fn stats_flagged_rows_render_complete_fact_reason_totals_and_native_details() {
+        let state = AppState::for_tests(Vec::new(), Vec::new(), true);
+        let registry = vec![crate::domain::registry::Entry {
+            issuer: "Backed xStocks".to_owned(),
+            ticker: "NVDA".to_owned(),
+            name: "NVIDIA".to_owned(),
+            chain: Chain::Base,
+            contract: "0x0000000000000000000000000000000000000002".to_owned(),
+            decimals: Some(18),
+            source: "test".to_owned(),
+            source_url: "https://issuer.example".to_owned(),
+            last_checked: "2026-10-07T00:00:00Z".to_owned(),
+            removed_at: None,
+            stale_since: None,
+            official_deployments: vec![crate::domain::registry::OfficialDeployment {
+                network: "Base".to_owned(),
+                address: "0x0000000000000000000000000000000000000002".to_owned(),
+                wrapper_address: None,
+                wrapper_address_v2: None,
+            }],
+        }];
+        let entry = crate::adapters::discovery::ImpostorEntry {
+            chain: "base".to_owned(),
+            chain_label: "Base".to_owned(),
+            ticker: "NVDA".to_owned(),
+            publisher: "Backed xStocks".to_owned(),
+            symbol: "WRONG-LISTING-SYMBOL".to_owned(),
+            name: "Wrong Market Listing".to_owned(),
+            address: "0x0000000000000000000000000000000000000001".to_owned(),
+            first_seen_at: "2026-10-06T01:02:00Z".to_owned(),
+            last_seen_at: "2026-10-07T03:04:00Z".to_owned(),
+            tier: crate::domain::guard::PublisherProductTier::Confirmed,
+            volume_24h_usd: Some(1234.5),
+            liquidity_24h_usd: Some(456.78),
+            pool_count: Some(2),
+            source: crate::adapters::discovery::MarketSource::Geckoterminal,
+            guard_url: "/guard/base/0x0000000000000000000000000000000000000001".to_owned(),
+            reason: "truncated reason".to_owned(),
+            reads: Vec::new(),
+            on_chain_symbol: Some("NVDA".to_owned()),
+            on_chain_name: Some("NVIDIA xStock".to_owned()),
+            publisher_catalog_snapshot_hash: Some("a".repeat(64)),
+            evidence_truncated: false,
+            guard_document: None,
+        };
+        let mut board = crate::adapters::discovery::Leaderboard::default();
+        board.entries.push(crate::adapters::discovery::LeaderboardEntry {
+            rank: 1,
+            chain: "base".to_owned(),
+            chain_label: "Base".to_owned(),
+            dex: "uniswap-v3".to_owned(),
+            pool: "0xpool".to_owned(),
+            base_symbol: "NVDA".to_owned(),
+            quote_symbol: "USDC".to_owned(),
+            source: crate::adapters::discovery::MarketSource::Dexscreener,
+            issuer: Some("Backed xStocks".to_owned()),
+            ticker: Some("NVDA".to_owned()),
+            issuer_on_base: Some(true),
+            verdict: "verified".to_owned(),
+            read_status: "checked".to_owned(),
+            read_reason: None,
+            price_usd: None,
+            change_24h_pct: None,
+            volume_24h_usd: Some(300.0),
+            liquidity_usd: None,
+            txns_24h: None,
+            detail_url: "/validated/base/0xpool".to_owned(),
+            trade_url: "https://dexscreener.com/base/0xpool".to_owned(),
+            explorer_url: "https://basescan.org/address/0xpool".to_owned(),
+            attestation_id: None,
+            checked_at: None,
+        });
+        let stats = super::super::api::leaderboard_stats(&board, &registry);
+        let rendered = render_stats_page(&state, &stats, &[&entry], &board, &registry)
+            .expect("stats page renders");
+        let rendered = String::from_utf8(rendered.to_vec()).expect("stats HTML is UTF-8");
+
+        assert!(rendered.contains("on-chain symbol “NVDA” and name “NVIDIA xStock”"));
+        assert!(rendered.contains("Listed as Wrong Market Listing"));
+        assert!(rendered.contains("WRONG-LISTING-SYMBOL · reported by GeckoTerminal"));
+        assert!(!rendered.contains("on-chain symbol “WRONG-LISTING-SYMBOL”"));
+        assert!(rendered.contains("exactly match the NVDA product published by Backed xStocks"));
+        assert!(rendered.contains("official deployments on Base"));
+        assert!(rendered.contains("<h3>Confirmed mismatches</h3>"));
+        assert!(rendered.contains("<h3>Caution — near matches</h3>"));
+        assert_eq!(rendered.matches("class=\"stats-flagged-total\"").count(), 1);
+        assert!(rendered.contains(
+            "Reported 24h volume across all flagged tokens: $1,234.5 (DexScreener/GeckoTerminal, not verified)"
+        ));
+        assert!(rendered.contains(
+            "On-chain symbol and name exactly match an issuer product; the address is absent from the issuer's catalog."
+        ));
+        assert!(
+            rendered
+                .contains("Similar to an issuer product, but QED could not confirm a mismatch.")
+        );
+        assert!(
+            rendered.contains(
+                "Total reported 24h volume (1 tokens): $1,234.5 (DexScreener/GeckoTerminal"
+            )
+        );
+        assert!(!rendered.contains("Total reported 24h volume (1 tokens): $1,234.5. "));
+        assert!(rendered.contains("$1.2k reported 24h volume"));
+        assert!(
+            rendered.contains("<details class=\"stats-row-details\"><summary>Details</summary>")
+        );
+        assert!(rendered.contains("0x0000000000000000000000000000000000000001</code>"));
+        assert!(rendered.contains("2026-10-06T01:02:00Z\">6 Oct 2026, 01:02 UTC"));
+        assert!(rendered.contains("2026-10-07T03:04:00Z\">7 Oct 2026, 03:04 UTC"));
+        assert!(rendered.contains(
+            "role=\"img\" aria-label=\"Deny — claims a product its publisher does not list\""
+        ));
+        assert!(rendered.contains("official publisher pool volume $300"));
+        assert!(rendered.contains("Liquidity:</strong> $456.78 reported by GeckoTerminal"));
+        assert!(rendered.contains("Pool count:</strong> 2 reported in this observation"));
+        assert!(!rendered.contains("same scan"));
+        let mut no_metrics = entry.clone();
+        no_metrics.liquidity_24h_usd = None;
+        no_metrics.pool_count = None;
+        let no_metrics_row = render_flagged_row(&no_metrics, &registry, &board.entries);
+        assert!(no_metrics_row.contains("Liquidity:</strong> Not retained in this observation"));
+        assert!(no_metrics_row.contains("Pool count:</strong> Not retained in this observation"));
+        let mut missing_facts = entry.clone();
+        missing_facts.on_chain_symbol = None;
+        missing_facts.on_chain_name = None;
+        missing_facts.reason = "x".repeat(crate::adapters::discovery::MAX_IMPOSTOR_REASON_BYTES);
+        let fallback_row = render_flagged_row(&missing_facts, &registry, &board.entries);
+        assert!(fallback_row.contains(&format!(
+            "Why flagged:</strong> {}…",
+            "x".repeat(crate::adapters::discovery::MAX_IMPOSTOR_REASON_BYTES)
+        )));
+        assert!(!rendered.contains("<details class=\"stats-row-details\" open"));
+        assert!(!rendered.contains("truncated reason"));
+    }
 
     struct GatedPowerReader {
         started: std::sync::Arc<tokio::sync::Notify>,
@@ -2046,6 +2687,37 @@ mod tests {
             Ok(crate::domain::powers::PowerFacts::default())
         }
     }
+    struct IncompletePowerReader {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ports::ChainReader for IncompletePowerReader {
+        fn chain(&self) -> Chain {
+            Chain::Solana
+        }
+
+        async fn read_pool(
+            &self,
+            _address: &str,
+        ) -> Result<crate::domain::pool::PoolInfo, PoolError> {
+            Err(PoolError::Reader("unused token-page test reader".to_owned()))
+        }
+
+        async fn power_facts(
+            &self,
+            _address: &str,
+        ) -> Result<crate::domain::powers::PowerFacts, PoolError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::domain::powers::PowerFacts {
+                unavailable: vec![crate::domain::powers::Reason::new(
+                    "extension_unreadable",
+                    "A token extension could not be decoded.",
+                )],
+                ..Default::default()
+            })
+        }
+    }
 
     struct TransientPowerReader;
 
@@ -2066,8 +2738,8 @@ mod tests {
             &self,
             _address: &str,
         ) -> Result<crate::domain::powers::PowerFacts, PoolError> {
-            let mut facts = crate::domain::powers::PowerFacts::default();
-            facts.transient_failure = true;
+            let mut facts =
+                crate::domain::powers::PowerFacts { transient_failure: true, ..Default::default() };
             facts
                 .unavailable
                 .push(crate::domain::powers::Reason::new("rpc_timeout", "RPC timed out."));
@@ -2202,7 +2874,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_power_facts_use_the_full_ttl_cache() {
+    async fn complete_power_facts_are_reused_by_user_inspections() {
         let address = "11111111111111111111111111111111";
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let state = token_page_state(
@@ -2235,12 +2907,52 @@ mod tests {
         assert_eq!(record.source_verified, crate::domain::powers::SourceVerified::Unavailable);
         assert!(state.app.powers_cache.get(&key).await.is_some());
         assert!(state.app.powers_retry_cache.get(&key).await.is_none());
-        assert_eq!(crate::app::warm::POWERS_CACHE_TTL, Duration::from_secs(30 * 60));
 
         let cached = crate::app::powers::inspect(&state.app, Chain::Solana, address)
             .await
             .expect("cached complete observation");
         assert_eq!(cached.observed_at, record.observed_at);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn incomplete_power_facts_use_only_the_retry_cache() {
+        let address = "11111111111111111111111111111111";
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = token_page_state(
+            Box::new(IncompletePowerReader { calls: calls.clone() }),
+            registry::Entry {
+                issuer: "Issuer".to_owned(),
+                ticker: "NVDA".to_owned(),
+                name: "Issuer NVDA".to_owned(),
+                chain: Chain::Solana,
+                contract: address.to_owned(),
+                decimals: Some(9),
+                source: "test".to_owned(),
+                source_url: "https://issuer.example/nvda".to_owned(),
+                last_checked: registry_adapter::now_rfc3339(),
+                removed_at: None,
+                stale_since: None,
+                official_deployments: Vec::new(),
+            },
+        );
+        let key = (
+            Chain::Solana,
+            address.to_owned(),
+            state.app.registry_version.load(std::sync::atomic::Ordering::Acquire),
+        );
+
+        let record = crate::app::powers::inspect(&state.app, Chain::Solana, address)
+            .await
+            .expect("incomplete observation");
+        assert_eq!(record.unavailable[0].code, "extension_unreadable");
+        assert!(state.app.powers_cache.get(&key).await.is_none());
+        assert!(state.app.powers_retry_cache.get(&key).await.is_some());
+
+        let retry_cached = crate::app::powers::inspect(&state.app, Chain::Solana, address)
+            .await
+            .expect("short retry-cache observation");
+        assert_eq!(retry_cached.observed_at, record.observed_at);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
@@ -2369,12 +3081,13 @@ mod tests {
         let mut cached = powers_record(crate::domain::powers::SourceVerified::Match);
         cached.chain = Chain::Solana;
         cached.contract = nvda.to_owned();
-        cached.observed_at = chrono::Utc::now().to_rfc3339();
+        cached.observed_at = (chrono::Utc::now() - chrono::Duration::minutes(99)).to_rfc3339();
         state.app.powers_cache.insert((Chain::Solana, nvda.to_owned(), version), cached).await;
         let mut stale_cached = powers_record(crate::domain::powers::SourceVerified::Match);
         stale_cached.chain = Chain::Solana;
         stale_cached.contract = tsla.to_owned();
-        stale_cached.observed_at = (chrono::Utc::now() - chrono::Duration::minutes(6)).to_rfc3339();
+        stale_cached.observed_at =
+            (chrono::Utc::now() - chrono::Duration::minutes(101)).to_rfc3339();
         state
             .app
             .powers_cache
@@ -2462,7 +3175,7 @@ mod tests {
             "permanent_delegate",
             "Permanent delegate can transfer or burn tokens.",
         ));
-        cached.observed_at = (chrono::Utc::now() - chrono::Duration::minutes(6)).to_rfc3339();
+        cached.observed_at = (chrono::Utc::now() - chrono::Duration::minutes(101)).to_rfc3339();
         let cached_time = cached.observed_at.clone();
         let key = (Chain::Solana, address.to_owned(), version);
         state.app.powers_cache.insert(key.clone(), cached).await;
@@ -2583,54 +3296,6 @@ mod tests {
         assert_eq!(format_wallet_amount("7", None), "7");
     }
 
-    #[test]
-    fn wallet_holdings_template_renders_genuine_pool_and_unknown_rows() {
-        let template = WalletHoldingsTemplate {
-            asset_version: 1,
-            public_url: "https://qed.example".to_owned(),
-            address: "0x0000000000000000000000000000000000000001".to_owned(),
-            holdings: vec![
-                WalletHoldingView {
-                    symbol: "NVDA".to_owned(),
-                    amount: "1.5".to_owned(),
-                    verdict: "Contract matches issuer registry".to_owned(),
-                    verdict_class: "is-verified".to_owned(),
-                    chain: "Base".to_owned(),
-                    pool_url: None,
-                    trade_links: Vec::new(),
-                    reason: None,
-                },
-                WalletHoldingView {
-                    symbol: "NVDA".to_owned(),
-                    amount: "2".to_owned(),
-                    verdict: "Verified · issuer NVDA".to_owned(),
-                    verdict_class: "is-verified".to_owned(),
-                    chain: "Ethereum".to_owned(),
-                    pool_url: Some("/validated/ethereum/pool".to_owned()),
-                    trade_links: vec![WalletTradeLinkView {
-                        label: "Market pool".to_owned(),
-                        url: "https://dex.example/pool".to_owned(),
-                    }],
-                    reason: None,
-                },
-                WalletHoldingView {
-                    symbol: "Unknown".to_owned(),
-                    amount: "3".to_owned(),
-                    verdict: "Unknown".to_owned(),
-                    verdict_class: "is-unknown".to_owned(),
-                    chain: "BNB Chain".to_owned(),
-                    pool_url: None,
-                    trade_links: Vec::new(),
-                    reason: Some("No issuer registry or known pool match.".to_owned()),
-                },
-            ],
-        };
-        let rendered = template.render().expect("wallet template renders");
-        assert!(rendered.contains("Contract matches issuer registry"));
-        assert!(rendered.contains("Verified · issuer NVDA"));
-        assert!(rendered.contains("Unknown"));
-        assert!(rendered.contains("https://dex.example/pool"));
-    }
     #[test]
     fn ticker_lookup_returns_canonical_active_issuer_ticker() {
         let entry = registry::Entry {
@@ -2965,30 +3630,127 @@ mod tests {
     }
 
     #[test]
-    fn homepage_links_powers_and_preserves_protected_statements() {
+    fn homepage_shows_prices_and_each_check_time_separately() {
+        let checked_at = (chrono::Utc::now() - chrono::Duration::hours(25))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let rendered = IndexTemplate {
             asset_version: 1,
             public_url: "https://qed.example".to_owned(),
-            stats_line: "0 pools checked · 0 issuer matches · 0 mismatches · 0 not read yet"
-                .to_owned(),
             leaderboard: super::super::views::LeaderboardPageView::from_value(serde_json::json!({
-                "entries": []
+                "entries": [{
+                    "rank": 1,
+                    "pool": "pool123",
+                    "chain": "base",
+                    "chain_label": "Base",
+                    "dex": "uniswap-v3",
+                    "base_symbol": "NVDA",
+                    "quote_symbol": "USDC",
+                    "checked_at": checked_at.clone(),
+                    "verdict": "verified",
+                    "source": "dexscreener",
+                    "trade_url": "https://dexscreener.com/base/pool123"
+                }],
+                "prices_updated_at": "2026-10-08T12:34:56Z",
+                "refreshing": false
             })),
-            whats_new: super::super::views::WhatsNewView::default(),
+            integration_chips: vec![
+                IntegrationChipView {
+                    category: "Issuer",
+                    name: "Ondo",
+                    href: "https://ondo.finance/",
+                    mark: "",
+                    icon: "ondo",
+                    logo_src: "/static/brand/ondo-mark.svg",
+                    number: Some("5".to_owned()),
+                    unit: "contracts tracked",
+                    empty_unit: "issuer catalog",
+                },
+                IntegrationChipView {
+                    category: "Chain",
+                    name: "Base",
+                    href: "https://base.org/",
+                    mark: "",
+                    icon: "base",
+                    logo_src: "",
+                    number: None,
+                    unit: "pools checked",
+                    empty_unit: "supported chain",
+                },
+                IntegrationChipView {
+                    category: "Source",
+                    name: "DexScreener",
+                    href: "https://dexscreener.com/",
+                    mark: "",
+                    icon: "dexscreener",
+                    logo_src: "",
+                    number: None,
+                    unit: "pools priced",
+                    empty_unit: "price source",
+                },
+                IntegrationChipView {
+                    category: "Verifier",
+                    name: "Sourcify",
+                    href: "https://sourcify.dev/",
+                    mark: "",
+                    icon: "sourcify",
+                    logo_src: "/static/brand/sourcify-mark.png",
+                    number: None,
+                    unit: "contracts verified",
+                    empty_unit: "source verification",
+                },
+            ],
         }
         .render()
         .expect("homepage template renders");
+        let checked_at_label = chrono::DateTime::parse_from_rfc3339(&checked_at)
+            .expect("fixture check timestamp parses")
+            .with_timezone(&chrono::Utc)
+            .format("%e %b %Y, %H:%M UTC")
+            .to_string()
+            .trim_start()
+            .to_owned();
+        assert!(rendered.contains(&format!("title=\"Checked {checked_at_label}\"")));
+        assert!(rendered.contains("aria-label=\"Check is stale\"> · stale</span>"));
+        assert!(rendered.contains(
+            "Prices updated <time datetime=\"2026-10-08T12:34:56Z\">8 Oct 2026, 12:34 UTC</time> · contract checks: top 50 every 6 h, others daily"
+        ));
+        assert!(!rendered.contains("leaderboard-source-note\" aria-live=\"polite\">Updated"));
+        assert!(rendered.contains("integration-set--clone"));
+        assert!(rendered.contains("aria-hidden=\"true\" inert"));
+        assert!(rendered.contains("integration-number\">5</strong>"));
+        assert!(rendered.contains("contracts tracked"));
+        assert!(rendered.contains("source verification"));
+        assert!(rendered.contains("/static/brand/ondo-mark.svg"));
+        assert!(rendered.contains("aria-label=\"Issuer: Ondo, 5 contracts tracked\""));
+        assert!(rendered.contains("aria-label=\"Chain: Base, supported chain\""));
+        assert!(rendered.contains("aria-label=\"Source: DexScreener, price source\""));
+        assert!(rendered.contains("aria-label=\"Verifier: Sourcify, source verification\""));
+        assert!(rendered.contains(">supported chain</span>"));
+        assert!(rendered.contains(">price source</span>"));
 
         assert!(rendered.contains(
             "A ticker is not a contract. Compare the pool with the issuer's published stock-token contract."
         ));
         assert!(rendered.contains(
-            "QED checks whether a pool uses the stock-token contract published by its issuer."
+            "QED checks whether a pool uses the <span class=\"nowrap\">stock-token</span> contract published by its issuer."
         ));
         assert!(rendered.contains(
             r#"<a href="/tokens/NVDA">QED also shows what the issuer can do to each token.</a>"#
         ));
-        assert!(rendered.contains(r#"<a href="/stats">Stats</a>"#));
+        assert!(!rendered.contains("Review a token or pool"));
+        assert!(!rendered.contains("Try the NVDA pool example"));
+        assert!(!rendered.contains("home-audience"));
+        assert!(!rendered.contains("leaderboard-stats-line"));
+        assert!(rendered.contains(
+            "title=\"Verified means the quote-side contract matches an issuer-published contract."
+        ));
+        assert!(
+            rendered.contains("title=\"External market page; QED checks contract match only.\"")
+        );
+        assert_eq!(rendered.matches("leaderboard-source-note").count(), 1);
+        assert!(!rendered.contains("verdict-scope"));
+        assert!(!rendered.contains("market-source"));
+        assert!(!rendered.contains("trade-limit"));
     }
     #[tokio::test]
     async fn homepage_does_not_embed_publisher_watch_candidate_records() {
@@ -3165,17 +3927,12 @@ mod tests {
             "<td class=\"statement-contract\"><code title=\"mint&amp;one\">mint&amp;one</code></td>"
         ));
         assert!(html.contains("<td>Match</td>"));
-        for heading in [
-            "Chain",
-            "Ticker",
-            "Contract",
-            "Balance",
-            "Issuer match",
-            "Powers summary",
-            "Slot / block",
-        ] {
+        for heading in ["Chain", "Ticker", "Contract", "Balance", "Issuer match"] {
             assert!(html.contains(&format!("<th>{heading}</th>")));
         }
+        assert!(html.contains("<tr class=\"statement-holding-row\">"));
+        assert!(html.contains("<tr class=\"statement-detail-row\"><td colspan=\"5\">"));
+        assert!(!html.contains("<th>Powers summary</th>"));
         assert!(html.contains("<strong>Label:</strong> Q3 &lt;investor&gt; report"));
         assert!(html.contains("href=\"/statements/statement-id/download.csv\" download"));
         assert!(html.contains("href=\"/statements/statement-id/verify\""));
@@ -3184,7 +3941,7 @@ mod tests {
         ));
         assert!(html.contains("action=\"/statements/statement-id/recheck\""));
         assert!(html.contains("data-print-statement"));
-        assert!(html.contains("Observed: 2026-10-04T00:00:00Z"));
+        assert!(html.contains("Observed: <time datetime=\"2026-10-04T00:00:00Z\" title=\"2026-10-04T00:00:00Z\">4 Oct 2026, 00:00 UTC</time>"));
         assert!(html.contains("slots 42–44"));
         assert!(html.contains("block 79879642"));
         assert!(!html.contains("block —"));

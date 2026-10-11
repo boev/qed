@@ -31,6 +31,9 @@ RUN cargo build --release --locked
 FROM --platform=linux/amd64 registry.access.redhat.com/ubi9/ubi-micro:9.7@sha256:efa877c7a38fc7f37a3f942ed4b6d357bec75360f572099c59da1ce09ca37917 AS ubi-micro-base
 FROM --platform=linux/amd64 registry.access.redhat.com/ubi9/ubi:9.7@sha256:ee3871c273cc65a2bd24970b47c15b90fbf962841bc2e41e4f915b1c4c0208e2 AS runtime-packages
 COPY --from=ubi-micro-base / /rootfs/
+# Release builds pass a fresh value so `dnf upgrade` below never comes from a stale layer cache.
+ARG QED_OS_REFRESH=unset
+RUN echo "OS package refresh: ${QED_OS_REFRESH}" >/dev/null
 RUN dnf upgrade --installroot /rootfs -y \
         --releasever=9.7 \
         --setopt=install_weak_deps=0 \

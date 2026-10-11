@@ -186,7 +186,7 @@ async fn inspect_with_refresh(
             return Err(error);
         }
     };
-    let is_transient = facts.transient_failure;
+    let cache_complete = facts.unavailable.is_empty() && !facts.transient_failure;
     let record = PowersRecord {
         chain,
         contract,
@@ -206,7 +206,7 @@ async fn inspect_with_refresh(
     };
 
     state.powers_failure_cache.invalidate(&cache_key).await;
-    if is_transient {
+    if !cache_complete {
         state.powers_retry_cache.insert(cache_key, record.clone()).await;
     } else {
         state.powers_retry_cache.invalidate(&cache_key).await;

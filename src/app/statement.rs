@@ -177,7 +177,7 @@ async fn asset_row(
     let version = state.registry_version.load(Ordering::Acquire);
     let cached = crate::app::powers::canonical_contract(entry.chain, &entry.contract)
         .ok()
-        .and_then(|contract| Some((entry.chain, contract, version)));
+        .map(|contract| (entry.chain, contract, version));
     let facts = match cached {
         Some(key) => state.powers_cache.get(&key).await,
         None => None,

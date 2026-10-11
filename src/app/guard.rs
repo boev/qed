@@ -24,6 +24,7 @@ const MAX_GUARD_ADDRESS_CHARS: usize = 66;
 const MAX_GUARD_POOLS: usize = 16;
 const MAX_GUARD_READS: usize = 256;
 const MAX_PUBLISHER_METADATA_CANDIDATES: usize = 8;
+pub(crate) const PUBLISHER_METADATA_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 #[derive(Debug, Error)]
 pub(crate) enum GuardError {
     #[error("guard address is invalid for the selected chain")]
@@ -44,6 +45,24 @@ pub(crate) async fn create(
     chain: Chain,
     wallet: Option<&str>,
 ) -> Result<GuardDocument, GuardError> {
+    create_with_metadata_cache(state, address, chain, wallet, false).await
+}
+
+pub(crate) async fn create_for_watch(
+    state: &Context,
+    address: &str,
+    chain: Chain,
+) -> Result<GuardDocument, GuardError> {
+    create_with_metadata_cache(state, address, chain, None, true).await
+}
+
+async fn create_with_metadata_cache(
+    state: &Context,
+    address: &str,
+    chain: Chain,
+    wallet: Option<&str>,
+    cache_published_metadata: bool,
+) -> Result<GuardDocument, GuardError> {
     let address = canonical_input(address, chain)?;
     if wallet.is_some_and(|wallet| wallet.len() > Chain::MAX_SOLANA_ADDRESS_CHARS) {
         return Err(GuardError::InvalidWallet);
@@ -53,9 +72,12 @@ pub(crate) async fn create(
         .filter(|value| !value.is_empty())
         .map(|wallet| canonical_wallet(wallet, chain))
         .transpose()?;
-    tokio::time::timeout(GUARD_DEADLINE, create_inner(state, &address, chain, wallet.as_deref()))
-        .await
-        .map_err(|_| GuardError::DeadlineExceeded)?
+    tokio::time::timeout(
+        GUARD_DEADLINE,
+        create_inner(state, &address, chain, wallet.as_deref(), cache_published_metadata),
+    )
+    .await
+    .map_err(|_| GuardError::DeadlineExceeded)?
 }
 
 async fn create_inner(
@@ -63,6 +85,7 @@ async fn create_inner(
     address: &str,
     chain: Chain,
     wallet: Option<&str>,
+    cache_published_metadata: bool,
 ) -> Result<GuardDocument, GuardError> {
     let reader = state
         .readers
@@ -88,26 +111,33 @@ async fn create_inner(
     .await;
     let ((publisher_metadata, publisher_metadata_unavailable), publisher_metadata_log) =
         capture_reads(load_publisher_metadata(
-            state.readers.as_slice(),
+            state,
             chain,
             &subject,
             metadata.as_ref(),
             std::sync::Arc::clone(&registry),
+            cache_published_metadata,
         ))
         .await;
     append_read_log(&mut read_log, publisher_metadata_log);
-    let identity = crate::domain::guard::identify_with_contract_metadata(
+    let complete_publishers = state
+        .publisher_catalog_complete
+        .read()
+        .map(|publishers| publishers.clone())
+        .unwrap_or_default();
+    let identity = crate::domain::guard::identify_with_catalog_status(
         chain,
         &subject,
         metadata.as_ref(),
         &registry,
         &publisher_metadata,
+        &complete_publishers,
     );
     let power_record =
         if subject.is_empty() { None } else { powers::inspect(state, chain, &subject).await.ok() };
     let (source, provider) = source_status(chain, power_record.as_ref());
 
-    let (wallet_check, wallet_log) = if let Some(wallet_address) = wallet.as_deref() {
+    let (wallet_check, wallet_log) = if let Some(wallet_address) = wallet {
         if subject.is_empty() {
             (
                 Some(GuardWalletCheck {
@@ -208,11 +238,12 @@ async fn create_inner(
     Ok(document)
 }
 async fn load_publisher_metadata(
-    readers: &[Box<dyn ChainReader>],
+    context: &Context,
     chain: Chain,
     target: &str,
     metadata: Option<&TokenMeta>,
     entries: std::sync::Arc<Vec<Entry>>,
+    cache_published: bool,
 ) -> (std::collections::HashMap<String, TokenMeta>, bool) {
     let empty = || (std::collections::HashMap::new(), false);
     let Some(metadata) = metadata else {
@@ -257,11 +288,33 @@ async fn load_publisher_metadata(
         return (std::collections::HashMap::new(), true);
     }
 
-    let results = futures_util::stream::iter(candidates.into_iter().map(|(key, index)| {
+    let mut publisher_metadata = std::collections::HashMap::new();
+    let mut misses = Vec::new();
+    for (key, index) in candidates {
+        let entry = &entries[index];
+        let cache_key = (entry.chain, key.clone());
+        let cached = if cache_published {
+            context.publisher_metadata_cache.get(&cache_key).await
+        } else {
+            None
+        };
+        if cached.as_ref().is_some_and(|cached| {
+            crate::domain::guard::metadata_complete(cached)
+                && same_address(entry.chain, &cached.address, &entry.contract)
+        }) {
+            publisher_metadata.insert(key, cached.expect("validated cached metadata"));
+        } else {
+            misses.push((key, index));
+        }
+    }
+
+    let context = context.clone();
+    let results = futures_util::stream::iter(misses.into_iter().map(|(key, index)| {
+        let context = context.clone();
         let entries = std::sync::Arc::clone(&entries);
         async move {
             let entry = &entries[index];
-            let result = match readers.iter().find(|reader| reader.chain() == entry.chain) {
+            let result = match context.readers.iter().find(|reader| reader.chain() == entry.chain) {
                 Some(reader) => reader.token_meta(&entry.contract).await.ok(),
                 None => None,
             };
@@ -271,7 +324,6 @@ async fn load_publisher_metadata(
     .buffer_unordered(MAX_PUBLISHER_METADATA_CANDIDATES)
     .collect::<Vec<_>>()
     .await;
-    let mut publisher_metadata = std::collections::HashMap::new();
     let mut unavailable = truncated;
     for (key, index, result) in results {
         match result {
@@ -283,12 +335,28 @@ async fn load_publisher_metadata(
                         &entries[index].contract,
                     ) =>
             {
+                if cache_published {
+                    context
+                        .publisher_metadata_cache
+                        .insert((entries[index].chain, key.clone()), metadata.clone())
+                        .await;
+                }
                 publisher_metadata.insert(key, metadata);
             }
             _ => unavailable = true,
         }
     }
     (publisher_metadata, unavailable)
+}
+
+pub(crate) async fn publisher_metadata_for_observation(
+    context: &Context,
+    chain: Chain,
+    target: &str,
+    observed: &TokenMeta,
+    entries: std::sync::Arc<Vec<Entry>>,
+) -> std::collections::HashMap<String, TokenMeta> {
+    load_publisher_metadata(context, chain, target, Some(observed), entries, true).await.0
 }
 
 fn append_read_log(target: &mut ReadLog, additional: ReadLog) {
@@ -350,19 +418,19 @@ async fn resolve_subject(
         // Solana account ownership and a plausible DEX layout do not prove
         // pool provenance. Treat an unindexed address as a token unless the
         // reader can establish derivation; indexed pools were handled above.
-        if chain != Chain::Solana {
-            if let Ok(pool) = reader.read_pool(address).await {
-                let (subject, metadata, pools) =
-                    resolve_pool_subject(reader, clock, chain, Some(pool), entries).await;
-                let unavailable = subject.is_empty();
-                return (
-                    subject,
-                    metadata,
-                    pools,
-                    crate::domain::guard::GuardSubjectType::Pool,
-                    unavailable,
-                );
-            }
+        if chain != Chain::Solana
+            && let Ok(pool) = reader.read_pool(address).await
+        {
+            let (subject, metadata, pools) =
+                resolve_pool_subject(reader, clock, chain, Some(pool), entries).await;
+            let unavailable = subject.is_empty();
+            return (
+                subject,
+                metadata,
+                pools,
+                crate::domain::guard::GuardSubjectType::Pool,
+                unavailable,
+            );
         }
         let metadata = reader.token_meta(address).await.ok();
         let mut pools = known_pools
@@ -686,7 +754,12 @@ mod tests {
             last_checked: "2026-10-01T00:00:00Z".to_owned(),
             removed_at: None,
             stale_since: None,
-            official_deployments: Vec::new(),
+            official_deployments: vec![crate::domain::registry::OfficialDeployment {
+                network: "Base".to_owned(),
+                address: TOKEN.to_owned(),
+                wrapper_address: None,
+                wrapper_address_v2: None,
+            }],
         }
     }
 
@@ -922,6 +995,43 @@ mod tests {
         assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 4);
         assert_eq!(second.reads.iter().filter(|read| read.method == "token_meta").count(), 2);
     }
+
+    #[tokio::test]
+    async fn statistics_publisher_metadata_reads_are_cached_by_official_contract() {
+        const CLONE: &str = "0x0000000000000000000000000000000000000005";
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = test_support::build(
+            vec![Box::new(GuardReader {
+                chain: Chain::Base,
+                pool: None,
+                metadata: HashMap::from([(
+                    TOKEN.to_owned(),
+                    meta(TOKEN, "NVDAx", "NVIDIA xStock"),
+                )]),
+                restrictions: Vec::new(),
+                wallet_applicable: true,
+                token_meta_reads: Some(std::sync::Arc::clone(&reads)),
+            })],
+            vec![entry()],
+            false,
+        );
+        let entries = std::sync::Arc::new(vec![entry()]);
+        let observed = meta(CLONE, "NVDAx", "NVIDIA xStock");
+        let first = publisher_metadata_for_observation(
+            &state,
+            Chain::Base,
+            CLONE,
+            &observed,
+            std::sync::Arc::clone(&entries),
+        )
+        .await;
+        let second =
+            publisher_metadata_for_observation(&state, Chain::Base, CLONE, &observed, entries)
+                .await;
+
+        assert_eq!(first, second);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
     #[tokio::test]
     async fn cross_chain_xstock_clone_is_denied_but_official_wrapper_matches() {
         const CLONE: &str = "0x0000000000000000000000000000000000000005";
@@ -1071,6 +1181,7 @@ mod tests {
         ]);
         let mut registered = entry();
         registered.contract = USD.to_owned();
+        registered.official_deployments[0].address = USD.to_owned();
         let mismatched = test_support::build(
             vec![Box::new(GuardReader {
                 chain: Chain::Base,

@@ -43,7 +43,7 @@
         <dt>Pool address</dt>
         <dd>
           <code class="pool-address-large">{{ certificate.pool_address }}</code>
-          <button class="copy-button" type="button" data-copy="{{ certificate.pool_address }}">Copy</button>
+          <button class="copy-button" type="button" data-copy="{{ certificate.pool_address }}" aria-label="Copy pool address" title="Copy pool address"><svg aria-hidden="true" focusable="false"><use href="/static/icons.svg#copy"></use></svg></button>
         </dd>
       </div>
       <div>
@@ -54,23 +54,19 @@
         <dt>Checked</dt>
         <dd>
           <time data-relative-time datetime="{{ certificate.checked_at }}">{{ certificate.checked_at }}</time>
-          <span aria-hidden="true"> · </span>
-          <time data-local-time datetime="{{ certificate.checked_at }}">{{ certificate.checked_at }}</time>
         </dd>
       </div>
       <div>
         <dt>Valid until</dt>
         <dd>
           <time data-relative-time datetime="{{ certificate.expires_at }}">{{ certificate.expires_at }}</time>
-          <span aria-hidden="true"> · </span>
-          <time data-local-time datetime="{{ certificate.expires_at }}">{{ certificate.expires_at }}</time>
         </dd>
       </div>
       <div>
         <dt>Serial</dt>
         <dd>
           <code>{{ certificate.serial }}</code>
-          <button class="copy-button" type="button" data-copy="{{ certificate.serial }}">Copy</button>
+          <button class="copy-button" type="button" data-copy="{{ certificate.serial }}" aria-label="Copy certificate serial" title="Copy certificate serial"><svg aria-hidden="true" focusable="false"><use href="/static/icons.svg#copy"></use></svg></button>
         </dd>
       </div>
       <div>
@@ -133,7 +129,7 @@
           <dt>Attestation id</dt>
           <dd>
             <code>{{ certificate.id }}</code>
-            <button class="copy-button" type="button" data-copy="{{ certificate.id }}">Copy</button>
+            <button class="copy-button" type="button" data-copy="{{ certificate.id }}" aria-label="Copy certificate ID" title="Copy certificate ID"><svg aria-hidden="true" focusable="false"><use href="/static/icons.svg#copy"></use></svg></button>
           </dd>
         </div>
         <div>

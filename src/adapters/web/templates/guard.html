@@ -8,13 +8,10 @@
 {% block canonical_url %}{{ public_url }}/guard{% endblock %}
 {% block canonical_link %}{{ public_url }}/guard{% endblock %}
 {% block content %}
-<section class="page-intro">
+<section class="page-intro guard-intro">
   <p class="eyebrow">Guard</p>
   <h1 class="page-title">Does this token or pool match its issuer-published contract?</h1>
-  <p>Is this token what it claims to be, and what can its issuer do to it?</p>
-  <p>QED checks tokens against the contract their issuer publishes. A pool is a contract where two tokens trade; the issuer registry lists the contract addresses each issuer has published.</p>
-  <p class="muted">For traders, app builders, and compliance teams. QED is read-only by design: it never holds keys, never submits transactions, and never recommends.</p>
-  <p class="muted">It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.</p>
+  <p>Is this token what it claims to be, and what can its issuer do to it? A pool is where two tokens trade; the registry lists each issuer's published contracts.</p>
 </section>
 <section class="lookup lookup-secondary" aria-label="Try a public Guard example">
   <h2>Try a public example</h2>
@@ -46,6 +43,7 @@
     <button class="button primary-button" type="submit">Review <span aria-hidden="true">→</span></button>
   </form>
 </section>
+<p class="guard-info-note">A signed, read-only review for traders, app builders, and compliance teams. QED is read-only by design: it never holds keys, never submits transactions, and never recommends. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.</p>
 <section class="lookup lookup-secondary">
   <h2>Use the API or an agent</h2>
   <p>Call <code>GET /api/guard/{address}?chain={chain}</code>, or prefer <code>POST /api/guard</code> with the wallet in a JSON body to keep it out of the URL. MCP agents can use <code>qed_check</code> to compare a pool or token with its issuer-published contract. The signed document can be checked with <code>POST /verify</code>.</p>

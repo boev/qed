@@ -108,12 +108,16 @@ pub(crate) mod evm {
     }
 
     pub(crate) fn analyze(snapshot: ProbeSnapshot) -> PowerFacts {
-        let mut facts = PowerFacts::default();
-        facts.source_is_proxy = snapshot.implementation.is_some()
-            || snapshot.admin.is_some()
-            || snapshot.beacon.is_some();
-        facts.source_target =
-            snapshot.implementation.clone().or_else(|| snapshot.beacon_implementation.clone());
+        let mut facts = PowerFacts {
+            source_is_proxy: snapshot.implementation.is_some()
+                || snapshot.admin.is_some()
+                || snapshot.beacon.is_some(),
+            source_target: snapshot
+                .implementation
+                .clone()
+                .or_else(|| snapshot.beacon_implementation.clone()),
+            ..Default::default()
+        };
         let pause_state = effective_paused(&snapshot);
         facts.token_paused = pause_state.map(|(paused, _)| paused);
         facts.sanctions_list = snapshot

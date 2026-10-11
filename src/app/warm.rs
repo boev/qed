@@ -18,12 +18,33 @@ use std::{
 };
 use tokio::sync::Notify;
 use tracing::info;
-
-pub(crate) const POWERS_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
-pub(crate) const POWERS_WARM_INTERVAL: Duration = Duration::from_secs(25 * 60);
-const POWERS_CACHE_REFRESH_AGE: Duration =
-    Duration::from_secs(POWERS_CACHE_TTL.as_secs() - POWERS_WARM_INTERVAL.as_secs());
+pub(crate) const HOT_POOLS: usize = 50;
+pub(crate) const HOT_TICKERS: usize = 25;
+pub(crate) const COLD_EVERY_N_PASSES: u32 = 4;
+pub(crate) const POWERS_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+pub(crate) const POWERS_WARM_INTERVAL: Duration = Duration::from_secs(100 * 60);
+const POWERS_CACHE_REFRESH_AGE: Duration = POWERS_WARM_INTERVAL;
 pub(crate) const POWERS_WARM_MAX_CONTRACTS: usize = 160;
+const COLD_WARM_REFRESH_AGE: Duration =
+    Duration::from_secs(POWERS_WARM_INTERVAL.as_secs() * COLD_EVERY_N_PASSES as u64);
+
+pub(crate) fn periodic_item_is_due(is_hot: bool, has_previous_check: bool, cold_due: bool) -> bool {
+    is_hot || !has_previous_check || cold_due
+}
+
+pub(crate) fn cold_refresh_is_due(
+    checked_at: Option<&str>,
+    now: &chrono::DateTime<Utc>,
+    interval: Duration,
+) -> bool {
+    checked_at
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|checked_at| {
+            now.signed_duration_since(checked_at.with_timezone(&Utc)).num_seconds()
+                >= i64::try_from(interval.as_secs()).unwrap_or(i64::MAX)
+        })
+        .unwrap_or(true)
+}
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct WarmChainSummary {
     pub(crate) ok: usize,
@@ -67,10 +88,13 @@ fn select_warm_targets(
     registry: &registry::Registry,
     tickers: &[String],
     max_contracts: usize,
+    cold_tickers: &HashSet<String>,
 ) -> WarmTargetSelection {
     let mut selection = WarmTargetSelection::default();
     let mut seen_contracts = HashSet::new();
+    let mut ranked_tickers = 0;
     for ticker in tickers {
+        let ticker_key = ticker.trim().to_ascii_uppercase();
         let mut ticker_targets = Vec::new();
         let mut ticker_contracts = HashSet::new();
         for entry in registry
@@ -86,6 +110,11 @@ fn select_warm_targets(
             }
         }
         if ticker_targets.is_empty() {
+            continue;
+        }
+        let is_hot = ranked_tickers < HOT_TICKERS;
+        ranked_tickers += 1;
+        if !periodic_item_is_due(is_hot, true, cold_tickers.contains(&ticker_key)) {
             continue;
         }
         if selection.targets.len().saturating_add(ticker_targets.len()) > max_contracts {
@@ -104,7 +133,26 @@ fn select_warm_targets(
 async fn current_warm_targets(state: &Context) -> WarmTargetSelection {
     let tickers = state.pool_index.warm_tickers().await;
     let registry = state.registry.snapshot().await;
-    select_warm_targets(&registry, &tickers, POWERS_WARM_MAX_CONTRACTS)
+    let ticker_keys =
+        tickers.iter().map(|ticker| ticker.trim().to_ascii_uppercase()).collect::<HashSet<_>>();
+    let now = state.clock.now();
+    let version = state.registry_version.load(Ordering::Acquire);
+    let mut cold_tickers = HashSet::new();
+    for entry in registry.iter().filter(|entry| {
+        registry::matchable(entry) && ticker_keys.contains(&entry.ticker.to_ascii_uppercase())
+    }) {
+        let Ok(contract) = canonical_contract(entry.chain, &entry.contract) else {
+            continue;
+        };
+        let key = (entry.chain, contract, version);
+        let cold_due = state.powers_cache.get(&key).await.is_none_or(|record| {
+            cold_refresh_is_due(Some(&record.observed_at), &now, COLD_WARM_REFRESH_AGE)
+        });
+        if cold_due {
+            cold_tickers.insert(entry.ticker.to_ascii_uppercase());
+        }
+    }
+    select_warm_targets(&registry, &tickers, POWERS_WARM_MAX_CONTRACTS, &cold_tickers)
 }
 
 pub(crate) async fn notify_powers_warm_if_targets(state: &Context, notify: &Notify) -> bool {
@@ -338,7 +386,7 @@ mod tests {
             ),
             warm_registry_entry(Chain::Solana, "FEAT", "11111111111111111111111111111111"),
         ];
-        let selection = select_warm_targets(&registry, &tickers, 3);
+        let selection = select_warm_targets(&registry, &tickers, 3, &HashSet::new());
         assert_eq!(
             selection.targets,
             [
@@ -348,10 +396,54 @@ mod tests {
             ]
         );
         assert_eq!(selection.tickers_covered, 2);
-        let exact_fill = select_warm_targets(&registry, &tickers[..2], 3);
+        let exact_fill = select_warm_targets(&registry, &tickers[..2], 3, &HashSet::new());
         assert_eq!(exact_fill.targets.len(), 3);
         assert!(!exact_fill.cap_hit);
         assert!(selection.cap_hit);
+    }
+
+    #[test]
+    fn periodic_selection_keeps_hot_items_and_new_items_due() {
+        assert!(periodic_item_is_due(true, true, false));
+        assert!(periodic_item_is_due(false, false, false));
+        assert!(periodic_item_is_due(false, true, true));
+        assert!(!periodic_item_is_due(false, true, false));
+    }
+
+    #[test]
+    fn cold_warm_refresh_is_due_after_four_warm_intervals() {
+        let now = Utc::now();
+        let cold_interval = Duration::from_secs(400 * 60);
+        assert_eq!(COLD_WARM_REFRESH_AGE, cold_interval);
+        let just_before = (now - chrono::Duration::seconds(cold_interval.as_secs() as i64 - 1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let due = (now - chrono::Duration::seconds(cold_interval.as_secs() as i64))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert!(!cold_refresh_is_due(Some(&just_before), &now, cold_interval));
+        assert!(cold_refresh_is_due(Some(&due), &now, cold_interval));
+        assert!(cold_refresh_is_due(None, &now, cold_interval));
+    }
+
+    #[test]
+    fn cold_warm_ticker_can_be_selected_for_initial_read_and_when_due() {
+        let tickers = (0..=HOT_TICKERS).map(|index| format!("T{index}")).collect::<Vec<_>>();
+        let registry = (0..=HOT_TICKERS)
+            .map(|index| {
+                warm_registry_entry(
+                    Chain::Base,
+                    &format!("T{index}"),
+                    &format!("0x{:040x}", index + 1),
+                )
+            })
+            .collect::<Vec<_>>();
+        let cold_ticker = format!("T{HOT_TICKERS}");
+        let not_due = select_warm_targets(&registry, &tickers, 64, &HashSet::new());
+        assert_eq!(not_due.targets.len(), HOT_TICKERS);
+        assert_eq!(not_due.tickers_covered, HOT_TICKERS);
+        let initial_read =
+            select_warm_targets(&registry, &tickers, 64, &HashSet::from([cold_ticker.clone()]));
+        assert_eq!(initial_read.targets.len(), HOT_TICKERS + 1);
+        assert_eq!(initial_read.tickers_covered, HOT_TICKERS + 1);
     }
 
     #[test]

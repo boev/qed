@@ -275,6 +275,53 @@ pub fn verify(document: &GuardDocument) -> Result<(), GuardVerifyError> {
     public_key.verify(&payload, &signature).map_err(|_| GuardVerifyError::SignatureInvalid)
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PublisherProductTier {
+    Confirmed,
+    #[default]
+    Caution,
+}
+
+/// Classifies observed contract metadata against the publisher's on-chain product metadata.
+/// Byte-exact identity is confirmed only when the publisher catalog is complete; normalized
+/// identity is a caution signal and never establishes a mismatch.
+pub fn classify_publisher_product(
+    observed: &TokenMeta,
+    published: &TokenMeta,
+    catalog_complete: bool,
+) -> Option<PublisherProductTier> {
+    if !metadata_complete(observed) || !metadata_complete(published) {
+        return None;
+    }
+    let exact = observed.symbol == published.symbol && observed.name == published.name;
+    if exact && catalog_complete {
+        return Some(PublisherProductTier::Confirmed);
+    }
+    (normalized_product_identity(observed.symbol.as_deref()?)
+        == normalized_product_identity(published.symbol.as_deref()?)
+        && normalized_product_identity(observed.name.as_deref()?)
+            == normalized_product_identity(published.name.as_deref()?))
+    .then_some(PublisherProductTier::Caution)
+}
+
+fn normalized_product_identity(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut pending_space = false;
+    for character in value.trim().chars().flat_map(char::to_lowercase) {
+        if character.is_whitespace() || matches!(character, '•' | '-' | '_') {
+            pending_space = !normalized.is_empty();
+        } else {
+            if pending_space {
+                normalized.push(' ');
+                pending_space = false;
+            }
+            normalized.push(character);
+        }
+    }
+    normalized
+}
+
 pub(crate) fn identify(
     chain: Chain,
     address: &str,
@@ -297,7 +344,31 @@ pub(crate) fn identify_with_contract_metadata(
     entries: &[Entry],
     publisher_metadata: &std::collections::HashMap<String, TokenMeta>,
 ) -> GuardIdentity {
-    let mut identity = identify_inner(chain, address, metadata, entries, publisher_metadata);
+    let complete_issuers = entries
+        .iter()
+        .filter(|entry| !entry.official_deployments.is_empty())
+        .map(|entry| entry.issuer.clone())
+        .collect::<std::collections::HashSet<_>>();
+    identify_with_catalog_status(
+        chain,
+        address,
+        metadata,
+        entries,
+        publisher_metadata,
+        &complete_issuers,
+    )
+}
+
+pub(crate) fn identify_with_catalog_status(
+    chain: Chain,
+    address: &str,
+    metadata: Option<&TokenMeta>,
+    entries: &[Entry],
+    publisher_metadata: &std::collections::HashMap<String, TokenMeta>,
+    complete_issuers: &std::collections::HashSet<String>,
+) -> GuardIdentity {
+    let mut identity =
+        identify_inner(chain, address, metadata, entries, publisher_metadata, complete_issuers);
     if let Some(metadata) = metadata {
         identity.observed_symbol.clone_from(&metadata.symbol);
         identity.observed_name.clone_from(&metadata.name);
@@ -311,6 +382,7 @@ fn identify_inner(
     metadata: Option<&TokenMeta>,
     entries: &[Entry],
     publisher_metadata: &std::collections::HashMap<String, TokenMeta>,
+    complete_issuers: &std::collections::HashSet<String>,
 ) -> GuardIdentity {
     if let Some(entry) = registry::lookup(entries, chain, address) {
         let mut identity = identity_for(entries, entry, IdentityStatus::Match);
@@ -335,38 +407,8 @@ fn identify_inner(
         registry::MatchStatus::Active | registry::MatchStatus::NotFound => {}
     }
 
-    if let Some(metadata) = metadata.filter(|metadata| metadata_complete(metadata)) {
-        for entry in entries.iter().filter(|entry| registry::matchable(entry)) {
-            if entry.chain == chain && same_contract(chain, address, &entry.contract) {
-                continue;
-            }
-            if !metadata_resembles_entry(metadata, entry)
-                && !metadata_claims_product_symbol(metadata, entry)
-            {
-                continue;
-            }
-            let Some(published) = publisher_metadata
-                .get(&issuer_metadata_key(entry.chain, &entry.contract))
-                .filter(|published| same_product_metadata(metadata, published))
-            else {
-                continue;
-            };
-            let Some(detail) =
-                unpublished_product_detail(entries, entry, chain, address, published)
-            else {
-                continue;
-            };
-            let mut identity = identity_for(entries, entry, IdentityStatus::Mismatch);
-            if entry.chain != chain {
-                identity.matched_contract = None;
-            }
-            identity.unpublished_product_detail = Some(detail);
-            return identity;
-        }
-    }
-
     let mut candidate = None;
-    if let Some(metadata) = metadata {
+    if let Some(metadata) = metadata.filter(|metadata| metadata_complete(metadata)) {
         for exact_ticker in [true, false] {
             for entry in entries {
                 if !registry::matchable(entry)
@@ -376,14 +418,30 @@ fn identify_inner(
                 {
                     continue;
                 }
-                if entry.chain == chain {
-                    let published =
-                        publisher_metadata.get(&issuer_metadata_key(entry.chain, &entry.contract));
-                    if is_contradicted_claim(chain, metadata, entry, published) {
-                        return identity_for(entries, entry, IdentityStatus::Mismatch);
+                let published =
+                    publisher_metadata.get(&issuer_metadata_key(entry.chain, &entry.contract));
+                let tier = published.and_then(|published| {
+                    classify_publisher_product(
+                        metadata,
+                        published,
+                        publisher_catalog_complete(entries, entry, complete_issuers),
+                    )
+                });
+                if tier == Some(PublisherProductTier::Confirmed)
+                    && let Some(published) = published
+                    && let Some(detail) =
+                        unpublished_product_detail(entries, entry, chain, address, published)
+                {
+                    let mut identity = identity_for(entries, entry, IdentityStatus::Mismatch);
+                    if entry.chain != chain {
+                        identity.matched_contract = None;
                     }
+                    identity.unpublished_product_detail = Some(detail);
+                    return identity;
                 }
-                candidate.get_or_insert(entry);
+                if tier == Some(PublisherProductTier::Caution) {
+                    candidate.get_or_insert(entry);
+                }
             }
         }
     }
@@ -429,14 +487,19 @@ pub(crate) fn metadata_claims_product_symbol(metadata: &TokenMeta, entry: &Entry
     })
 }
 
-fn same_product_metadata(left: &TokenMeta, right: &TokenMeta) -> bool {
-    if !metadata_complete(left) || !metadata_complete(right) {
-        return false;
-    }
-    normalized_identity(left.symbol.as_deref().unwrap())
-        == normalized_identity(right.symbol.as_deref().unwrap())
-        && normalized_identity(left.name.as_deref().unwrap())
-            == normalized_identity(right.name.as_deref().unwrap())
+pub(crate) fn publisher_catalog_complete(
+    entries: &[Entry],
+    entry: &Entry,
+    complete_issuers: &std::collections::HashSet<String>,
+) -> bool {
+    complete_issuers.contains(&entry.issuer)
+        && entries.iter().any(|candidate| {
+            registry::matchable(candidate)
+                && candidate.issuer == entry.issuer
+                && candidate.ticker == entry.ticker
+                && !candidate.official_deployments.is_empty()
+                && !registry::official_networks(candidate).is_empty()
+        })
 }
 
 fn unpublished_product_detail(
@@ -554,24 +617,6 @@ fn normalized_identity(value: &str) -> String {
         .filter(|character| character.is_ascii_alphanumeric())
         .map(|character| character.to_ascii_lowercase())
         .collect()
-}
-
-fn is_contradicted_claim(
-    chain: Chain,
-    metadata: &TokenMeta,
-    entry: &Entry,
-    published_metadata: Option<&TokenMeta>,
-) -> bool {
-    if same_contract(chain, &metadata.address, &entry.contract) || !metadata_complete(metadata) {
-        return false;
-    }
-    let Some(published) = published_metadata.filter(|value| metadata_complete(value)) else {
-        return false;
-    };
-    normalized_identity(metadata.symbol.as_deref().unwrap())
-        == normalized_identity(published.symbol.as_deref().unwrap())
-        && normalized_identity(metadata.name.as_deref().unwrap())
-            == normalized_identity(published.name.as_deref().unwrap())
 }
 
 fn no_publisher() -> GuardIdentity {
@@ -820,7 +865,12 @@ mod tests {
             last_checked: "2026-10-01T00:00:00Z".to_owned(),
             removed_at: None,
             stale_since: None,
-            official_deployments: Vec::new(),
+            official_deployments: vec![crate::domain::registry::OfficialDeployment {
+                network: "Base".to_owned(),
+                address: contract.to_owned(),
+                wrapper_address: None,
+                wrapper_address_v2: None,
+            }],
         }
     }
 
@@ -908,7 +958,94 @@ mod tests {
 
         assert_eq!(identity.status, IdentityStatus::Mismatch);
         assert_eq!(identity.matched_contract.as_deref(), Some(published.contract.as_str()));
+        let (verdict, reasons) = evaluate(&identity, Some(&powers()), None, SourceStatus::Verified);
+        assert_eq!(verdict, GuardVerdict::Deny);
+        assert!(
+            reasons.iter().any(|reason| { reason.code == "claims_unpublished_publisher_product" })
+        );
     }
+
+    #[test]
+    fn normalized_symbol_and_padded_name_remain_unknown_cautions() {
+        let published = entry("0x0000000000000000000000000000000000000002", "NVDA", "NVIDIA");
+        let published_metadata = metadata(&published.contract, "NVDAx", "NVIDIA xStock");
+        let publisher_metadata = std::collections::HashMap::from([(
+            issuer_metadata_key(Chain::Base, &published.contract),
+            published_metadata,
+        )]);
+        for (symbol, name) in [("NVDAX", "NVIDIA xStock"), ("NVDAx", " NVIDIA   xStock ")] {
+            let observed = metadata("0x0000000000000000000000000000000000000003", symbol, name);
+            let identity = identify_with_contract_metadata(
+                Chain::Base,
+                &observed.address,
+                Some(&observed),
+                std::slice::from_ref(&published),
+                &publisher_metadata,
+            );
+            let (verdict, reasons) =
+                evaluate(&identity, Some(&powers()), None, SourceStatus::Verified);
+            assert_eq!(identity.status, IdentityStatus::NoPublisher);
+            assert_eq!(verdict, GuardVerdict::Unknown);
+            assert!(reasons.iter().any(|reason| reason.code == "name_resembles_registry_entry"));
+        }
+    }
+
+    #[test]
+    fn exact_metadata_with_incomplete_catalog_remains_unknown() {
+        let mut published = entry("0x0000000000000000000000000000000000000002", "NVDA", "NVIDIA");
+        published.official_deployments.clear();
+        let observed =
+            metadata("0x0000000000000000000000000000000000000003", "NVDAx", "NVIDIA xStock");
+        let publisher_metadata = std::collections::HashMap::from([(
+            issuer_metadata_key(Chain::Base, &published.contract),
+            metadata(&published.contract, "NVDAx", "NVIDIA xStock"),
+        )]);
+        let identity = identify_with_contract_metadata(
+            Chain::Base,
+            &observed.address,
+            Some(&observed),
+            std::slice::from_ref(&published),
+            &publisher_metadata,
+        );
+        let (verdict, reasons) = evaluate(&identity, Some(&powers()), None, SourceStatus::Verified);
+        assert_eq!(identity.status, IdentityStatus::NoPublisher);
+        assert_eq!(verdict, GuardVerdict::Unknown);
+        assert!(reasons.iter().any(|reason| reason.code == "name_resembles_registry_entry"));
+    }
+
+    #[test]
+    fn robinhood_clone_address_still_denies_exact_published_identity() {
+        let clone_address = "0x9D70341316BE25ca3732A6351d443fcc8527910e";
+        let mut published = entry("0x0000000000000000000000000000000000000002", "NVDA", "NVIDIA");
+        published.chain = Chain::RobinhoodChain;
+        published.official_deployments = vec![crate::domain::registry::OfficialDeployment {
+            network: "Robinhood Chain".to_owned(),
+            address: published.contract.clone(),
+            wrapper_address: None,
+            wrapper_address_v2: None,
+        }];
+        let observed = metadata(clone_address, "NVDA", "NVIDIA • Robinhood Token");
+        let publisher_metadata = std::collections::HashMap::from([(
+            issuer_metadata_key(Chain::RobinhoodChain, &published.contract),
+            metadata(&published.contract, "NVDA", "NVIDIA • Robinhood Token"),
+        )]);
+        let identity = identify_with_contract_metadata(
+            Chain::RobinhoodChain,
+            clone_address,
+            Some(&observed),
+            std::slice::from_ref(&published),
+            &publisher_metadata,
+        );
+        let (verdict, reasons) = evaluate(&identity, Some(&powers()), None, SourceStatus::Verified);
+        assert_eq!(identity.observed_symbol.as_deref(), Some("NVDA"));
+        assert_eq!(identity.observed_name.as_deref(), Some("NVIDIA • Robinhood Token"));
+        assert_eq!(identity.status, IdentityStatus::Mismatch);
+        assert_eq!(verdict, GuardVerdict::Deny);
+        assert!(
+            reasons.iter().any(|reason| { reason.code == "claims_unpublished_publisher_product" })
+        );
+    }
+
     #[test]
     fn cross_chain_mismatch_never_labels_published_address_without_its_chain() {
         let mut published = entry("0x0000000000000000000000000000000000000001", "NVDA", "NVIDIA");

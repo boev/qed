@@ -60,8 +60,8 @@ pub(crate) async fn handle(
     let modern_request = has_protocol_metadata
         || header_text(&headers, "MCP-Protocol-Version") == Some(MODERN_PROTOCOL_VERSION);
     if modern_request {
-        if let Err(response) = validate_modern_request(&headers, method, params, &id) {
-            return response;
+        if let Err(error) = validate_modern_request(&headers, method, params) {
+            return error.into_response(&id);
         }
     } else if let Some(version) = header_text(&headers, "MCP-Protocol-Version")
         && !SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
@@ -144,65 +144,70 @@ fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok()
 }
 
-fn validate_modern_request(
+enum ModernRequestError<'a> {
+    InvalidParams(&'static str),
+    HeaderMismatch(&'static str),
+    UnsupportedVersion(&'a str),
+}
+
+impl ModernRequestError<'_> {
+    fn into_response(self, id: &Value) -> Response {
+        match self {
+            Self::InvalidParams(message) => {
+                rpc_error(id.clone(), -32602, message, StatusCode::BAD_REQUEST)
+            }
+            Self::HeaderMismatch(message) => {
+                rpc_error(id.clone(), -32020, message, StatusCode::BAD_REQUEST)
+            }
+            Self::UnsupportedVersion(requested) => {
+                unsupported_version_error(id.clone(), requested, StatusCode::BAD_REQUEST)
+            }
+        }
+    }
+}
+
+fn validate_modern_request<'a>(
     headers: &HeaderMap,
     method: &str,
-    params: &Value,
-    id: &Value,
-) -> Result<(), Response> {
-    let meta = params.get("_meta").and_then(Value::as_object).ok_or_else(|| {
-        rpc_error(
-            id.clone(),
-            -32602,
-            "Invalid params: request metadata must be an object",
-            StatusCode::BAD_REQUEST,
-        )
-    })?;
+    params: &'a Value,
+) -> Result<(), ModernRequestError<'a>> {
+    let meta = params.get("_meta").and_then(Value::as_object).ok_or(
+        ModernRequestError::InvalidParams("Invalid params: request metadata must be an object"),
+    )?;
     let version = meta
         .get("io.modelcontextprotocol/protocolVersion")
         .and_then(Value::as_str)
-        .ok_or_else(|| {
-            rpc_error(
-                id.clone(),
-                -32602,
-                "Invalid params: protocol version metadata must be a string",
-                StatusCode::BAD_REQUEST,
-            )
-        })?;
+        .ok_or(ModernRequestError::InvalidParams(
+            "Invalid params: protocol version metadata must be a string",
+        ))?;
     let Some(header_version) = header_text(headers, "MCP-Protocol-Version") else {
-        return Err(header_mismatch(id, "Missing MCP-Protocol-Version header"));
+        return Err(header_mismatch("Missing MCP-Protocol-Version header"));
     };
     if version != header_version {
-        return Err(header_mismatch(id, "Protocol version header does not match request metadata"));
+        return Err(header_mismatch("Protocol version header does not match request metadata"));
     }
     if !SUPPORTED_PROTOCOL_VERSIONS.contains(&version) {
-        return Err(unsupported_version_error(id.clone(), version, StatusCode::BAD_REQUEST));
+        return Err(ModernRequestError::UnsupportedVersion(version));
     }
     if !meta.get("io.modelcontextprotocol/clientCapabilities").is_some_and(Value::is_object) {
-        return Err(rpc_error(
-            id.clone(),
-            -32602,
-            "Missing client capabilities metadata",
-            StatusCode::BAD_REQUEST,
-        ));
+        return Err(ModernRequestError::InvalidParams("Missing client capabilities metadata"));
     }
     if header_text(headers, "Mcp-Method") != Some(method) {
-        return Err(header_mismatch(id, "Mcp-Method header does not match request method"));
+        return Err(header_mismatch("Mcp-Method header does not match request method"));
     }
     if method == "tools/call" {
         let Some(name) = params.get("name").and_then(Value::as_str) else {
-            return Err(rpc_error(
-                id.clone(),
-                -32602,
-                "Invalid params: name must be a string",
-                StatusCode::BAD_REQUEST,
-            ));
+            return Err(ModernRequestError::InvalidParams("Invalid params: name must be a string"));
         };
         if header_text(headers, "Mcp-Name") != Some(name) {
-            return Err(header_mismatch(id, "Mcp-Name header does not match request name"));
+            return Err(header_mismatch("Mcp-Name header does not match request name"));
         }
     }
     Ok(())
+}
+
+fn header_mismatch(message: &'static str) -> ModernRequestError<'static> {
+    ModernRequestError::HeaderMismatch(message)
 }
 
 fn initialize(id: Value, params: &Value) -> Response {
@@ -712,10 +717,6 @@ fn rpc_error(id: Value, code: i32, message: &str, status: StatusCode) -> Respons
         })),
     )
         .into_response()
-}
-
-fn header_mismatch(id: &Value, message: &str) -> Response {
-    rpc_error(id.clone(), -32020, message, StatusCode::BAD_REQUEST)
 }
 
 fn unsupported_version_error(id: Value, requested: &str, status: StatusCode) -> Response {

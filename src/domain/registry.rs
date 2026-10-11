@@ -46,6 +46,18 @@ fn deployment_network_matches(network: &str, chain: Chain) -> bool {
     Chain::from_network_name(network) == Some(chain)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentKey {
+    pub chain: Chain,
+    pub contract: String,
+}
+
+impl DeploymentKey {
+    pub fn new(chain: Chain, contract: &str) -> Self {
+        Self { chain, contract: normalize_contract(chain, contract) }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
@@ -83,14 +95,14 @@ pub struct SnapshotRejected {
     pub incoming: usize,
 }
 
-/// Replace one issuer's registry entries with a complete, validated snapshot.
-/// Entries omitted from a successful snapshot remain as tombstones so an old
-/// contract can no longer match by accident.
+/// Apply validated issuer entries, tombstoning omissions only for complete snapshots.
+/// Partial snapshots update known entries and add new ones without removing omissions.
 pub fn reconcile_snapshot(
     registry: &mut Registry,
     issuer: &str,
     incoming: impl IntoIterator<Item = Entry>,
     checked_at: &str,
+    tombstone_missing: bool,
 ) -> Result<usize, SnapshotRejected> {
     let incoming = incoming.into_iter().collect::<Vec<_>>();
     let previous =
@@ -107,10 +119,12 @@ pub fn reconcile_snapshot(
             incoming: incoming.len(),
         });
     }
-    for entry in registry.iter_mut().filter(|entry| entry.issuer == issuer) {
-        if !incoming_keys.contains(&key(entry)) {
-            entry.removed_at.get_or_insert_with(|| checked_at.to_owned());
-            entry.stale_since = None;
+    if tombstone_missing {
+        for entry in registry.iter_mut().filter(|entry| entry.issuer == issuer) {
+            if !incoming_keys.contains(&key(entry)) {
+                entry.removed_at.get_or_insert_with(|| checked_at.to_owned());
+                entry.stale_since = None;
+            }
         }
     }
     for mut entry in incoming {
@@ -217,8 +231,8 @@ pub fn lookup<'a>(registry: &'a [Entry], chain: Chain, contract: &str) -> Option
     })
 }
 
-fn key(entry: &Entry) -> (Chain, String) {
-    (entry.chain, normalize_contract(entry.chain, &entry.contract))
+fn key(entry: &Entry) -> DeploymentKey {
+    DeploymentKey::new(entry.chain, &entry.contract)
 }
 
 fn normalize_contract(chain: Chain, contract: &str) -> String {
@@ -283,7 +297,7 @@ mod tests {
         checked_at: &str,
     ) {
         let mut registry = original.clone();
-        assert!(reconcile_snapshot(&mut registry, "Test", incoming, checked_at).is_err());
+        assert!(reconcile_snapshot(&mut registry, "Test", incoming, checked_at, true).is_err());
         assert_eq!(registry, *original);
     }
 
@@ -347,7 +361,7 @@ mod tests {
         let mut registry = vec![entry("0xabc", "OLD"), entry("0xdef", "KEEP")];
         let mut replacement = entry("0xdef", "KEEP");
         replacement.last_checked = "2026-09-23T00:00:00Z".to_owned();
-        reconcile_snapshot(&mut registry, "Test", [replacement], "2026-09-23T00:00:00Z")
+        reconcile_snapshot(&mut registry, "Test", [replacement], "2026-09-23T00:00:00Z", true)
             .expect("complete snapshot");
         assert!(matches!(
             match_status(&registry, Chain::Ethereum, "0xabc"),
@@ -363,7 +377,8 @@ mod tests {
             vec![entry("0xabc", "A"), entry("0xdef", "B"), entry("0x123", "C")];
         let incoming = entry("0xabc", "A");
         assert!(
-            reconcile_snapshot(&mut registry, "Test", [incoming], "2026-09-23T00:00:00Z").is_err()
+            reconcile_snapshot(&mut registry, "Test", [incoming], "2026-09-23T00:00:00Z", true)
+                .is_err()
         );
         assert_eq!(registry.iter().filter(|item| matchable(item)).count(), 3);
     }

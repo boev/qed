@@ -50,7 +50,7 @@
     {% if powers.can_change_rules.len() > 0 %}<h3>Rule-change signals</h3><ul>{% for reason in powers.can_change_rules %}<li>{{ reason }}</li>{% endfor %}</ul>{% endif %}
     {% if powers.unavailable.len() > 0 %}<h3>Unavailable reads</h3><ul>{% for reason in powers.unavailable %}<li>{{ reason }}</li>{% endfor %}</ul>{% endif %}
   </details>
-  <p>{{ powers.source_verified_subject }}: {{ powers.source_verified }}{% if powers.source_verified_proxy.len() > 0 %}; proxy: {{ powers.source_verified_proxy }}{% endif %}. Observed at <time>{{ powers.observed_at }}</time>.</p>
+  <p>{{ powers.source_verified_subject }}: {{ powers.source_verified }}{% if powers.source_verified_proxy.len() > 0 %}; proxy: {{ powers.source_verified_proxy }}{% endif %}. Observed at <time datetime="{{ powers.observed_at }}">{{ powers.observed_at }}</time>.</p>
   {% else %}
   <p>Power evidence is unavailable for this review.</p>
   {% endif %}
@@ -73,7 +73,7 @@
   <h2 id="guard-pools-title">Known pools</h2>
   {% if pools.is_empty() %}<p>No matching pool facts are currently indexed.</p>{% else %}
   <div class="table-scroll"><table><thead><tr><th>Pool</th><th>Venue</th><th>Quote side</th><th>Check</th><th>Observed</th></tr></thead><tbody>
-  {% for pool in pools %}<tr><td><code>{{ pool.address }}</code></td><td>{{ pool.venue }}</td><td>{{ pool.quote }}</td><td>{{ pool.verdict }}</td><td>{{ pool.observed_at }}</td></tr>{% endfor %}
+  {% for pool in pools %}<tr><td><code>{{ pool.address }}</code></td><td>{{ pool.venue }}</td><td>{{ pool.quote }}</td><td>{{ pool.verdict }}</td><td><time datetime="{{ pool.observed_at }}">{{ pool.observed_at }}</time></td></tr>{% endfor %}
   </tbody></table></div>
   {% endif %}
 </section>

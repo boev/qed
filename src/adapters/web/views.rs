@@ -565,9 +565,23 @@ fn attestation_pair_label(attestation: &Attestation) -> String {
 pub(crate) struct LeaderboardPageView {
     pub(crate) rows: Vec<LeaderboardRowView>,
     pub(crate) json: String,
-    pub(crate) status_line: String,
-    pub(crate) status_tooltip: String,
     pub(crate) show_empty: bool,
+    pub(crate) building: bool,
+    pub(crate) prices_updated_at: String,
+    pub(crate) prices_updated_at_label: String,
+    pub(crate) refreshing: bool,
+}
+#[derive(Debug, Clone)]
+pub(crate) struct IntegrationChipView {
+    pub(crate) category: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) href: &'static str,
+    pub(crate) mark: &'static str,
+    pub(crate) icon: &'static str,
+    pub(crate) logo_src: &'static str,
+    pub(crate) number: Option<String>,
+    pub(crate) unit: &'static str,
+    pub(crate) empty_unit: &'static str,
 }
 
 #[derive(Debug)]
@@ -586,9 +600,10 @@ pub(crate) struct LeaderboardRowView {
     pub(crate) change_class: String,
     pub(crate) volume: String,
     pub(crate) liquidity: String,
-    pub(crate) source_label: String,
     pub(crate) detail_url: String,
     pub(crate) trade_url: String,
+    pub(crate) checked_at_title: String,
+    pub(crate) checked_at_stale: bool,
 }
 
 fn html_safe_json(value: &str) -> String {
@@ -599,10 +614,24 @@ fn html_safe_json(value: &str) -> String {
         .replace('\u{2028}', "\\u2028")
         .replace('\u{2029}', "\\u2029")
 }
+fn format_utc_timestamp(parsed: &chrono::DateTime<chrono::FixedOffset>) -> String {
+    parsed
+        .with_timezone(&chrono::Utc)
+        .format("%e %b %Y, %H:%M UTC")
+        .to_string()
+        .trim_start()
+        .to_owned()
+}
+
+fn utc_timestamp_label(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|parsed| format_utc_timestamp(&parsed))
+        .unwrap_or_else(|_| "—".to_owned())
+}
 
 impl LeaderboardPageView {
     pub(crate) fn from_value(value: Value) -> Self {
-        let rows = value
+        let rows: Vec<LeaderboardRowView> = value
             .get("entries")
             .and_then(Value::as_array)
             .into_iter()
@@ -610,39 +639,24 @@ impl LeaderboardPageView {
             .take(10)
             .map(LeaderboardRowView::from_value)
             .collect();
-        let updated_at = value.get("updated_at").and_then(Value::as_str).unwrap_or("");
-        let next_refresh_at = value.get("next_refresh_at").and_then(Value::as_str).unwrap_or("");
-        let prices_updated_at =
-            value.get("prices_updated_at").and_then(Value::as_str).unwrap_or("");
-        let source = value.get("source").and_then(Value::as_str).unwrap_or("QED");
-        let refreshing = value.get("refreshing").and_then(Value::as_bool).unwrap_or(false);
         let empty_successful =
             value.get("empty_successful").and_then(Value::as_bool).unwrap_or(false);
-        let has_entries = value
-            .get("entries")
-            .and_then(Value::as_array)
-            .is_some_and(|entries| !entries.is_empty());
-        let status_line = if refreshing {
-            "Updating…".to_owned()
-        } else if !has_entries && !empty_successful {
-            "Building the first board…".to_owned()
-        } else {
-            let freshness = relative_time(updated_at);
-            if is_stale(next_refresh_at) {
-                format!("Updated {freshness} · stale")
-            } else {
-                format!("Updated {freshness}")
-            }
-        };
-        let status_tooltip = format!(
-            "{source} · next refresh {} · prices updated {}",
-            refresh_time(next_refresh_at, refreshing),
-            relative_time(prices_updated_at)
-        );
+        let building = rows.is_empty() && !empty_successful;
+        let prices_updated_at = text(&value, "prices_updated_at");
+        let prices_updated_at_label = utc_timestamp_label(&prices_updated_at);
+        let refreshing = value.get("refreshing").and_then(Value::as_bool).unwrap_or(false);
         let json = serde_json::to_string(&value)
             .map(|json| html_safe_json(&json))
             .unwrap_or_else(|_| "{\"entries\":[]}".to_owned());
-        Self { rows, json, status_line, status_tooltip, show_empty: empty_successful }
+        Self {
+            rows,
+            json,
+            show_empty: empty_successful,
+            building,
+            prices_updated_at,
+            prices_updated_at_label,
+            refreshing,
+        }
     }
 }
 
@@ -660,7 +674,6 @@ impl LeaderboardRowView {
         } else {
             discovery::MarketSource::Dexscreener
         };
-        let source_label = source.label().to_owned();
         let trade_url = discovery::chain_from_dex_id(&chain)
             .map(|chain| {
                 discovery::canonical_market_url_for_source(
@@ -689,6 +702,14 @@ impl LeaderboardRowView {
             &quote_symbol,
             value.get("issuer_on_base").and_then(Value::as_bool),
         );
+        let checked_at = chrono::DateTime::parse_from_rfc3339(&text(value, "checked_at")).ok();
+        let checked_at_title = checked_at
+            .as_ref()
+            .map(|parsed| format!("Checked {}", format_utc_timestamp(parsed)))
+            .unwrap_or_else(|| "Not checked".to_owned());
+        let checked_at_stale = checked_at.as_ref().is_some_and(|parsed| {
+            chrono::Utc::now() - parsed.with_timezone(&chrono::Utc) > chrono::Duration::hours(24)
+        });
         Self {
             rank: text(value, "rank"),
             chain_icon,
@@ -717,9 +738,10 @@ impl LeaderboardRowView {
             change_class: change_class.to_owned(),
             volume: usd_label(number(value, "volume_24h_usd")),
             liquidity: usd_label(number(value, "liquidity_usd")),
-            source_label,
             detail_url,
             trade_url,
+            checked_at_title,
+            checked_at_stale,
         }
     }
 }
@@ -737,7 +759,7 @@ fn number(value: &Value, key: &str) -> Option<f64> {
     value.get(key).and_then(Value::as_f64).filter(|number| number.is_finite())
 }
 
-fn usd_label(value: Option<f64>) -> String {
+pub(crate) fn usd_label(value: Option<f64>) -> String {
     value.map(|number| format!("${}", format_number(number))).unwrap_or_else(|| "—".to_owned())
 }
 
@@ -775,13 +797,6 @@ fn relative_time(value: &str) -> String {
     } else {
         format!("in {text}")
     }
-}
-
-fn is_stale(next_refresh_at: &str) -> bool {
-    let Ok(next_refresh) = chrono::DateTime::parse_from_rfc3339(next_refresh_at) else {
-        return false;
-    };
-    chrono::Utc::now() >= next_refresh.with_timezone(&chrono::Utc)
 }
 
 fn refresh_time(value: &str, refreshing: bool) -> String {
@@ -845,17 +860,6 @@ pub(crate) struct ContentPageTemplate {
     pub(crate) body_html: String,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct WhatsNewView {
-    pub(crate) available: bool,
-    pub(crate) release_label: String,
-    pub(crate) headline: String,
-    pub(crate) changelog_href: String,
-    pub(crate) has_latest_blog: bool,
-    pub(crate) latest_blog_title: String,
-    pub(crate) latest_blog_href: String,
-}
-
 #[derive(Debug, Template)]
 #[template(path = "docs.html")]
 pub(crate) struct DocsPageTemplate {
@@ -869,7 +873,6 @@ pub(crate) struct DocsPageTemplate {
     pub(crate) canonical_path: String,
     pub(crate) active_sidebar: String,
     pub(crate) body_html: String,
-    pub(crate) whats_new: WhatsNewView,
 }
 
 #[derive(Debug, Template)]
@@ -877,9 +880,8 @@ pub(crate) struct DocsPageTemplate {
 pub(crate) struct IndexTemplate {
     pub(crate) asset_version: u64,
     pub(crate) public_url: String,
-    pub(crate) stats_line: String,
     pub(crate) leaderboard: LeaderboardPageView,
-    pub(crate) whats_new: WhatsNewView,
+    pub(crate) integration_chips: Vec<IntegrationChipView>,
 }
 
 #[derive(Debug, Template)]
@@ -901,13 +903,6 @@ pub(crate) struct TokenTemplate {
     pub(crate) contracts: Vec<DirectoryContractView>,
     pub(crate) pools: Vec<DirectoryPoolView>,
     pub(crate) json_ld: String,
-}
-
-#[derive(Debug, Template)]
-#[template(path = "wallet.html")]
-pub(crate) struct WalletTemplate {
-    pub(crate) asset_version: u64,
-    pub(crate) public_url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1024,15 +1019,6 @@ pub(crate) fn format_wallet_amount(raw: &str, decimals: Option<u8>) -> String {
 }
 
 #[derive(Debug, Template)]
-#[template(path = "wallet_holdings.html")]
-pub(crate) struct WalletHoldingsTemplate {
-    pub(crate) asset_version: u64,
-    pub(crate) public_url: String,
-    pub(crate) address: String,
-    pub(crate) holdings: Vec<WalletHoldingView>,
-}
-
-#[derive(Debug, Template)]
 #[template(path = "chain.html")]
 pub(crate) struct ChainTemplate {
     pub(crate) asset_version: u64,
@@ -1117,7 +1103,6 @@ pub(crate) struct GlossaryTemplate {
     pub(crate) meta_description: String,
     pub(crate) canonical_path: String,
     pub(crate) active_sidebar: String,
-    pub(crate) whats_new: WhatsNewView,
 }
 
 #[derive(Debug, Template)]
@@ -1132,7 +1117,6 @@ pub(crate) struct GuideVerifyTemplate {
     pub(crate) meta_description: String,
     pub(crate) canonical_path: String,
     pub(crate) active_sidebar: String,
-    pub(crate) whats_new: WhatsNewView,
 }
 
 #[derive(Debug)]
@@ -1975,7 +1959,7 @@ mod tests {
     }
 
     #[test]
-    fn geckoterminal_leaderboard_row_keeps_its_market_page_and_source_label() {
+    fn geckoterminal_leaderboard_row_keeps_its_market_page() {
         let pool = "0x0000000000000000000000000000000000000001";
         let trade_url = format!("https://www.geckoterminal.com/base/pools/{pool}");
         let row = LeaderboardRowView::from_value(&json!({
@@ -1984,7 +1968,6 @@ mod tests {
             "source": "geckoterminal",
             "trade_url": trade_url.clone(),
         }));
-        assert_eq!(row.source_label, "GeckoTerminal");
         assert_eq!(row.trade_url, trade_url);
     }
     #[test]
@@ -2014,18 +1997,6 @@ mod tests {
                 && link.url == "https://app.uniswap.org/explore/pools/ethereum/0xpool"
         }));
     }
-    #[test]
-    fn empty_first_board_shows_building_state() {
-        let view = LeaderboardPageView::from_value(json!({
-            "updated_at": "2026-09-26T00:00:00Z",
-            "next_refresh_at": "2026-09-26T00:05:00Z",
-            "entries": [],
-            "refreshing": false,
-            "empty_successful": false,
-        }));
-        assert_eq!(view.status_line, "Building the first board…");
-        assert!(!view.show_empty);
-    }
 
     #[test]
     fn successful_empty_board_shows_empty_state() {
@@ -2036,35 +2007,7 @@ mod tests {
             "refreshing": false,
             "empty_successful": true,
         }));
-        assert!(view.status_line.starts_with("Updated "));
         assert!(view.show_empty);
-    }
-
-    #[test]
-    fn stale_restored_board_keeps_rows_and_marks_stale() {
-        let view = LeaderboardPageView::from_value(json!({
-            "updated_at": "2020-01-01T00:00:00Z",
-            "next_refresh_at": "2026-09-26T00:05:00Z",
-            "entries": [{ "pool": "pool-1" }],
-            "refreshing": false,
-            "empty_successful": false,
-        }));
-        assert!(view.status_line.contains("stale"));
-        assert!(!view.show_empty);
-    }
-    #[test]
-    fn board_is_not_stale_before_its_scheduled_refresh() {
-        let now = chrono::Utc::now();
-        let updated_at = (now - chrono::Duration::hours(6)).to_rfc3339();
-        let next_refresh_at = (now + chrono::Duration::hours(1)).to_rfc3339();
-        let view = LeaderboardPageView::from_value(json!({
-            "updated_at": updated_at,
-            "next_refresh_at": next_refresh_at,
-            "entries": [{ "pool": "stale-but-scheduled", "verdict": "verified" }],
-            "refreshing": false
-        }));
-        assert!(view.status_line.starts_with("Updated "));
-        assert!(!view.status_line.contains("stale"));
     }
 
     #[test]

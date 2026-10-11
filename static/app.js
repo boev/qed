@@ -7,60 +7,24 @@
 
   const setActiveNav = () => {
     const current = window.location.pathname.replace(/\/$/, '') || '/';
-    document.querySelectorAll('.site-nav a[href]').forEach((link) => {
-      const target = new URL(link.href, window.location.origin).pathname.replace(/\/$/, '') || '/';
-      const active = target === '/' ? current === '/' : current === target || current.startsWith(`${target}/`);
-      link.toggleAttribute('aria-current', active);
+    const links = [...document.querySelectorAll('[data-main-nav] a[href]')];
+    const targetOf = (link) => new URL(link.href, window.location.origin).pathname.replace(/\/$/, '') || '/';
+    const matches = (target) => (target === '/' ? current === '/' : current === target || current.startsWith(`${target}/`));
+    // Only the most specific match is current, so /docs/llm marks "MCP setup", not also "Documentation".
+    const best = links.map(targetOf).filter(matches).reduce((longest, target) => (target.length > longest.length ? target : longest), '');
+    links.forEach((link) => {
+      if (best && targetOf(link) === best) link.setAttribute('aria-current', 'page');
+      else link.removeAttribute('aria-current');
     });
   };
 
-  const formatRelative = (date) => {
-    const seconds = Math.round((Date.now() - date.getTime()) / 1000);
-    const future = seconds < 0;
-    const amount = Math.abs(seconds);
-    let value;
-    let unit;
-    if (amount < 45) return 'just now';
-    if (amount < 90) {
-      value = 1;
-      unit = 'min';
-    } else if (amount < 3600) {
-      value = Math.round(amount / 60);
-      unit = 'min';
-    } else if (amount < 86400) {
-      value = Math.round(amount / 3600);
-      unit = 'h';
-    } else {
-      value = Math.round(amount / 86400);
-      unit = 'd';
-    }
-    const text = `${value} ${unit}${value === 1 ? '' : ''}`;
-    return future ? `in ${text}` : `${text} ago`;
-  };
 
   const formatTimes = (root = document) => {
-    root.querySelectorAll?.('time[data-relative-time]').forEach((time) => {
+    root.querySelectorAll?.('time[datetime]').forEach((time) => {
       const raw = time.getAttribute('datetime') || '';
-      const parsed = new Date(raw);
-      if (Number.isNaN(parsed.getTime())) return;
-      time.title = new Intl.DateTimeFormat(undefined, {
-        dateStyle: 'medium',
-        timeStyle: 'medium',
-      }).format(parsed);
-      const nerdRoot = time.closest('[data-nerd-root]');
-      time.textContent = nerdRoot?.classList.contains('is-nerd') ? raw : formatRelative(parsed);
-    });
-    root.querySelectorAll?.('time[data-local-time]').forEach((time) => {
-      const raw = time.getAttribute('datetime') || '';
-      const parsed = new Date(raw);
-      if (Number.isNaN(parsed.getTime())) return;
-      time.textContent = new Intl.DateTimeFormat(undefined, {
-        dateStyle: 'medium',
-        timeStyle: 'short',
-      }).format(parsed);
+      if (raw) time.title = raw;
     });
   };
-  window.__qedFormatRelative = formatRelative;
   window.__qedFormatTimes = formatTimes;
   let registryTickers = null;
   let registryTickersPromise = null;
@@ -173,11 +137,11 @@
     const tickerInput = document.getElementById('ticker');
     if (tickerInput && !event.target.closest('.ticker-combobox')) closeTickerSuggestions(tickerInput);
     const row = event.target.closest('.leaderboard-row[data-detail-url]');
-    if (row && !event.target.closest('a')) {
+    if (row && row.dataset.vueRow !== 'true' && !event.target.closest('a')) {
       window.location.href = row.dataset.detailUrl;
       return;
     }
-    const toggle = event.target.closest('#theme-toggle');
+    const toggle = event.target.closest('[data-theme-toggle]');
     if (toggle) {
       const root = document.documentElement;
       const followsDarkSystem =
@@ -209,9 +173,40 @@
     if (!copy) return;
     event.preventDefault();
     copyText(copy.dataset.copy || '').then(() => {
-      const old = copy.textContent;
-      copy.textContent = 'Copied';
-      window.setTimeout(() => { copy.textContent = old; }, 1200);
+      const oldLabel = copy.dataset.copyOriginalLabel
+        || copy.getAttribute('aria-label')
+        || copy.textContent;
+      const oldText = copy.dataset.copyOriginalText || copy.textContent;
+      const oldTitle = copy.dataset.copyOriginalTitle || copy.getAttribute('title') || '';
+      copy.dataset.copyOriginalLabel = oldLabel || '';
+      copy.dataset.copyOriginalText = oldText || '';
+      copy.dataset.copyOriginalTitle = oldTitle;
+      copy.setAttribute('aria-label', 'Copied');
+      copy.setAttribute('title', 'Copied');
+      const icon = copy.querySelector('use');
+      if (icon) {
+        copy.classList.add('is-copied');
+        icon.setAttribute('href', '/static/icons.svg#check');
+      } else {
+        copy.textContent = 'Copied';
+      }
+      const status = document.getElementById('copy-status');
+      if (status) status.textContent = 'Copied';
+      window.clearTimeout(Number(copy.dataset.copyFeedbackTimer));
+      copy.dataset.copyFeedbackTimer = String(window.setTimeout(() => {
+        if (oldLabel) copy.setAttribute('aria-label', oldLabel);
+        else copy.removeAttribute('aria-label');
+        if (oldTitle) copy.setAttribute('title', oldTitle);
+        else copy.removeAttribute('title');
+        if (icon) {
+          copy.classList.remove('is-copied');
+          icon.setAttribute('href', '/static/icons.svg#copy');
+        } else {
+          copy.textContent = oldText;
+        }
+        if (status) status.textContent = '';
+        delete copy.dataset.copyFeedbackTimer;
+      }, 1200));
     });
   };
 
@@ -245,11 +240,35 @@
       }
     }
     if (event.key !== 'Enter' && event.key !== ' ') return;
-    const row = event.target.closest?.('.leaderboard-row[data-detail-url]');
-    if (!row || event.target.closest('a')) return;
+    const target = event.target instanceof Element ? event.target : null;
+    const row = target?.closest('.leaderboard-row[data-detail-url]');
+    if (!row || row.dataset.vueRow === 'true' || target.closest('a')) return;
     event.preventDefault();
     window.location.href = row.dataset.detailUrl;
   };
+
+  const initIntegrationMarquee = () => {
+    const track = document.querySelector('.integration-track');
+    const firstSet = track?.querySelector('.integration-set:not(.integration-set--clone)');
+    if (!track || !firstSet) return;
+    const width = firstSet.getBoundingClientRect().width;
+    if (width <= 0) return;
+    for (const sheet of document.styleSheets) {
+      if (!sheet.href || new URL(sheet.href, document.baseURI).origin !== window.location.origin) continue;
+      let rules;
+      try {
+        rules = sheet.cssRules;
+      } catch (_error) {
+        continue;
+      }
+      for (const rule of rules) {
+        if (rule.selectorText !== '.integration-track') continue;
+        rule.style.setProperty('--marquee-duration', `${width / 25}s`);
+        return;
+      }
+    }
+  };
+  window.addEventListener('resize', initIntegrationMarquee, { passive: true });
 
   const boot = () => {
     const saved = localStorage.getItem('qed-theme');
@@ -257,6 +276,7 @@
     setActiveNav();
     formatTimes();
     initTickerLookup();
+    initIntegrationMarquee();
     const params = new URLSearchParams(window.location.search);
     if (params.get('hero') === 'open') document.documentElement.classList.add('hero-open');
     if (params.get('nerd') === '1') {
@@ -293,17 +313,33 @@
       }, 0);
     }
   });
+  const navMenus = () => document.querySelectorAll('details.docs-menu[open], details.mobile-nav-menu[open]');
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    navMenus().forEach((menu) => {
+      menu.open = false;
+      menu.querySelector('summary')?.focus();
+    });
+  });
+  document.addEventListener('click', (event) => {
+    navMenus().forEach((menu) => {
+      if (!menu.contains(event.target)) menu.open = false;
+    });
+  });
   document.addEventListener('DOMContentLoaded', boot, { once: true });
   document.addEventListener('htmx:afterSettle', () => {
     setActiveNav();
     formatTimes();
     initTickerLookup();
+    initIntegrationMarquee();
     window.__qedLeaderboardBoot?.();
   });
   document.addEventListener('htmx:historyRestore', () => {
     setActiveNav();
     formatTimes();
     initTickerLookup();
+    initIntegrationMarquee();
+    window.__qedLeaderboardBoot?.();
   });
   boot();
 })();

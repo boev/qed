@@ -77,13 +77,11 @@
         const currentPage = ref(initialPage);
         const sortKey = ref('volume');
         const descending = ref(true);
+        const isRefreshing = ref(false);
         const flashCells = ref(new Map());
         let fullRefreshTimer;
         let flashTimer;
-        let statusTimer;
         let requestNumber = 0;
-        const statusTick = ref(Date.now());
-        const pricesUpdatedAt = ref(initialPayload.prices_updated_at || '');
         const numberValue = (value) => {
           if (value === null || value === undefined || value === '') return null;
           const number = typeof value === 'number' ? value : Number(value);
@@ -142,7 +140,6 @@
             per: nextPer,
             total: nextTotal,
           };
-          if (next.prices_updated_at) pricesUpdatedAt.value = next.prices_updated_at;
           currentPage.value = nextPage;
           if (changed.size) {
             flashCells.value = changed;
@@ -153,6 +150,7 @@
 
         const fetchLeaderboard = async () => {
           const request = ++requestNumber;
+          isRefreshing.value = true;
           const params = new URLSearchParams({
             page: String(currentPage.value),
             per: String(perPage),
@@ -167,6 +165,8 @@
             replacePayload(await response.json());
           } catch (_error) {
             // Keep the last complete snapshot visible when a refresh is unavailable.
+          } finally {
+            if (request === requestNumber) isRefreshing.value = false;
           }
         };
 
@@ -201,41 +201,29 @@
             compactDisplay: 'short',
           }).format(number)}`;
         };
-
         const percentLabel = (value) => {
           const number = numberValue(value);
           if (number === null) return '—';
           return `${number >= 0 ? '+' : ''}${number.toFixed(2)}%`;
         };
 
-        const statusLabel = computed(() => {
-          statusTick.value;
-          const relative = window.__qedFormatRelative || (() => '—');
-          const updatedDate = new Date(payload.value.updated_at || '');
-          const nextDate = new Date(payload.value.next_refresh_at || '');
-          const priceDate = new Date(pricesUpdatedAt.value || '');
-          const hasEntries = Array.isArray(payload.value.entries) && payload.value.entries.length > 0;
-          const emptyState = payload.value.refreshing
-            ? 'Updating…'
-            : !hasEntries && !payload.value.empty_successful
-              ? 'Building the first board…'
-              : null;
-          const nextText = payload.value.refreshing
-            || Number.isNaN(nextDate.getTime())
-            || nextDate.getTime() <= statusTick.value
-            ? 'updating now'
-            : relative(nextDate);
-          const updatedText = Number.isNaN(updatedDate.getTime())
-            ? '—'
-            : `${relative(updatedDate)}${Date.now() - updatedDate.getTime() >= 3_600_000 ? ' · stale' : ''}`;
-          return {
-            emptyState,
-            updatedText,
-            nextText,
-            pricesText: Number.isNaN(priceDate.getTime()) ? '—' : relative(priceDate),
-          };
-        });
-
+        const formatUtcTimestamp = (value) => {
+          const date = new Date(value);
+          if (!Number.isFinite(date.getTime())) return '—';
+          const day = new Intl.DateTimeFormat('en-GB', {
+            day: 'numeric',
+            month: 'short',
+            year: 'numeric',
+            timeZone: 'UTC',
+          }).format(date);
+          const time = new Intl.DateTimeFormat('en-GB', {
+            hour: '2-digit',
+            minute: '2-digit',
+            hourCycle: 'h23',
+            timeZone: 'UTC',
+          }).format(date);
+          return `${day}, ${time} UTC`;
+        };
         const sealIcon = (verdict) => {
           if (verdict === 'verified') return 'qed-seal-verified';
           if (verdict === 'mismatch' || verdict === 'nomatch') return 'qed-seal-broken';
@@ -262,37 +250,42 @@
         onMounted(() => {
           fetchLeaderboard();
           fullRefreshTimer = window.setInterval(fetchLeaderboard, fullRefreshInterval);
-          statusTimer = window.setInterval(() => {
-            statusTick.value = Date.now();
-          }, 1_000);
         });
         onUpdated(() => {
           window.__qedFormatTimes?.();
         });
         onBeforeUnmount(() => {
           window.clearInterval(fullRefreshTimer);
-          window.clearInterval(statusTimer);
+          
           window.clearTimeout(flashTimer);
         });
 
         return () => {
           const h = Vue.h;
-          const sortButton = (key, label) => h('button', {
+          const sortButton = (key, label, accessibleLabel = label) => h('button', {
             type: 'button',
             class: ['sort-button', { 'is-sorted': sortKey.value === key }],
             onClick: () => updateSort(key),
-            'aria-label': `Sort by ${label}`,
-          }, [label, h('span', { 'aria-hidden': 'true' },
+            'aria-label': `Sort by ${accessibleLabel}`,
+          }, [h('span', { class: 'sort-label' }, label), h('span', { 'aria-hidden': 'true' },
             sortKey.value === key ? (descending.value ? ' ↓' : ' ↑') : ' ↕')]);
           const header = h('thead', {}, [
             h('tr', {}, [
-              h('th', { scope: 'col', class: 'rank-cell' }, 'Rank'),
+              h('th', { scope: 'col', class: 'rank-cell', 'aria-label': 'Rank' }, [
+                h('span', { class: 'leaderboard-heading--desktop' }, 'Rank'),
+                h('span', { class: 'leaderboard-heading--mobile' }, '#'),
+              ]),
               h('th', { scope: 'col' }, 'Pair'),
-              h('th', { scope: 'col' }, 'Chain'),
+              h('th', { scope: 'col', 'aria-label': 'Chain' }, 'Chain'),
               h('th', { scope: 'col' }, 'Venue'),
               h('th', { scope: 'col' }, 'Verdict'),
               h('th', { scope: 'col' }, [sortButton('price', 'Price')]),
-              h('th', { scope: 'col' }, [sortButton('change', '24h change')]),
+              h('th', { scope: 'col', 'aria-label': '24h change' }, [
+                sortButton('change', [
+                  h('span', { class: 'leaderboard-heading--desktop' }, '24h change'),
+                  h('span', { class: 'leaderboard-heading--mobile' }, '24h'),
+                ], '24h change'),
+              ]),
               h('th', { scope: 'col' }, [sortButton('volume', '24h volume')]),
               h('th', { scope: 'col' }, [sortButton('liquidity', 'Liquidity')]),
               h('th', { scope: 'col', class: 'trade-heading' }, [
@@ -309,6 +302,13 @@
             const detailUrl = row.detail_url || `/validated/${row.chain}/${row.pool}`;
             const tradeUrl = row.trade_url || '';
             const changeLabel = `${change !== null && change > 0 ? '↑ ' : change !== null && change < 0 ? '↓ ' : ''}${percentLabel(change)}`;
+            const checkedAt = typeof row.checked_at === 'string' ? row.checked_at : '';
+            const checkedTime = Date.parse(checkedAt);
+            const checkIsStale = Number.isFinite(checkedTime)
+              && Date.now() - checkedTime > 86_400_000;
+            const checkedTitle = Number.isFinite(checkedTime)
+              ? `Checked ${formatUtcTimestamp(checkedAt)}`
+              : 'Not checked';
             return h('tr', {
               key: `${row.chain}:${row.pool}`,
               class: 'leaderboard-row',
@@ -316,6 +316,7 @@
               role: 'link',
               'aria-label': `${row.base_symbol || 'Unknown'} / ${row.quote_symbol || 'Unknown'}`,
               'data-detail-url': detailUrl,
+              'data-vue-row': 'true',
               onClick: (event) => {
                 if (!event.target.closest('a')) window.location.href = detailUrl;
               },
@@ -344,17 +345,14 @@
                 ]),
               ]),
               h('td', { class: 'venue-cell', 'data-label': 'Venue' }, venueLabel(row.dex)),
-              h('td', { 'data-label': 'Verdict' }, [
+              h('td', { 'data-label': 'Verdict', title: checkedTitle }, [
                 h('span', {
                   class: ['seal-label', `is-${row.verdict || 'unknown'}`],
-                  title: row.verdict === 'verified'
-                    ? 'contract match only, not custody, price or endorsement'
-                    : undefined,
                 }, [
                   h('svg', { class: 'seal-icon', 'aria-hidden': 'true' }, [
                     h('use', { href: `/static/icons.svg#${sealIcon(row.verdict)}` }),
                   ]),
-                  h('span', {}, verdictLabel(row.verdict)),
+                  h('span', {}, `${verdictLabel(row.verdict)}${checkIsStale ? ' · stale' : ''}`),
                 ]),
               ]),
               metricCell(row, 'price_usd', 'Price', row.price_usd, '$'),
@@ -370,21 +368,26 @@
               metricCell(row, 'liquidity_usd', 'Liquidity', row.liquidity_usd, '$'),
               h('td', { class: 'trade-cell', 'data-label': 'Market' }, tradeUrl ? [
                 h('a', {
+                  class: 'market-link',
                   href: tradeUrl,
-                  title: row.verdict === 'verified'
-                    ? 'contract match only, not custody, price or endorsement'
-                    : undefined,
+                  title: 'External market page; QED checks contract match only.',
+                  'aria-label': `Open market page for ${row.base_symbol || 'Unknown'} / ${row.quote_symbol || 'Unknown'}`,
                   target: '_blank',
                   rel: 'noopener noreferrer',
                   onClick: (event) => event.stopPropagation(),
-                }, ['Market', h('span', { 'aria-hidden': 'true' }, ' ↗')]),
+                }, [
+                  h('span', { class: 'market-label' }, 'Market'),
+                  h('span', { class: 'market-icon', 'aria-hidden': 'true' }, '↗'),
+                ]),
               ] : '—'),
             ]);
           });
-          if (!rows.length && payload.value.empty_successful) {
+          if (!rows.length) {
             rows.push(h('tr', {}, [
               h('td', { colspan: '10', class: 'leaderboard-empty' },
-                'No stock-paired pools are available right now.'),
+                payload.value.empty_successful
+                  ? 'No stock-paired pools are available right now.'
+                  : 'Building the first board…'),
             ]));
           }
           const pagination = h('nav', {
@@ -409,27 +412,33 @@
               'aria-label': 'Next page',
             }, 'Next'),
           ]);
+          const pricesUpdatedAt = typeof payload.value.prices_updated_at === 'string'
+            ? payload.value.prices_updated_at
+            : '';
+          const updating = isRefreshing.value || Boolean(payload.value.refreshing);
+          const sourceNote = h('p', {
+            class: 'leaderboard-source-note',
+            'aria-live': 'polite',
+          }, [
+            'Prices updated ',
+            h('time', {
+              datetime: pricesUpdatedAt,
+              title: pricesUpdatedAt,
+            }, formatUtcTimestamp(pricesUpdatedAt)),
+            ' · contract checks: top 50 every 6 h, others daily',
+            updating ? ' · Updating leaderboard…' : '',
+            ' · Verified = the quote-side contract matches the issuer-published contract; not proof of backing, custody, price or safety. Prices, volume and liquidity from DexScreener and GeckoTerminal.',
+          ]);
           return h('div', {}, [
             h('div', { class: 'leaderboard-table-wrap' }, [
-              h('table', { class: 'leaderboard-table stack-table' }, [
+              h('table', { class: 'leaderboard-table' }, [
                 h('caption', { class: 'visually-hidden' }, 'Live stock-paired token leaderboard'),
                 header,
                 h('tbody', {}, rows),
               ]),
             ]),
-            h('p', { class: 'contract-match-footnote' },
-              'Verified means contract match only: not custody, price or endorsement.'),
-            h('p', { class: 'leaderboard-status', 'aria-live': 'polite' },
-              statusLabel.value.emptyState || [
-                'Prices and volume from DexScreener, prices ',
-                statusLabel.value.pricesText,
-                ' · updated ',
-                statusLabel.value.updatedText,
-                ' · next ',
-                statusLabel.value.nextText,
-                '. Verdicts read from chain.',
-              ]),
             pagination,
+            sourceNote,
           ]);
         };
       },

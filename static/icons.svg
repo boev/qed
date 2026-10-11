@@ -6,7 +6,7 @@
       <path d="m7.5 11.5 3 3 6-6" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
     </symbol>
     <symbol id="qed-seal-verified" viewBox="0 0 24 24">
-      <circle cx="12" cy="12" r="9" fill="#14F195"/>
+      <circle cx="12" cy="12" r="9" fill="currentColor"/>
       <path d="M7 12.5 10.5 16 17.5 8.5" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
     </symbol>
     <symbol id="qed-seal-broken" viewBox="0 0 24 24">
@@ -32,5 +32,6 @@
     <symbol id="sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
     <symbol id="moon" viewBox="0 0 24 24"><path d="M20 15.7A8.5 8.5 0 0 1 8.3 4a8.5 8.5 0 1 0 11.7 11.7Z"/></symbol>
     <symbol id="copy" viewBox="0 0 24 24"><path d="M8 8V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-3v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2h3Zm-3 2v9h7v-9H5Zm6-4v2h3a2 2 0 0 1 2 2v3h3V6h-8Z"/></symbol>
+    <symbol id="check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   </defs>
 </svg>

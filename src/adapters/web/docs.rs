@@ -24,6 +24,8 @@ mod discoverability {
 
 QED checks tokens that claim to be something against the contract their issuer publishes. Re-check certificates after expiry or when the issuer registry changes. It is read-only by design: it never holds keys, submits transactions, or recommends. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.
 
+Contact: contact@web3-energy.com
+
 ## Docs
 - [Documentation hub]({base}/docs): contract-first verification guide.
 - [API quick start]({base}/docs/api-quick-start): three curl examples.
@@ -68,12 +70,14 @@ QED checks tokens that claim to be something against the contract their issuer p
         let body_html = super::openapi::render_api_reference_html();
         super::super::pages::docs_content_page(
             &state,
-            "API reference",
-            "REFERENCE",
-            "How can software check an issuer-published token contract?",
-            "QED checks tokens that claim to be something against the contract their issuer publishes. This API guide documents the machine-readable checks, signed reviews, and verification routes.",
-            "QED API operations, parameters, and JSON examples generated from the OpenAPI document.",
-            "/api",
+            super::super::pages::PageMetadata {
+                page_title: "API reference",
+                heading: "How can software check an issuer-published token contract?",
+                eyebrow: "REFERENCE",
+                intro: "QED checks tokens that claim to be something against the contract their issuer publishes. This API guide documents the machine-readable checks, signed reviews, and verification routes.",
+                meta_description: "QED API operations, parameters, and JSON examples generated from the OpenAPI document.",
+                canonical_path: "/api",
+            },
             "api",
             body_html,
         )
@@ -459,7 +463,7 @@ mod openapi {
         "summary": "Download statistics CSV",
         "responses": {
           "200": {
-            "description": "CSV whose first record embeds the exact signed stats JSON document",
+            "description": "CSV whose first record embeds the exact signed stats JSON document; publisher_catalog_absent_token rows append their confirmed or caution tier as the final field",
             "content": {
               "text/csv": {
                 "schema": { "type": "string" },
@@ -1664,7 +1668,7 @@ mod openapi {
       "CatalogAbsentToken": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["chain", "chain_label", "ticker", "publisher", "source", "symbol", "name", "address", "first_seen_at", "last_seen_at", "volume_24h_usd", "guard_url", "reason", "reads", "evidence_truncated"],
+        "required": ["chain", "chain_label", "ticker", "publisher", "source", "symbol", "name", "address", "first_seen_at", "last_seen_at", "tier", "volume_24h_usd", "guard_url", "reason", "reads", "evidence_truncated"],
         "properties": {
           "chain": { "type": "string", "maxLength": 32 },
           "chain_label": { "type": "string", "maxLength": 64 },
@@ -1675,8 +1679,11 @@ mod openapi {
           "name": { "type": "string", "maxLength": 64, "description": "Reported by the source named in source." },
           "address": { "type": "string", "maxLength": 128 },
           "first_seen_at": { "type": "string", "format": "date-time", "maxLength": 64 },
+          "tier": { "type": "string", "enum": ["confirmed", "caution"], "description": "confirmed requires byte-exact on-chain symbol/name identity and a complete publisher catalog; caution is a normalized near match or an incomplete catalog and never denies." },
           "last_seen_at": { "type": "string", "format": "date-time", "maxLength": 64 },
           "volume_24h_usd": { "type": ["number", "null"], "minimum": 0, "description": "Reported by the source named in source; not independently validated." },
+          "liquidity_24h_usd": { "type": ["number", "null"], "minimum": 0, "description": "Reported by the source named in source; absent on legacy observations." },
+          "pool_count": { "type": ["integer", "null"], "minimum": 1, "description": "Unique matching candidate pools returned in the same publisher-watch scan; absent on legacy observations." },
           "guard_url": { "type": "string", "maxLength": 200 },
           "reason": { "type": "string", "maxLength": 256 },
           "reads": { "type": "array", "maxItems": 4, "items": { "$ref": "#/components/schemas/ObservedRead" }, "description": "Identity-determining token symbol/name reads at the queried address (or Solana metadata reads tied to that mint). Each retained params and raw_result value is bounded to 512 serialized bytes. Other Guard reads are available from guard_url and are not duplicated here." },
@@ -2542,7 +2549,7 @@ mod openapi {
             if parameter.get("in").and_then(Value::as_str) == Some("path") {
                 let name = parameter.get("name").and_then(Value::as_str).unwrap_or("");
                 example_path =
-                    example_path.replace(&format!("{{{name}}}"), &path_parameter_example(name));
+                    example_path.replace(&format!("{{{name}}}"), path_parameter_example(name));
             }
         }
         let query = parameters
@@ -3029,6 +3036,10 @@ mod openapi {
                     "#/components/schemas/MarketDataSource"
                 );
             }
+            assert_eq!(
+                document["components"]["schemas"]["CatalogAbsentToken"]["properties"]["tier"]["enum"],
+                serde_json::json!(["confirmed", "caution"])
+            );
             assert_eq!(
                 document["components"]["schemas"]["PricePoint"]["properties"]["source"]["$ref"],
                 "#/components/schemas/MarketDataSource"

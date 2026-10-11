@@ -15,7 +15,7 @@ use app::{
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::Parser;
 use config::Config;
-use domain::{chain::Chain, powers::PowersRecord};
+use domain::{chain::Chain, pool::TokenMeta, powers::PowersRecord};
 use moka::future::Cache;
 use ports::{AttestationStore, ChainReader, Clock};
 use std::{
@@ -139,6 +139,10 @@ async fn main() -> Result<()> {
         .build();
     let powers_cache: Cache<PowersCacheKey, PowersRecord> =
         Cache::builder().max_capacity(10_000).time_to_live(warm::POWERS_CACHE_TTL).build();
+    let publisher_metadata_cache: Cache<(Chain, String), TokenMeta> = Cache::builder()
+        .max_capacity(10_000)
+        .time_to_live(app::guard::PUBLISHER_METADATA_CACHE_TTL)
+        .build();
     let powers_warm_notify = Arc::new(Notify::new());
 
     let admin_auth = Arc::new(adapters::state::AdminAuth::new(
@@ -287,6 +291,7 @@ async fn main() -> Result<()> {
         check_cache: Arc::new(check_cache.clone()),
         statement_cache: Arc::new(statement_cache.clone()),
         powers_cache: Arc::new(powers_cache.clone()),
+        publisher_metadata_cache: Arc::new(publisher_metadata_cache.clone()),
         powers_retry_cache: Arc::new(powers_retry_cache.clone()),
         powers_failure_cache: Arc::new(powers_failure_cache.clone()),
         powers_locks: Arc::new(powers_locks.clone()),
@@ -302,6 +307,7 @@ async fn main() -> Result<()> {
         dev_signer,
         attest_store: attestations_store,
         registry_hash: Arc::clone(&registry_hash),
+        publisher_catalog_complete: Arc::new(StdRwLock::new(std::collections::HashSet::new())),
         registry_version: Arc::clone(&registry_version),
         source_verifier: Arc::new(adapters::sourcify::SourcifyVerifier::new(source_http.clone())),
         clock: Arc::new(SystemClock),

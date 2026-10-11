@@ -7,8 +7,9 @@
 {% block twitter_description %}QED reads a pool and checks whether its quote token matches an issuer's published registry.{% endblock %}
 {% block canonical_link %}{{ public_url }}{% endblock %}
 {% block content %}
-<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"Organization","name":"QED","url":"{{ public_url }}","sameAs":["https://github.com/boev/qed"]},{"@type":"WebSite","name":"QED","url":"{{ public_url }}"}]}</script>
 <link rel="stylesheet" href="/static/home.css?v={{ asset_version }}">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"Organization","name":"QED","url":"{{ public_url }}","sameAs":["https://github.com/boev/qed"]},{"@type":"WebSite","name":"QED","url":"{{ public_url }}"}]}</script>
+<div class="hex-bg" aria-hidden="true"></div>
 <section class="home-hero" aria-labelledby="home-title">
   <div class="wordmark-stage">
     <p class="proof-phrase" role="img" aria-label="Quod erat demonstrandum">
@@ -16,41 +17,72 @@
     </p>
   </div>
   <div class="hero-copy-stack">
-    {# Product-positioning copy: contract match only, not proof of backing or custody. #}
     <p class="problem-copy">A ticker is not a contract. Compare the pool with the issuer's published stock-token contract.</p>
-    <h1 id="home-title">QED checks whether a pool uses the stock-token contract published by its issuer.</h1>
+    <h1 id="home-title">QED checks whether a pool uses the <span class="nowrap">stock-token</span> contract published by its issuer.</h1>
     <p class="problem-copy"><a href="/tokens/NVDA">QED also shows what the issuer can do to each token.</a></p>
-  <p class="home-audience">For traders, app builders, and compliance teams: a pool is a contract where two tokens trade; the issuer registry lists contracts each issuer has published.</p>
   </div>
-  <a class="home-lookup-link" href="/guard" hx-boost="true" hx-target="main" hx-select="main" hx-swap="innerHTML show:window:top">Review a token or pool <span aria-hidden="true">→</span></a>
-  <a class="home-example-link" href="/guard/robinhood/0x6444a8e0b267406a15db74ca00c4a24bdfa81ed3180f5b6d0851f8ed6f4f29c5">Try the NVDA pool example</a>
 </section>
-{% if whats_new.available %}
-  <p class="release-whats-new"><strong>New in {{ whats_new.release_label }}: {{ whats_new.headline }}</strong> <a href="{{ whats_new.changelog_href }}">→ Changelog</a>{% if whats_new.has_latest_blog %} <span class="latest-blog-link">· Latest post: <a href="{{ whats_new.latest_blog_href }}">{{ whats_new.latest_blog_title }}</a></span>{% endif %}</p>
-{% endif %}
-<section class="leaderboard-section" aria-labelledby="leaderboard-title">
-  <div class="section-heading">
-    <div>
-      <p class="eyebrow">Live market</p>
-      <h2 id="leaderboard-title">Stock-paired token leaderboard</h2>
-      <p class="leaderboard-stats-line">{{ stats_line }} · <a href="/stats">Stats</a></p>
+<section class="integration-band" aria-labelledby="integration-title">
+  <p class="integration-title" id="integration-title">Integrated with</p>
+  <div class="integration-viewport">
+    <div class="integration-track">
+      <ul class="integration-set">
+        {% for chip in integration_chips %}
+        <li>
+          <a href="{{ chip.href }}" target="_blank" rel="noopener noreferrer" title="{{ chip.category }}" aria-label="{{ chip.category }}: {{ chip.name }}{% if chip.number.is_some() %}, {{ chip.number.as_ref().unwrap() }} {{ chip.unit }}{% else %}, {{ chip.empty_unit }}{% endif %}">
+            {% if !chip.logo_src.is_empty() %}
+            <span class="integration-mark-frame integration-mark-frame--{{ chip.icon }}"><img class="integration-logo" src="{{ chip.logo_src }}?v={{ asset_version }}" alt="" width="32" height="32"></span>
+            {% else if !chip.icon.is_empty() %}
+            <span class="integration-mark-frame integration-mark-frame--{{ chip.icon }}"><svg class="integration-icon" aria-hidden="true" focusable="false"><use href="/static/icons.svg#{{ chip.icon }}"></use></svg></span>
+            {% else %}
+            <span class="integration-mark-frame integration-mark-frame--monogram" aria-hidden="true">{{ chip.mark }}</span>
+            {% endif %}
+            <span class="integration-label">
+              <strong class="integration-name">{{ chip.name }}</strong>
+              <span class="integration-metric">{% if chip.number.is_some() %}<strong class="integration-number">{{ chip.number.as_ref().unwrap() }}</strong><span class="integration-unit">{{ chip.unit }}</span>{% else %}<span class="integration-unit integration-unit--market">{{ chip.empty_unit }}</span>{% endif %}</span>
+            </span>
+          </a>
+        </li>
+        {% endfor %}
+      </ul>
+      <ul class="integration-set integration-set--clone" aria-hidden="true" inert>
+        {% for chip in integration_chips %}
+        <li>
+          <a href="{{ chip.href }}" target="_blank" rel="noopener noreferrer" tabindex="-1" title="{{ chip.category }}">
+            {% if !chip.logo_src.is_empty() %}
+            <span class="integration-mark-frame integration-mark-frame--{{ chip.icon }}"><img class="integration-logo" src="{{ chip.logo_src }}?v={{ asset_version }}" alt="" width="32" height="32"></span>
+            {% else if !chip.icon.is_empty() %}
+            <span class="integration-mark-frame integration-mark-frame--{{ chip.icon }}"><svg class="integration-icon" aria-hidden="true" focusable="false"><use href="/static/icons.svg#{{ chip.icon }}"></use></svg></span>
+            {% else %}
+            <span class="integration-mark-frame integration-mark-frame--monogram" aria-hidden="true">{{ chip.mark }}</span>
+            {% endif %}
+            <span class="integration-label">
+              <strong class="integration-name">{{ chip.name }}</strong>
+              <span class="integration-metric">{% if chip.number.is_some() %}<strong class="integration-number">{{ chip.number.as_ref().unwrap() }}</strong><span class="integration-unit">{{ chip.unit }}</span>{% else %}<span class="integration-unit integration-unit--market">{{ chip.empty_unit }}</span>{% endif %}</span>
+            </span>
+          </a>
+        </li>
+        {% endfor %}
+      </ul>
     </div>
-    <span class="live-pill"><span class="live-dot" aria-hidden="true"></span>Live</span>
   </div>
+</section>
+<section class="leaderboard-section" aria-labelledby="leaderboard-title">
+  <h2 id="leaderboard-title">Stock-paired token leaderboard</h2>
   <div id="leaderboard" class="leaderboard-shell">
     <script id="leaderboard-data" type="application/json">{{ leaderboard.json|safe }}</script>
     <div class="leaderboard-table-wrap">
-      <table class="leaderboard-table stack-table">
+      <table class="leaderboard-table">
         <caption class="visually-hidden">Live stock-paired token leaderboard</caption>
         <thead>
           <tr>
-            <th scope="col" class="rank-cell">Rank</th>
+            <th scope="col" class="rank-cell" aria-label="Rank"><span class="leaderboard-heading--desktop">Rank</span><span class="leaderboard-heading--mobile">#</span></th>
             <th scope="col">Pair</th>
-            <th scope="col">Chain</th>
+            <th scope="col" aria-label="Chain">Chain</th>
             <th scope="col">Venue</th>
-            <th scope="col">Verdict</th>
+            <th scope="col" title="Verified means the quote-side contract matches an issuer-published contract. This does not prove backing, custody, reserves, price, safety or endorsement.">Verdict</th>
             <th scope="col">Price</th>
-            <th scope="col">24h change</th>
+            <th scope="col" aria-label="24h change"><span class="leaderboard-heading--desktop">24h change</span><span class="leaderboard-heading--mobile">24h</span></th>
             <th scope="col">24h volume</th>
             <th scope="col">Liquidity</th>
             <th scope="col" class="trade-heading"><span class="visually-hidden">Market</span></th>
@@ -67,22 +99,25 @@
             </td>
             <td class="chain-cell" data-label="Chain"><span class="chain-label"><svg aria-hidden="true"><use href="/static/icons.svg#{{ row.chain_icon }}"></use></svg><span>{{ row.chain_label }}</span></span></td>
             <td class="venue-cell" data-label="Venue">{{ row.dex }}</td>
-            <td data-label="Verdict"><span class="seal-label is-{{ row.verdict }}"{% if row.verdict == "verified" %} title="Only the quote-side contract is checked; this is not proof of backing or custody, reserves, price, safety or endorsement"{% endif %}><svg class="seal-icon" aria-hidden="true"><use href="/static/icons.svg#{{ row.seal_icon }}"></use></svg><span>{{ row.verdict_label }}</span></span>{% if row.verdict == "verified" %}<small class="verdict-scope">Quote-side contract only</small>{% endif %}</td>
+            <td data-label="Verdict" title="{{ row.checked_at_title }}"><span class="seal-label is-{{ row.verdict }}"><svg class="seal-icon" aria-hidden="true"><use href="/static/icons.svg#{{ row.seal_icon }}"></use></svg><span>{{ row.verdict_label }}</span>{% if row.checked_at_stale %}<span aria-label="Check is stale"> · stale</span>{% endif %}</span></td>
             <td class="number-cell" data-label="Price">{{ row.price }}</td>
             <td class="number-cell change-cell {{ row.change_class }}" data-label="24h change">{{ row.change }}</td>
-            <td class="number-cell" data-label="24h volume">{{ row.volume }}<small class="market-source">reported by {{ row.source_label }}</small></td>
-            <td class="number-cell" data-label="Liquidity">{{ row.liquidity }}<small class="market-source">reported by {{ row.source_label }}</small></td>
-            <td class="trade-cell" data-label="Market"><a href="{{ row.trade_url }}"{% if row.verdict == "verified" %} title="contract match only, not proof of backing or custody, reserves, price, safety or endorsement"{% endif %} target="_blank" rel="noopener noreferrer">Market<span aria-hidden="true"> ↗</span></a><small class="trade-limit">External market page; QED checks contract match only.</small></td>
+            <td class="number-cell" data-label="24h volume">{{ row.volume }}</td>
+            <td class="number-cell" data-label="Liquidity">{{ row.liquidity }}</td>
+            <td class="trade-cell" data-label="Market"><a class="market-link" href="{{ row.trade_url }}" title="External market page; QED checks contract match only." aria-label="Open market page for {{ row.base_symbol }} / {{ row.quote_symbol }}" target="_blank" rel="noopener noreferrer"><span class="market-label">Market</span><span class="market-icon" aria-hidden="true">↗</span></a></td>
           </tr>
         {% endfor %}
-        {% if leaderboard.show_empty %}
-          <tr><td colspan="10" class="leaderboard-empty">No stock-paired pools are available right now.</td></tr>
+        {% if leaderboard.building %}
+          <tr><td colspan="10" class="leaderboard-empty">Building the first board…</td></tr>
+        {% else %}
+          {% if leaderboard.show_empty %}
+            <tr><td colspan="10" class="leaderboard-empty">No stock-paired pools are available right now.</td></tr>
+          {% endif %}
         {% endif %}
         </tbody>
       </table>
     </div>
-    <p class="contract-match-footnote">QED checks whether a pool uses the stock-token contract published by its issuer. It does not prove backing or custody, solvency, price, safety, or endorsement. Market links open exact external pair pages. Rows and records can expire or change when registry data updates; re-check before relying on them.</p>
-    <p class="leaderboard-status" title="{{ leaderboard.status_tooltip }}" aria-live="polite">{{ leaderboard.status_line }}</p>
+    <p class="leaderboard-source-note" aria-live="polite">Prices updated {% if leaderboard.prices_updated_at.is_empty() %}—{% else %}<time datetime="{{ leaderboard.prices_updated_at }}">{{ leaderboard.prices_updated_at_label }}</time>{% endif %} · contract checks: top 50 every 6 h, others daily{% if leaderboard.refreshing %} · Updating leaderboard…{% endif %} · Verified = the quote-side contract matches the issuer-published contract; not proof of backing, custody, price or safety. Prices, volume and liquidity from DexScreener and GeckoTerminal.</p>
   </div>
-</section>
+  </section>
 {% endblock %}

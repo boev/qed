@@ -1842,7 +1842,7 @@ mod tests {
     fn multicall_incomplete_result_counts_fall_back_for_every_token() {
         let requested = [1_u8, 2];
         for returned_count in [0, 1, 3] {
-            let results = (0..returned_count).map(|value| Ok::<_, ()>(value)).collect();
+            let results = (0..returned_count).map(Ok::<_, ()>).collect();
             let (successful, fallback) =
                 classify_multicall_results(&requested, Ok::<_, ()>(results));
             assert!(successful.is_empty());

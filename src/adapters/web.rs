@@ -29,7 +29,7 @@ pub(crate) use docs::{api_docs, imprint, llms, llms_full, privacy, terms, valida
 pub(crate) use pages::{
     certificate, chain_page, featured, glossary_page, guide_verify_page, index,
     recheck_certificate, registry_page, registry_table, stats_page, token_lookup, token_page,
-    validated, validated_detail, wallet_holdings_page, wallet_page,
+    validated, validated_detail,
 };
 pub(crate) fn wallet_error_status(error: crate::app::wallet::WalletError) -> StatusCode {
     match error {
@@ -68,9 +68,9 @@ const fn asset_version() -> u64 {
     let hash = hash_bytes(hash, include_bytes!("../../static/icons.svg"));
     let hash = hash_bytes(hash, include_bytes!("../../static/logo.svg"));
     let hash = hash_bytes(hash, include_bytes!("../../static/app.js"));
-    let hash = hash_bytes(hash, include_bytes!("../../static/wallet.js"));
     let hash = hash_bytes(hash, include_bytes!("../../static/leaderboard.js"));
-    hash_bytes(hash, include_bytes!("../../static/vue.global.prod.js"))
+    let hash = hash_bytes(hash, include_bytes!("../../static/vue.global.prod.js"));
+    hash_bytes(hash, include_bytes!("../../static/hex-comets.js"))
 }
 
 pub fn router(state: AppState) -> Router {
@@ -87,7 +87,6 @@ pub fn router(state: AppState) -> Router {
         .route("/tokens", get(token_lookup))
         .route("/tokens/{ticker}", get(token_page))
         .route("/chains/{chain_name}", get(chain_page))
-        .route("/wallet", get(wallet_page).post(wallet_holdings_page))
         .route("/glossary", get(glossary_page))
         .route("/docs", get(pages::docs_page))
         .route("/docs/llm", get(pages::docs_llm_page))
@@ -251,7 +250,7 @@ async fn usage_metrics(
         || (method == Method::POST
             && (path == "/check" || path == "/verify" || path == "/api/guard" || path == "/guard"))
         || (method == Method::POST && path.starts_with("/v/") && path.ends_with("/recheck"));
-    let is_wallet = path == "/wallet" || path == "/api/wallet";
+    let is_wallet = path == "/api/wallet";
     let is_health = path == "/healthz";
     let is_static_asset = path == "/static" || path.starts_with("/static/");
     state.usage_stats.record_request(
@@ -281,8 +280,7 @@ async fn rate_limit(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    let is_wallet =
-        request.method() == Method::POST && (path == "/wallet" || path == "/api/wallet");
+    let is_wallet = request.method() == Method::POST && path == "/api/wallet";
     let is_registry_api = request.method() == Method::GET && path == "/api/registry";
     let is_expensive = (request.method() == Method::POST
         && (path == "/mcp" || path == "/api/statement" || path == "/statements"))
@@ -429,7 +427,137 @@ async fn cache_static(request: axum::extract::Request, next: Next) -> Response {
 }
 
 fn wants_fragment(headers: &axum::http::HeaderMap) -> bool {
+    if headers
+        .get("HX-History-Restore-Request")
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"true"))
+    {
+        return false;
+    }
     headers.get("HX-Request").is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"true"))
+}
+
+pub(super) fn timestamp_html(value: &str) -> String {
+    let value = crate::adapters::content::html_escape(value);
+    format!("<time datetime=\"{value}\">{value}</time>")
+}
+
+fn format_html_timestamp(value: &str) -> Option<String> {
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(parsed.with_timezone(&chrono::Utc).format("%-d %b %Y, %H:%M UTC").to_string());
+    }
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .ok()
+        .map(|date| date.format("%-d %b %Y").to_string())
+}
+
+fn time_attribute<'a>(opening_tag: &'a str, name: &str) -> Option<&'a str> {
+    let marker = match name {
+        "datetime" => " datetime=\"",
+        "title" => " title=\"",
+        _ => return None,
+    };
+    opening_tag.split_once(marker)?.1.split_once('"').map(|(value, _)| value)
+}
+
+fn latest_release_menu_item() -> &'static str {
+    static RELEASE_ITEM: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        crate::adapters::content::changelog_entries()
+            .into_iter()
+            .next()
+            .map(|entry| {
+                let anchor = crate::adapters::content::html_escape(&entry.anchor);
+                let label = crate::adapters::content::html_escape(&entry.label);
+                let headline = crate::adapters::content::html_escape(&entry.headline);
+                format!(
+                    "<a class=\"docs-menu-release\" href=\"/changelog#{anchor}\" title=\"New in {label} — {headline} → Changelog\"><strong>New in {label}</strong><span class=\"docs-menu-release-text\"><span class=\"docs-menu-release-headline\">{headline}</span><span class=\"docs-menu-release-link\">→ Changelog</span></span></a>"
+                )
+            })
+            .unwrap_or_default()
+    });
+    RELEASE_ITEM.as_str()
+}
+
+pub(super) fn format_html_timestamps(html: &str) -> String {
+    const LATEST_RELEASE_MARKER: &str = "<!-- QED_LATEST_RELEASE -->";
+    const PACKAGE_VERSION_MARKER: &str = "<!-- QED_PACKAGE_VERSION -->";
+    let release_item = latest_release_menu_item();
+    let mut output = String::with_capacity(html.len() + release_item.len() * 2);
+    let mut remaining = html;
+    loop {
+        let mut next = (usize::MAX, 0);
+        if let Some(index) = remaining.find("<time") {
+            next = (index, 1);
+        }
+        if let Some(index) = remaining.find(LATEST_RELEASE_MARKER)
+            && index < next.0
+        {
+            next = (index, 2);
+        }
+        if let Some(index) = remaining.find(PACKAGE_VERSION_MARKER)
+            && index < next.0
+        {
+            next = (index, 3);
+        }
+        if next.0 == usize::MAX {
+            output.push_str(remaining);
+            break;
+        }
+        output.push_str(&remaining[..next.0]);
+        let remainder = &remaining[next.0..];
+        match next.1 {
+            2 => {
+                output.push_str(release_item);
+                remaining = &remainder[LATEST_RELEASE_MARKER.len()..];
+            }
+            3 => {
+                output.push_str(env!("CARGO_PKG_VERSION"));
+                remaining = &remainder[PACKAGE_VERSION_MARKER.len()..];
+            }
+            _ => {
+                let Some(opening_length) = remainder.find('>') else {
+                    output.push_str(remainder);
+                    break;
+                };
+                let opening_end = opening_length + 1;
+                let Some(closing_offset) = remainder[opening_end..].find("</time>") else {
+                    output.push_str(remainder);
+                    break;
+                };
+                let closing_start = opening_end + closing_offset;
+                let closing_end = closing_start + "</time>".len();
+                let opening_tag = &remainder[..opening_end];
+                let contents = &remainder[opening_end..closing_start];
+                let existing_datetime = time_attribute(opening_tag, "datetime");
+                let datetime = existing_datetime.unwrap_or_else(|| contents.trim());
+                if let Some(human) = format_html_timestamp(datetime) {
+                    output.push_str(&opening_tag[..opening_end - 1]);
+                    if existing_datetime.is_none() {
+                        output.push_str(" datetime=\"");
+                        output.push_str(datetime);
+                        output.push('"');
+                    }
+                    if time_attribute(opening_tag, "title").is_none() {
+                        output.push_str(" title=\"");
+                        output.push_str(datetime);
+                        output.push('"');
+                    }
+                    output.push('>');
+                    if let Some(start) = contents.find(datetime) {
+                        output.push_str(&contents[..start]);
+                        output.push_str(&human);
+                        output.push_str(&contents[start + datetime.len()..]);
+                    } else {
+                        output.push_str(contents);
+                    }
+                    output.push_str("</time>");
+                } else {
+                    output.push_str(&remainder[..closing_end]);
+                }
+                remaining = &remainder[closing_end..];
+            }
+        }
+    }
+    output
 }
 
 fn render_page<T: askama::Template>(
@@ -437,7 +565,7 @@ fn render_page<T: askama::Template>(
     _fragment: bool,
 ) -> Result<axum::response::Html<String>, StatusCode> {
     let page = template.render().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(axum::response::Html(page))
+    Ok(axum::response::Html(format_html_timestamps(&page)))
 }
 
 async fn robots(State(state): State<AppState>) -> impl IntoResponse {
@@ -778,6 +906,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wallet_page_routes_are_removed_without_removing_wallet_api() {
+        let app = router(AppState::for_tests(Vec::new(), Vec::new(), false));
+        for request in [
+            Request::get("/wallet").body(Body::empty()).unwrap(),
+            Request::post("/wallet")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("address="))
+                .unwrap(),
+        ] {
+            let response =
+                app.clone().oneshot(request).await.expect("removed wallet route response");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        let address = "0x0000000000000000000000000000000000000001";
+        let response = app
+            .oneshot(
+                Request::post("/api/wallet")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"address":"{address}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .expect("wallet API response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body =
+            axum::body::to_bytes(response.into_body(), 1024 * 1024).await.expect("wallet API body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("wallet API JSON");
+        assert_eq!(value, serde_json::json!({"address": address, "holdings": []}));
+    }
+
+    #[tokio::test]
     async fn new_pages_have_metadata_nav_and_draft_exclusions() {
         let app = router(AppState::for_tests(Vec::new(), Vec::new(), false));
         let pages = [
@@ -795,6 +955,7 @@ mod tests {
             ("/privacy", "QED | Privacy"),
             ("/terms", "QED | Terms"),
             ("/statements", "QED | Statement"),
+            ("/stats", "QED | Leaderboard statistics"),
             ("/guide/verify-a-stock-token", "QED | Contract-first verification guide"),
             ("/glossary", "QED | Glossary"),
         ];
@@ -819,6 +980,10 @@ mod tests {
             assert!(body.contains("<p class=\"eyebrow\">"), "{path}");
             assert!(body.contains("<h1 class=\"page-title\">"), "{path}");
             assert!(body.contains("<meta name=\"description\" content="), "{path}");
+            assert!(
+                body.contains("Contact: <a href=\"mailto:contact@web3-energy.com\">contact@web3-energy.com</a>"),
+                "{path}: shared footer contact"
+            );
             assert!(body.contains("<meta property=\"og:description\" content="), "{path}");
             assert!(body.contains("<meta property=\"og:url\" content="), "{path}");
             let canonical = body
@@ -836,13 +1001,34 @@ mod tests {
                 .split("</nav>")
                 .next()
                 .expect("navigation close");
-            assert_eq!(nav.matches("<a ").count(), 7, "{path}");
+            let top_level =
+                nav.split_once("<details class=\"docs-menu\">").expect("Docs dropdown").0;
             let mut previous = 0;
-            for label in ["Guard", "Registry", "Statement", "Docs", "API", "MCP", "llms.txt"] {
-                let position = nav.find(&format!(">{label}</a>")).expect("navigation label");
-                assert!(position >= previous, "{path}: {label}");
+            for path in ["/guard", "/registry", "/statements", "/stats"] {
+                let position = top_level.find(&format!("href=\"{path}\"")).expect("main nav link");
+                assert!(position >= previous, "{path}");
                 previous = position;
             }
+            let docs_menu = nav.split_once("<details class=\"docs-menu\">").unwrap().1;
+            for path in ["/docs", "/api", "/docs/llm", "/llms.txt", "/blog", "/changelog#"] {
+                assert!(docs_menu.contains(&format!("href=\"{path}")), "{path}");
+            }
+            assert!(docs_menu.contains(&format!("New in {}", env!("CARGO_PKG_VERSION"))));
+            assert!(!nav.contains("version-pill"), "version pill sits outside the centered nav");
+            let actions = body
+                .split_once("<div class=\"header-actions\">")
+                .expect("header actions")
+                .1
+                .split("</div>")
+                .next()
+                .expect("header actions close");
+            assert!(actions.contains(&format!(">v{}</a>", env!("CARGO_PKG_VERSION"))));
+            let version = actions.find("class=\"version-pill\"").expect("version pill");
+            let github = actions.find("class=\"repository-link\"").expect("GitHub link");
+            let theme = actions.find("data-theme-toggle").expect("theme toggle");
+            assert!(version < github && github < theme, "header action order");
+            assert!(!actions.contains("My Wallet"), "removed wallet-page link");
+            assert!(!body.contains("href=\"/wallet\""), "removed wallet-page URL");
             let footer = body
                 .split_once("<nav aria-label=\"Legal and project links\"")
                 .expect("footer navigation")
@@ -863,6 +1049,21 @@ mod tests {
                 "GitHub",
             ] {
                 assert!(footer.contains(&format!(">{label}</a>")), "{path}: {label}");
+            }
+            if path == "/about" {
+                let releases = crate::adapters::content::changelog_entries();
+                let release_date = releases
+                    .first()
+                    .and_then(|entry| entry.date.as_deref())
+                    .expect("current changelog release date");
+                assert!(body.contains("Project facts"));
+                assert!(body.contains(&format!(
+                    "v{} · released {release_date}",
+                    env!("CARGO_PKG_VERSION")
+                )));
+                assert!(body.contains("Questions, issuer corrections or takedown requests:"));
+                assert!(body.contains("github.com/boev/qed"));
+                assert!(body.contains(">Security policy</a>"));
             }
             if path == "/statements" {
                 assert!(body.contains(
@@ -945,7 +1146,8 @@ mod tests {
         assert!(home.contains(
             "A ticker is not a contract. Compare the pool with the issuer's published stock-token contract."
         ));
-        assert!(home.contains(
+        let visible_home = home.replace("<span class=\"nowrap\">", "").replace("</span>", "");
+        assert!(visible_home.contains(
             "QED checks whether a pool uses the stock-token contract published by its issuer."
         ));
         let docs = app
@@ -1052,21 +1254,6 @@ mod tests {
             if path == "/api" {
                 let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
                 let body = String::from_utf8(body.to_vec()).unwrap();
-                let nav = body
-                    .split_once("<nav class=\"site-nav\"")
-                    .expect("API site navigation")
-                    .1
-                    .split("</nav>")
-                    .next()
-                    .expect("API navigation close");
-                assert_eq!(nav.matches("<a ").count(), 7);
-                let mut previous = 0;
-                for label in ["Guard", "Registry", "Statement", "Docs", "API", "MCP", "llms.txt"] {
-                    let position =
-                        nav.find(&format!(">{label}</a>")).expect("API navigation label");
-                    assert!(position >= previous);
-                    previous = position;
-                }
                 assert!(body.contains("<a href=\"/terms\">Terms</a>"));
             }
         }
@@ -1172,13 +1359,10 @@ mod tests {
     #[tokio::test]
     async fn home_and_docs_expose_release_news_and_agent_quick_paths() {
         let app = router(AppState::for_tests(Vec::new(), Vec::new(), false));
-        let entry = crate::adapters::content::latest_released_changelog_entry()
-            .expect("changelog is readable")
+        let entry = crate::adapters::content::changelog_entries()
+            .into_iter()
+            .next()
             .expect("a released changelog entry exists");
-        let expected_news = format!("New in {}: {}", entry.label, entry.headline);
-        let posts = crate::adapters::content::blog_posts().expect("blog posts are readable");
-        let latest_blog = crate::adapters::content::latest_published_blog_post(&posts);
-
         let home = app
             .clone()
             .oneshot(Request::get("/").body(Body::empty()).expect("home request"))
@@ -1200,33 +1384,25 @@ mod tests {
             .expect("LLM text response");
         let llms = axum::body::to_bytes(llms.into_body(), usize::MAX).await.unwrap();
         let llms = String::from_utf8(llms.to_vec()).unwrap();
+        assert!(llms.contains("Contact: contact@web3-energy.com"));
         assert!(llms.contains("- MCP endpoint: POST `http://localhost:3000/mcp`"));
         assert!(!llms.contains("[MCP endpoint]"));
 
         for body in [&home, &docs] {
-            let banner_start =
-                body.find("<p class=\"release-whats-new\">").expect("release banner");
-            let banner_end =
-                body[banner_start..].find("</p>").expect("release banner end") + banner_start;
-            let banner = &body[banner_start..banner_end];
-            assert!(banner.contains(&expected_news), "expected {expected_news:?} in {banner:?}");
-            assert!(!banner.contains("Navigation"));
-            assert!(!banner.contains("Release notes"));
+            assert!(!body.contains("release-whats-new"));
+            assert!(body.contains("class=\"docs-menu-release\""));
+            assert!(body.contains(&format!("New in {}", entry.label)));
+            assert!(body.contains(&entry.headline));
+            assert!(body.contains("→ Changelog"));
             assert!(body.contains(&format!("/changelog#{}", entry.anchor)));
             assert!(!body.contains("Unreleased"));
-            match latest_blog {
-                Some(post) => {
-                    assert!(body.contains(&format!("href=\"/blog/{}\"", post.slug)));
-                    assert!(body.contains(&post.title));
-                }
-                None => assert!(!body.contains("Latest post:")),
-            }
             assert!(body.contains("For developers &amp; AI agents"));
             assert!(body.contains("href=\"/api\""));
             assert!(!body.contains("href=\"/mcp\""));
             assert!(body.contains("href=\"/docs/llm\""));
             assert!(body.contains("href=\"/llms.txt\""));
         }
+        assert!(!home.contains("Latest post:"));
         assert!(!docs.contains("MCP endpoint: POST"));
 
         for question in [
@@ -1262,6 +1438,160 @@ mod tests {
         ] {
             assert!(docs.contains(text), "missing docs quick path: {text}");
         }
+    }
+
+    #[tokio::test]
+    async fn stats_page_shows_four_overview_numbers_and_collapsed_details() {
+        let app = router(AppState::for_tests(Vec::new(), Vec::new(), false));
+        let api = app
+            .clone()
+            .oneshot(Request::get("/api/stats").body(Body::empty()).expect("stats API request"))
+            .await
+            .expect("stats API response");
+        let api = axum::body::to_bytes(api.into_body(), usize::MAX).await.unwrap();
+        let api: serde_json::Value = serde_json::from_slice(&api).unwrap();
+        let headline = api["stats"]["headline"].as_str().expect("API headline");
+        assert!(!headline.is_empty());
+
+        let response = app
+            .oneshot(Request::get("/stats").body(Body::empty()).expect("stats request"))
+            .await
+            .expect("stats response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(body.matches("<article class=\"stats-number-card").count(), 4);
+        assert!(body.contains("0 of 0"));
+        assert!(
+            body.contains("aria-label=\"Deny — claims a product its publisher does not list\"")
+        );
+        assert!(body.contains(
+            "<p class=\"stats-number\">0</p><p>Pools not checked: 0 not read yet · 0 unsupported venues</p>"
+        ));
+        assert!(body.contains("<details class=\"stats-details\">"));
+        assert!(!body.contains("<details class=\"stats-details\" open>"));
+        assert!(body.contains("Method, counts and downloads"));
+        assert!(!body.contains(headline));
+    }
+
+    #[tokio::test]
+    async fn blog_route_returns_human_dates_and_htmx_page_fragments() {
+        let app = router(AppState::for_tests(Vec::new(), Vec::new(), false));
+        let full = app
+            .clone()
+            .oneshot(Request::get("/blog").body(Body::empty()).expect("blog request"))
+            .await
+            .expect("blog response");
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(
+            full.headers().get(header::VARY).expect("blog response Vary header"),
+            "HX-Request, HX-History-Restore-Request"
+        );
+        let full = axum::body::to_bytes(full.into_body(), usize::MAX).await.unwrap();
+        let full = String::from_utf8(full.to_vec()).unwrap();
+        assert!(full.contains(
+            "<article class=\"blog-listing\"><a href=\"/blog/three-ways-to-protect-funds\"><time class=\"blog-date\" datetime=\"2026-10-06\" title=\"2026-10-06\">6 Oct 2026</time>"
+        ));
+        assert!(full.contains("Three questions to answer before you touch a token"));
+        assert!(!full.contains("What QED Powers shows"));
+        assert!(!full.contains("What a QED Statement is"));
+
+        let fragment = app
+            .clone()
+            .oneshot(
+                Request::get("/blog?page=1")
+                    .header("HX-Request", "true")
+                    .body(Body::empty())
+                    .expect("blog fragment request"),
+            )
+            .await
+            .expect("blog fragment response");
+        assert_eq!(fragment.status(), StatusCode::OK);
+        assert_eq!(
+            fragment.headers().get(header::VARY).expect("fragment Vary header"),
+            "HX-Request, HX-History-Restore-Request"
+        );
+        let fragment = axum::body::to_bytes(fragment.into_body(), usize::MAX).await.unwrap();
+        let fragment = String::from_utf8(fragment.to_vec()).unwrap();
+        assert!(!fragment.contains("<html"));
+        assert!(fragment.contains("Is it the real NVDA? 3 checks in 30 seconds"));
+        let restored = app
+            .clone()
+            .oneshot(
+                Request::get("/blog?page=1")
+                    .header("HX-Request", "true")
+                    .header("HX-History-Restore-Request", "true")
+                    .body(Body::empty())
+                    .expect("history restore request"),
+            )
+            .await
+            .expect("history restore response");
+        assert_eq!(restored.status(), StatusCode::OK);
+        let restored = axum::body::to_bytes(restored.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8(restored.to_vec()).unwrap().contains("<html"));
+
+        let out_of_range = app
+            .oneshot(
+                Request::get("/blog?page=2")
+                    .body(Body::empty())
+                    .expect("out-of-range blog page request"),
+            )
+            .await
+            .expect("out-of-range blog page response");
+        assert_eq!(out_of_range.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn blog_paging_keeps_plain_links_and_returns_the_next_six_posts() {
+        let posts = (0..7)
+            .map(|index| {
+                let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 8 - index).unwrap();
+                let file_name = format!("{date}-blog-item-{index}.md");
+                let source = format!(
+                    "---\ntitle: Blog item {index}\ndate: {date}\nsummary: Summary for item {index}.\ndraft: false\n---\n\nBody for item {index}."
+                );
+                crate::adapters::content::parse_blog_post(&file_name, &source).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let state = AppState::for_tests(Vec::new(), Vec::new(), false);
+        let first = pages::render_blog_page(&state, &posts, None, false).unwrap().0;
+        for index in 0..6 {
+            assert!(first.contains(&format!("Blog item {index}")));
+        }
+        assert!(!first.contains("Blog item 6"));
+        assert!(first.contains("hx-get=\"/blog?page=2\""));
+        assert!(first.contains("href=\"/blog?page=2\" hx-boost=\"false\">Next posts</a>"));
+        assert!(first.contains("hx-push-url=\"false\""));
+
+        let second_fragment = pages::render_blog_page(&state, &posts, Some(2), true).unwrap().0;
+        assert!(second_fragment.contains("Blog item 6"));
+        assert!(!second_fragment.contains("Blog item 0"));
+        assert!(!second_fragment.contains("hx-get="));
+        assert!(!second_fragment.contains("<html"));
+
+        let second_page = pages::render_blog_page(&state, &posts, Some(2), false).unwrap().0;
+        assert!(second_page.contains("Blog item 6"));
+        assert!(second_page.contains("Previous posts"));
+        assert!(!second_page.contains("Next posts"));
+    }
+
+    #[tokio::test]
+    async fn html_timestamps_show_utc_human_text_and_keep_full_iso_metadata() {
+        let raw = "2026-10-08T02:52:27Z";
+        assert_eq!(
+            format_html_timestamps(&format!("<time datetime=\"{raw}\">{raw}</time>")),
+            format!("<time datetime=\"{raw}\" title=\"{raw}\">8 Oct 2026, 02:52 UTC</time>")
+        );
+        let response = router(AppState::for_tests(Vec::new(), Vec::new(), false))
+            .oneshot(Request::get("/changelog").body(Body::empty()).expect("changelog request"))
+            .await
+            .expect("changelog response");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains(
+            "<time class=\"release-date\" datetime=\"2026-10-08\" title=\"2026-10-08\">8 Oct 2026</time>"
+        ));
+        assert!(!body.contains(">2026-10-08</time>"));
     }
 
     #[tokio::test]

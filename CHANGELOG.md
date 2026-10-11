@@ -1,6 +1,24 @@
 # Changelog
 
-Notable QED changes, in reverse chronological order. Entries describe shipped behavior; QED does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.
+Notable QED changes, in reverse chronological order. Entries describe shipped releases and current unreleased work; QED does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.
+
+## [1.0.2] - 2026-10-09
+
+**Lighter background reads with honest check times**
+
+- **Background RPC budget** — Keep six-hour checks for the top 50 leaderboard pools by reported 24-hour volume and featured pools; refresh cold pool rows after 24 hours, preserve their actual check timestamps, and give new rows an initial read. Limit successful publisher-watch scans to once per 24 hours. Refresh top-25 powers ticker groups every 100 minutes and cold groups every four warm intervals (400 minutes, about 6 hours 40 minutes; immediately if uncached). Retain complete powers and published-contract metadata for six hours. Cold leaderboard/watch observations can be up to 24 hours old; powers observations can be reused for up to six hours.
+- **Evidence freshness** — Separate price-update time from leaderboard contract checks; each verdict exposes its UTC check time and marks observations older than 24 hours stale. Retry all leaderboard rows not marked `checked` on the next discovery pass, preserve publisher-watch results and scan time when every Guard read fails, and keep incomplete power facts in the 30-second retry cache instead of the six-hour cache.
+
+## [1.0.1] - 2026-10-08
+
+**A calmer QED with clearer evidence**
+
+- **Navigation** — group reference links under a no-JavaScript Docs menu with the latest released headline, and mark the current page with an outline that glides between menu items.
+- **Pages** — streamline the homepage and blog, add a linked integration marquee and ambient hex background, icon copy controls, and compact vertical screenshot steps.
+- **Evidence** — foreground three useful statistics, separate long table details, show human UTC timestamps, and load Ondo's public address catalog daily from its documentation and CSV; keep omitted deployments active and the catalog incomplete until a second consecutive clean snapshot confirms their removal.
+- **Flagged tokens** — re-derive retained observation tiers with Guard's classifier and published on-chain product metadata from the current accepted registry at startup, registry refresh, and signed stats generation; distinguish confirmed mismatches from caution near matches, with compact reported-volume summaries and expandable details.
+- **Page polish** — align page titles, add Stats to navigation and the version pill, and clarify leaderboard freshness and phone layout.
+- **Wallet page** — remove the My Wallet page for now; it returns as Connect Wallet.
 
 ## [1.0] - 2026-10-07
 

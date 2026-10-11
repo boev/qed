@@ -1,0 +1,45 @@
+{
+  "observation": {
+    "chain": "robinhood",
+    "chain_label": "Robinhood Chain",
+    "ticker": "NVDA",
+    "publisher": "Backed xStocks",
+    "symbol": "NVDAx",
+    "name": "NVIDIA xStock",
+    "address": "0x0a2b3781e77157cf8a7aa46e09a877493ae0c777",
+    "first_seen_at": "2026-10-08T20:32:07Z",
+    "last_seen_at": "2026-10-08T20:32:07Z",
+    "volume_24h_usd": 1.0,
+    "source": "dexscreener",
+    "guard_url": "/guard/robinhood/0x0a2b3781e77157cf8a7aa46e09a877493ae0c777",
+    "reason": "QED Guard found an exact on-chain symbol/name match for NVIDIA xStock (NVDA), but this address is absent from Backed xStocks's published deployment catalog.",
+    "on_chain_symbol": "NVDAx",
+    "on_chain_name": "NVIDIA xStock"
+  },
+  "registry": [
+    {
+      "issuer": "Backed xStocks",
+      "ticker": "NVDA",
+      "name": "NVIDIA",
+      "chain": "ethereum",
+      "contract": "0xc845b2894dBddd03858fd2D643B4eF725fE0849d",
+      "decimals": null,
+      "source": "xstocks-api",
+      "source_url": "https://api.xstocks.fi/api/v2/public/assets",
+      "last_checked": "2026-10-08T22:04:32Z",
+      "official_deployments": [
+        {
+          "network": "Ethereum",
+          "address": "0xc845b2894dbddd03858fd2d643b4ef725fe0849d"
+        }
+      ]
+    }
+  ],
+  "published": {
+    "address": "0xc845b2894dBddd03858fd2D643B4eF725fE0849d",
+    "symbol": "NVDAx",
+    "name": "NVIDIA xStock",
+    "decimals": null,
+    "total_supply": null
+  }
+}

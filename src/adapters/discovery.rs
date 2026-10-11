@@ -63,7 +63,7 @@ impl DurableBoardStore {
                 return Self::default();
             };
             let config = aws_config::defaults(aws_config::BehaviorVersion::latest()).load().await;
-            return Self { client: Some(S3Client::new(&config)), bucket: Some(bucket) };
+            Self { client: Some(S3Client::new(&config)), bucket: Some(bucket) }
         }
         #[cfg(not(feature = "s3"))]
         {
@@ -279,15 +279,6 @@ pub enum MarketSource {
     Geckoterminal,
 }
 
-impl MarketSource {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Dexscreener => "DexScreener",
-            Self::Geckoterminal => "GeckoTerminal",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DexEndpoint {
     TokenPairs,
@@ -441,7 +432,13 @@ pub struct ImpostorEntry {
     pub address: String,
     pub first_seen_at: String,
     pub last_seen_at: String,
+    #[serde(default)]
+    pub tier: crate::domain::guard::PublisherProductTier,
     pub volume_24h_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liquidity_24h_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_count: Option<u32>,
     #[serde(default)]
     pub source: MarketSource,
     pub guard_url: String,
@@ -484,9 +481,9 @@ pub struct UnsupportedImpostorCandidate {
 pub struct ImpostorSnapshot {
     #[serde(default)]
     pub scanned_at: String,
-    /// Start of the current impostor-search source outage: every search failed or returned
-    /// no pairs. Absent after a successful scan; retained results and `scanned_at` stay from
-    /// the last successful scan.
+    /// Start of a market-search outage: every search failed or returned no pairs. Clear it
+    /// once searches return pairs, even if a later Guard evaluation cannot complete; retained
+    /// observations and `scanned_at` stay from the last completed scan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_unavailable_since: Option<String>,
     #[serde(default)]
@@ -509,6 +506,102 @@ pub struct ImpostorSnapshot {
     pub entries: Vec<ImpostorEntry>,
     #[serde(default)]
     pub unsupported_candidates: Vec<UnsupportedImpostorCandidate>,
+}
+fn classify_impostor_tier(
+    observation: &ImpostorEntry,
+    registry: &Registry,
+    publisher_metadata: &HashMap<String, crate::domain::pool::TokenMeta>,
+    complete_issuers: &HashSet<String>,
+) -> crate::domain::guard::PublisherProductTier {
+    use crate::domain::{guard, pool::TokenMeta};
+
+    let observed = TokenMeta {
+        address: observation.address.clone(),
+        symbol: observation.on_chain_symbol.clone(),
+        name: observation.on_chain_name.clone(),
+        decimals: None,
+        total_supply: None,
+    };
+    for entry in registry.iter().filter(|entry| {
+        registry::matchable(entry)
+            && entry.issuer == observation.publisher
+            && entry.ticker == observation.ticker
+    }) {
+        let key = guard::issuer_metadata_key(entry.chain, &entry.contract);
+        let Some(published) = publisher_metadata.get(&key) else { continue };
+        if guard::classify_publisher_product(
+            &observed,
+            published,
+            guard::publisher_catalog_complete(registry, entry, complete_issuers),
+        ) == Some(crate::domain::guard::PublisherProductTier::Confirmed)
+        {
+            return crate::domain::guard::PublisherProductTier::Confirmed;
+        }
+    }
+    crate::domain::guard::PublisherProductTier::Caution
+}
+
+pub(crate) async fn reclassify_impostor_tiers(
+    snapshot: &mut ImpostorSnapshot,
+    registry: &Arc<Registry>,
+    complete_issuers: &HashSet<String>,
+    context: &crate::app::context::Context,
+) {
+    use crate::domain::{chain::Chain, pool::TokenMeta};
+
+    let mut metadata_by_observation =
+        HashMap::<(String, String, String, String), HashMap<String, TokenMeta>>::new();
+    for observation in &mut snapshot.entries {
+        let tier = crate::domain::guard::PublisherProductTier::Caution;
+        let Some(chain) = Chain::from_network_name(&observation.chain) else {
+            observation.tier = tier;
+            continue;
+        };
+        let (Some(symbol), Some(name)) =
+            (observation.on_chain_symbol.as_deref(), observation.on_chain_name.as_deref())
+        else {
+            observation.tier = tier;
+            continue;
+        };
+        if !registry.iter().any(|entry| {
+            registry::matchable(entry)
+                && entry.issuer == observation.publisher
+                && entry.ticker == observation.ticker
+        }) {
+            observation.tier = tier;
+            continue;
+        }
+        let cache_key = (
+            observation.publisher.clone(),
+            observation.ticker.clone(),
+            symbol.to_owned(),
+            name.to_owned(),
+        );
+        if !metadata_by_observation.contains_key(&cache_key) {
+            let observed = TokenMeta {
+                address: observation.address.clone(),
+                symbol: Some(symbol.to_owned()),
+                name: Some(name.to_owned()),
+                decimals: None,
+                total_supply: None,
+            };
+            let publisher_metadata = crate::app::guard::publisher_metadata_for_observation(
+                context,
+                chain,
+                &observation.address,
+                &observed,
+                Arc::clone(registry),
+            )
+            .await;
+            metadata_by_observation.insert(cache_key.clone(), publisher_metadata);
+        }
+        observation.tier = classify_impostor_tier(
+            observation,
+            registry,
+            metadata_by_observation.get(&cache_key).expect("observation metadata cached"),
+            complete_issuers,
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -734,7 +827,6 @@ impl PoolIndex for DiscoveryPoolIndex {
     }
 
     async fn warm_tickers(&self) -> Vec<String> {
-        let featured = self.featured.read().await;
         let leaderboard = self.leaderboard.read().await;
         let mut ordered = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -744,12 +836,22 @@ impl PoolIndex for DiscoveryPoolIndex {
                 ordered.push(ticker);
             }
         };
-        for ticker in featured.iter().filter_map(|pool| pool.ticker.as_deref()) {
+        let mut entries = leaderboard.entries.iter().collect::<Vec<_>>();
+        entries.sort_by(|left, right| match (left.volume_24h_usd, right.volume_24h_usd) {
+            (Some(left_volume), Some(right_volume)) => {
+                right_volume.total_cmp(&left_volume).then_with(|| left.rank.cmp(&right.rank))
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.rank.cmp(&right.rank),
+        });
+        for ticker in entries.iter().filter_map(|entry| entry.ticker.as_deref()) {
             append(ticker);
         }
-        let mut entries = leaderboard.entries.iter().collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.rank);
-        for ticker in entries.iter().filter_map(|entry| entry.ticker.as_deref()) {
+        drop(entries);
+        drop(leaderboard);
+        let featured = self.featured.read().await;
+        for ticker in featured.iter().filter_map(|pool| pool.ticker.as_deref()) {
             append(ticker);
         }
         ordered
@@ -884,7 +986,7 @@ fn normalize_impostor_snapshot(mut snapshot: ImpostorSnapshot) -> ImpostorSnapsh
         let Some(chain) = chain_from_dex_id(&entry.chain) else {
             rejected_entries = rejected_entries.saturating_add(1);
             tracing::debug!(
-                rejection = ?InvalidWatchObservation::InvalidChain,
+                rejection = ?InvalidWatchObservation::Chain,
                 "rejected persisted publisher-watch entry"
             );
             return false;
@@ -893,7 +995,7 @@ fn normalize_impostor_snapshot(mut snapshot: ImpostorSnapshot) -> ImpostorSnapsh
         if !valid_token_address(chain, address) {
             rejected_entries = rejected_entries.saturating_add(1);
             tracing::debug!(
-                rejection = ?InvalidWatchObservation::InvalidAddress,
+                rejection = ?InvalidWatchObservation::Address,
                 "rejected persisted publisher-watch entry"
             );
             return false;
@@ -905,7 +1007,7 @@ fn normalize_impostor_snapshot(mut snapshot: ImpostorSnapshot) -> ImpostorSnapsh
         {
             rejected_entries = rejected_entries.saturating_add(1);
             tracing::debug!(
-                rejection = ?InvalidWatchObservation::InvalidCatalogHash,
+                rejection = ?InvalidWatchObservation::CatalogHash,
                 "rejected persisted publisher-watch entry"
             );
             return false;
@@ -947,6 +1049,9 @@ fn normalize_impostor_snapshot(mut snapshot: ImpostorSnapshot) -> ImpostorSnapsh
                 entry.reason = reason.detail.clone();
             }
         }
+        entry.liquidity_24h_usd =
+            entry.liquidity_24h_usd.filter(|value| value.is_finite() && *value >= 0.0);
+        entry.pool_count = entry.pool_count.filter(|count| *count > 0);
         clip_impostor_entry_text(entry);
         true
     });
@@ -1318,27 +1423,14 @@ impl DexScreenerClient {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct GeckoBudget {
     requests: VecDeque<Instant>,
     backoff_until: Option<Instant>,
     #[cfg(test)]
-    request_limit: usize,
+    request_limit: Option<usize>,
     #[cfg(test)]
-    backoff_duration: Duration,
-}
-
-impl Default for GeckoBudget {
-    fn default() -> Self {
-        Self {
-            requests: VecDeque::new(),
-            backoff_until: None,
-            #[cfg(test)]
-            request_limit: GECKOTERMINAL_CALLS_PER_MINUTE,
-            #[cfg(test)]
-            backoff_duration: GECKOTERMINAL_BACKOFF,
-        }
-    }
+    backoff_duration: Option<Duration>,
 }
 
 impl GeckoBudget {
@@ -1351,7 +1443,7 @@ impl GeckoBudget {
         }
         self.backoff_until = None;
         #[cfg(test)]
-        let request_limit = self.request_limit;
+        let request_limit = self.request_limit.unwrap_or(GECKOTERMINAL_CALLS_PER_MINUTE);
         #[cfg(not(test))]
         let request_limit = GECKOTERMINAL_CALLS_PER_MINUTE;
         if self.requests.len() >= request_limit {
@@ -1366,7 +1458,7 @@ impl GeckoBudget {
 
     fn backoff(&mut self, now: Instant) {
         #[cfg(test)]
-        let duration = self.backoff_duration;
+        let duration = self.backoff_duration.unwrap_or(GECKOTERMINAL_BACKOFF);
         #[cfg(not(test))]
         let duration = GECKOTERMINAL_BACKOFF;
         self.backoff_until = Some(now + duration);
@@ -2766,6 +2858,40 @@ fn rank_leaderboard_candidates(
     candidates.truncate(MAX_LEADERBOARD_CANDIDATES);
     candidates
 }
+
+fn leaderboard_check_is_due(
+    rank: usize,
+    candidate: &LeaderboardCandidate,
+    previous: Option<&LeaderboardEntry>,
+    extra_hot: &HashSet<(Chain, String)>,
+    now: &DateTime<Utc>,
+) -> bool {
+    let checked_at = previous.and_then(|entry| entry.checked_at.as_deref());
+    let cold_due = crate::app::warm::cold_refresh_is_due(
+        checked_at,
+        now,
+        std::time::Duration::from_secs(
+            DISCOVERY_REFRESH_SECS * crate::app::warm::COLD_EVERY_N_PASSES as u64,
+        ),
+    );
+    let read_failed = previous.is_some_and(|entry| entry.read_status != "checked");
+    let is_hot = rank < crate::app::warm::HOT_POOLS
+        || extra_hot.contains(&(candidate.chain, candidate.pool.to_ascii_lowercase()))
+        || read_failed;
+    crate::app::warm::periodic_item_is_due(is_hot, checked_at.is_some(), cold_due)
+}
+
+fn carry_forward_leaderboard_check(
+    mut current: LeaderboardEntry,
+    previous: &LeaderboardEntry,
+) -> LeaderboardEntry {
+    current.verdict.clone_from(&previous.verdict);
+    current.read_status.clone_from(&previous.read_status);
+    current.read_reason.clone_from(&previous.read_reason);
+    current.attestation_id.clone_from(&previous.attestation_id);
+    current.checked_at.clone_from(&previous.checked_at);
+    current
+}
 fn symbol_matches_search_ticker(symbol: &str, ticker: &str) -> bool {
     let symbol = symbol.trim();
     let symbol_bytes = symbol.as_bytes();
@@ -2879,10 +3005,11 @@ fn rotating_impostor_search_terms(
     for offset in 0..tail_query_count {
         let term_index = (start + offset) % tail_search_count;
         let ticker = &tail_tickers[term_index / 2];
-        if term_index % 2 == 0 && ticker.len() < MIN_DEXSCREENER_SEARCH_BYTES {
+        if term_index.is_multiple_of(2) && ticker.len() < MIN_DEXSCREENER_SEARCH_BYTES {
             continue;
         }
-        let search = if term_index % 2 == 0 { ticker.clone() } else { format!("{ticker}x") };
+        let search =
+            if term_index.is_multiple_of(2) { ticker.clone() } else { format!("{ticker}x") };
         searches.push((ticker.clone(), search));
     }
     (searches, next_offset)
@@ -2974,9 +3101,9 @@ fn rank_impostor_candidates(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InvalidWatchObservation {
-    InvalidChain,
-    InvalidAddress,
-    InvalidCatalogHash,
+    Chain,
+    Address,
+    CatalogHash,
 }
 
 fn compact_watch_reads<'a>(
@@ -3131,13 +3258,13 @@ fn validate_unsupported_candidate(
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
-        return Err(InvalidWatchObservation::InvalidChain);
+        return Err(InvalidWatchObservation::Chain);
     }
     if address.is_empty()
         || address.len() > MAX_IMPOSTOR_ADDRESS_BYTES
         || !address.bytes().all(|byte| byte.is_ascii_graphic())
     {
-        return Err(InvalidWatchObservation::InvalidAddress);
+        return Err(InvalidWatchObservation::Address);
     }
     Ok(())
 }
@@ -3212,41 +3339,71 @@ fn truncate_json_value(value: &mut serde_json::Value, max_bytes: usize) -> bool 
     true
 }
 
-fn catalog_absent_entry(
+struct CatalogAbsence<'a> {
     chain: Chain,
-    scanned_at: &str,
+    scanned_at: &'a str,
     symbol: String,
     name: String,
     volume_24h_usd: Option<f64>,
     source: MarketSource,
     publisher_catalog_snapshot_hash: Option<String>,
+}
+
+fn catalog_absent_entry(
+    observation: CatalogAbsence<'_>,
     mut guard: crate::domain::guard::GuardDocument,
 ) -> Result<Option<ImpostorEntry>, InvalidWatchObservation> {
-    if guard.verdict != crate::domain::guard::GuardVerdict::Deny
-        || guard.identity.status != crate::domain::guard::IdentityStatus::Mismatch
-    {
-        return Ok(None);
-    }
-    let Some(reason_index) = guard
-        .reasons
-        .iter()
-        .position(|reason| reason.code == "claims_unpublished_publisher_product")
-    else {
+    let CatalogAbsence {
+        chain,
+        scanned_at,
+        symbol,
+        name,
+        volume_24h_usd,
+        source,
+        publisher_catalog_snapshot_hash,
+    } = observation;
+    let Some(reason_index) = guard.reasons.iter().position(|reason| {
+        reason.code == "claims_unpublished_publisher_product"
+            || reason.code == "name_resembles_registry_entry"
+    }) else {
         return Ok(None);
     };
-    let (Some(publisher), Some(ticker)) =
-        (guard.identity.publisher.take(), guard.identity.ticker.take())
-    else {
+    let tier = match guard.reasons[reason_index].code.as_str() {
+        "claims_unpublished_publisher_product"
+            if guard.verdict == crate::domain::guard::GuardVerdict::Deny
+                && guard.identity.status == crate::domain::guard::IdentityStatus::Mismatch =>
+        {
+            crate::domain::guard::PublisherProductTier::Confirmed
+        }
+        "name_resembles_registry_entry"
+            if guard.verdict == crate::domain::guard::GuardVerdict::Unknown =>
+        {
+            crate::domain::guard::PublisherProductTier::Caution
+        }
+        _ => return Ok(None),
+    };
+    let candidate = guard.identity.candidate.take();
+    let publisher = guard
+        .identity
+        .publisher
+        .take()
+        .or_else(|| candidate.as_ref().map(|candidate| candidate.publisher.clone()));
+    let ticker = guard
+        .identity
+        .ticker
+        .take()
+        .or_else(|| candidate.as_ref().map(|candidate| candidate.ticker.clone()));
+    let (Some(publisher), Some(ticker)) = (publisher, ticker) else {
         return Ok(None);
     };
     if !valid_token_address(chain, &guard.address) {
-        return Err(InvalidWatchObservation::InvalidAddress);
+        return Err(InvalidWatchObservation::Address);
     }
     if publisher_catalog_snapshot_hash
         .as_deref()
         .is_some_and(|hash| !valid_publisher_catalog_snapshot_hash(hash))
     {
-        return Err(InvalidWatchObservation::InvalidCatalogHash);
+        return Err(InvalidWatchObservation::CatalogHash);
     }
     let (reads, reads_truncated) = compact_watch_reads(guard.reads.iter(), chain, &guard.address);
     let evidence_truncated =
@@ -3262,7 +3419,10 @@ fn catalog_absent_entry(
         address: std::mem::take(&mut guard.address),
         first_seen_at: scanned_at.to_owned(),
         last_seen_at: scanned_at.to_owned(),
+        tier,
         volume_24h_usd,
+        liquidity_24h_usd: None,
+        pool_count: None,
         source,
         guard_url,
         reason: guard.reasons.swap_remove(reason_index).detail,
@@ -3356,6 +3516,18 @@ fn official_unsupported_deployment_key(network: &str, address: &str) -> (String,
     (normalized_watch_network_id(network), watch_address_key(address))
 }
 
+fn impostor_watch_refresh_is_due(snapshot: &ImpostorSnapshot, now: &DateTime<Utc>) -> bool {
+    let checked_at = (!snapshot.scanned_at.is_empty()).then_some(snapshot.scanned_at.as_str());
+    let cold_due = crate::app::warm::cold_refresh_is_due(
+        checked_at,
+        now,
+        std::time::Duration::from_secs(
+            DISCOVERY_REFRESH_SECS * crate::app::warm::COLD_EVERY_N_PASSES as u64,
+        ),
+    );
+    crate::app::warm::periodic_item_is_due(false, checked_at.is_some(), cold_due)
+}
+
 async fn refresh_impostor_watch(
     state: &AppState,
     client: &MarketDataClient,
@@ -3378,6 +3550,7 @@ async fn refresh_impostor_watch(
     let scanned_at = now_rfc3339();
     let mut candidates = Vec::<(Chain, usize, DexPair)>::new();
     let mut candidate_keys = HashSet::new();
+    let mut candidate_pool_addresses = HashMap::<(Chain, String), HashSet<String>>::new();
     let mut unsupported_keys = HashSet::new();
     let mut official_unsupported_keys = HashSet::new();
     let mut official_on_unsupported_chain = 0usize;
@@ -3389,11 +3562,10 @@ async fn refresh_impostor_watch(
     let mut fallback_tickers = HashSet::new();
     let mut watch_budget = GeckoWatchBudget::default();
     let mut searches_made = 0usize;
-    for offset in 0..query_count {
+    for (offset, (ticker, search)) in searches.iter().take(query_count).enumerate() {
         if offset > 0 {
             sleep(REQUEST_INTERVAL).await;
         }
-        let (ticker, search) = &searches[offset];
         let ticker_rank =
             tickers.iter().position(|priority| priority == ticker).unwrap_or(usize::MAX);
         let mut pairs = Vec::new();
@@ -3488,7 +3660,7 @@ async fn refresh_impostor_watch(
             if !valid_token_address(chain, address) {
                 tracing::debug!(
                     %chain,
-                    rejection = ?InvalidWatchObservation::InvalidAddress,
+                    rejection = ?InvalidWatchObservation::Address,
                     "rejected invalid publisher-watch candidate"
                 );
                 continue;
@@ -3497,6 +3669,12 @@ async fn refresh_impostor_watch(
                 continue;
             }
             let key = (chain, impostor_address_key(chain, address));
+            if !pair.pair_address.is_empty() {
+                candidate_pool_addresses
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(impostor_address_key(chain, &pair.pair_address));
+            }
             if candidate_keys.insert(key) {
                 candidates.push((chain, ticker_rank, pair));
             }
@@ -3522,16 +3700,14 @@ async fn refresh_impostor_watch(
         })
         .collect::<HashSet<_>>();
 
-    let mut previous_entries = std::mem::take(&mut previous.entries);
-    previous_entries.retain(|entry| {
-        Chain::from_network_name(&entry.chain)
-            .is_none_or(|chain| registry::lookup(registry, chain, &entry.address).is_none())
-    });
-    let eligible_previous = previous_entries
+    let eligible_previous = previous
+        .entries
         .iter()
         .filter(|entry| {
             let Some(chain) = Chain::from_network_name(&entry.chain) else { return false };
-            !current_candidate_keys.contains(&(chain, impostor_address_key(chain, &entry.address)))
+            registry::lookup(registry, chain, &entry.address).is_none()
+                && !current_candidate_keys
+                    .contains(&(chain, impostor_address_key(chain, &entry.address)))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -3549,6 +3725,7 @@ async fn refresh_impostor_watch(
     let mut detected = Vec::new();
     let mut confirmed_official = HashSet::new();
     let mut guard_checks = 0;
+    let mut successful_guard_checks = 0;
     for offset in 0..recheck_count {
         if guard_checks > 0 {
             sleep(REQUEST_INTERVAL).await;
@@ -3556,11 +3733,10 @@ async fn refresh_impostor_watch(
         guard_checks += 1;
         let previous_entry = &eligible_previous[(recheck_start + offset) % eligible_previous.len()];
         let Some(chain) = Chain::from_network_name(&previous_entry.chain) else { continue };
-        let guard = match crate::app::guard::create(
+        let guard = match crate::app::guard::create_for_watch(
             &state.app,
             &previous_entry.address,
             chain,
-            None,
         )
         .await
         {
@@ -3570,22 +3746,27 @@ async fn refresh_impostor_watch(
                 continue;
             }
         };
+        successful_guard_checks += 1;
         if guard.identity.status == crate::domain::guard::IdentityStatus::Match {
             confirmed_official
                 .insert((chain, impostor_address_key(chain, &previous_entry.address)));
             continue;
         }
         match catalog_absent_entry(
-            chain,
-            &scanned_at,
-            previous_entry.symbol.clone(),
-            previous_entry.name.clone(),
-            previous_entry.volume_24h_usd,
-            previous_entry.source,
-            publisher_catalog_snapshot_hash.clone(),
+            CatalogAbsence {
+                chain,
+                scanned_at: &scanned_at,
+                symbol: previous_entry.symbol.clone(),
+                name: previous_entry.name.clone(),
+                volume_24h_usd: previous_entry.volume_24h_usd,
+                source: previous_entry.source,
+                publisher_catalog_snapshot_hash: publisher_catalog_snapshot_hash.clone(),
+            },
             guard,
         ) {
-            Ok(Some(updated)) => detected.push(updated),
+            Ok(Some(updated)) => {
+                detected.push(updated);
+            }
             Err(rejection) => {
                 tracing::debug!(%chain, rejection = ?rejection, "rejected invalid publisher-watch entry");
                 rejected_entries = rejected_entries.saturating_add(1);
@@ -3593,37 +3774,50 @@ async fn refresh_impostor_watch(
             Ok(None) => {}
         }
     }
-    previous_entries.retain(|entry| {
-        let Some(chain) = Chain::from_network_name(&entry.chain) else { return true };
-        !confirmed_official.contains(&(chain, impostor_address_key(chain, &entry.address)))
-    });
 
     let new_candidate_limit = MAX_IMPOSTOR_CANDIDATES_PER_REFRESH.saturating_sub(guard_checks);
     let judged_count = recheck_count + candidates.len().min(new_candidate_limit);
     for (chain, _ticker_rank, pair) in candidates.into_iter().take(new_candidate_limit) {
+        let Some(address) = pair.base_token.address.as_deref() else { continue };
         if guard_checks > 0 {
             sleep(REQUEST_INTERVAL).await;
         }
         guard_checks += 1;
-        let Some(address) = pair.base_token.address.as_deref() else { continue };
-        let guard = match crate::app::guard::create(&state.app, address, chain, None).await {
-            Ok(guard) => guard,
+        let guard = match crate::app::guard::create_for_watch(&state.app, address, chain).await {
+            Ok(guard) => {
+                successful_guard_checks += 1;
+                guard
+            }
             Err(error) => {
                 warn!(%chain, address, error = %error, "Guard could not read impostor candidate");
                 continue;
             }
         };
+        let observed_liquidity = pair
+            .liquidity
+            .as_ref()
+            .and_then(|liquidity| liquidity.usd)
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        let observed_pool_count = candidate_pool_addresses
+            .get(&(chain, impostor_address_key(chain, address)))
+            .and_then(|pools| u32::try_from(pools.len()).ok());
         match catalog_absent_entry(
-            chain,
-            &scanned_at,
-            pair.base_token.symbol.unwrap_or_default(),
-            pair.base_token.name.unwrap_or_default(),
-            pair.volume.as_ref().and_then(|volume| volume.h24),
-            pair.source,
-            publisher_catalog_snapshot_hash.clone(),
+            CatalogAbsence {
+                chain,
+                scanned_at: &scanned_at,
+                symbol: pair.base_token.symbol.unwrap_or_default(),
+                name: pair.base_token.name.unwrap_or_default(),
+                volume_24h_usd: pair.volume.as_ref().and_then(|volume| volume.h24),
+                source: pair.source,
+                publisher_catalog_snapshot_hash: publisher_catalog_snapshot_hash.clone(),
+            },
             guard,
         ) {
-            Ok(Some(entry)) => detected.push(entry),
+            Ok(Some(mut entry)) => {
+                entry.liquidity_24h_usd = observed_liquidity;
+                entry.pool_count = observed_pool_count;
+                detected.push(entry);
+            }
             Err(rejection) => {
                 tracing::debug!(%chain, rejection = ?rejection, "rejected invalid publisher-watch entry");
                 rejected_entries = rejected_entries.saturating_add(1);
@@ -3631,6 +3825,20 @@ async fn refresh_impostor_watch(
             Ok(None) => {}
         }
     }
+    if guard_checks > 0 && successful_guard_checks == 0 {
+        warn!(
+            guard_checks,
+            "publisher-watch scan could not complete because every Guard evaluation failed; retaining last-good observations"
+        );
+        previous.source_unavailable_since = None;
+        return previous;
+    }
+    let mut previous_entries = std::mem::take(&mut previous.entries);
+    previous_entries.retain(|entry| {
+        let Some(chain) = Chain::from_network_name(&entry.chain) else { return true };
+        registry::lookup(registry, chain, &entry.address).is_none()
+            && !confirmed_official.contains(&(chain, impostor_address_key(chain, &entry.address)))
+    });
     let (entries, evicted_entries) = merge_impostor_entries(previous_entries, detected);
     let (unsupported_candidates, evicted_unsupported_candidates) = merge_unsupported_candidates(
         std::mem::take(&mut previous.unsupported_candidates),
@@ -3762,38 +3970,54 @@ async fn refresh_leaderboard(
     data_dir: &Path,
     registry: &Registry,
     candidates: Vec<LeaderboardCandidate>,
+    extra_hot: &HashSet<(Chain, String)>,
 ) -> HashMap<(Chain, String), CheckResult> {
     let candidates = rank_leaderboard_candidates(candidates);
     let candidate_count = candidates.len();
     let updated_at = now_rfc3339();
+    let now = Utc::now();
+    let previous_by_pool = state
+        .leaderboard
+        .read()
+        .await
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            chain_from_dex_id(&entry.chain)
+                .map(|chain| ((chain, entry.pool.to_ascii_lowercase()), entry.clone()))
+        })
+        .collect::<HashMap<_, _>>();
     let mut entries = candidates
         .iter()
         .enumerate()
         .map(|(index, candidate)| provisional_leaderboard_entry(index + 1, candidate))
         .collect::<Vec<_>>();
     let mut shared_checks = HashMap::with_capacity(candidate_count);
-    let transient_retry_keys = state
-        .leaderboard
-        .read()
-        .await
-        .entries
+    let failed_read_keys = previous_by_pool
         .iter()
-        .filter(|entry| {
-            entry.read_status == "not_read_yet" && entry.read_reason.as_deref() == Some("transient")
-        })
-        .filter_map(|entry| {
-            chain_from_dex_id(&entry.chain).map(|chain| (chain, entry.pool.to_ascii_lowercase()))
-        })
+        .filter(|(_, entry)| entry.read_status != "checked")
+        .map(|(key, _)| key.clone())
         .collect::<HashSet<_>>();
+    let mut checks_run = 0;
     for (index, candidate) in candidates.into_iter().enumerate() {
-        if index > 0 {
+        let key = (candidate.chain, candidate.pool.to_ascii_lowercase());
+        let previous = previous_by_pool.get(&key);
+        if !leaderboard_check_is_due(index, &candidate, previous, extra_hot, &now) {
+            if let Some(previous) = previous {
+                entries[index] = carry_forward_leaderboard_check(
+                    provisional_leaderboard_entry(index + 1, &candidate),
+                    previous,
+                );
+            }
+            continue;
+        }
+        if checks_run > 0 {
             sleep(REQUEST_INTERVAL).await;
         }
-        let force_refresh =
-            transient_retry_keys.contains(&(candidate.chain, candidate.pool.to_ascii_lowercase()));
+        checks_run += 1;
+        let force_refresh = failed_read_keys.contains(&key);
         let result = cached_leaderboard_check(state, &candidate, force_refresh).await;
-        shared_checks
-            .insert((candidate.chain, candidate.pool.to_ascii_lowercase()), result.clone());
+        shared_checks.insert(key, result.clone());
         entries[index] = leaderboard_entry(index + 1, candidate, result);
     }
     let entry_count = entries.len();
@@ -3875,20 +4099,30 @@ pub async fn refresh_discovery(
             return first_refresh;
         }
     };
-    let shared_checks = refresh_leaderboard(state, data_dir, &registry, batch.leaderboard).await;
+    let extra_hot = batch
+        .featured
+        .iter()
+        .map(|candidate| (candidate.chain, candidate.pool.to_ascii_lowercase()))
+        .collect::<HashSet<_>>();
+    let shared_checks =
+        refresh_leaderboard(state, data_dir, &registry, batch.leaderboard, &extra_hot).await;
     if let Err(error) = crate::adapters::web::refresh_stats_snapshot(state).await {
         warn!(%error, "could not refresh prepared statistics after leaderboard refresh");
     }
     refresh_featured(state, data_dir, batch.featured, &shared_checks).await;
     let previous_impostors = state.leaderboard.read().await.impostors.clone();
-    let impostors = refresh_impostor_watch(
-        state,
-        &MarketDataClient::new(state.http.clone()),
-        &registry,
-        publisher_catalog_snapshot_hash,
-        previous_impostors,
-    )
-    .await;
+    let impostors = if impostor_watch_refresh_is_due(&previous_impostors, &Utc::now()) {
+        refresh_impostor_watch(
+            state,
+            &MarketDataClient::new(state.http.clone()),
+            &registry,
+            publisher_catalog_snapshot_hash,
+            previous_impostors,
+        )
+        .await
+    } else {
+        previous_impostors
+    };
     let persisted_board = {
         let mut board = state.leaderboard.write().await;
         board.impostors = impostors;
@@ -4044,6 +4278,100 @@ mod tests {
     use super::*;
     use crate::adapters::solana::METAPLEX_METADATA_PROGRAM;
     use crate::domain::{chain::Chain, registry::Entry};
+    fn legacy_watch_entry(symbol: &str, name: &str) -> ImpostorEntry {
+        serde_json::from_value(serde_json::json!({
+            "chain": "robinhood",
+            "chain_label": "Robinhood Chain",
+            "ticker": "NVDA",
+            "publisher": "Backed xStocks",
+            "symbol": "NVDAx",
+            "name": "NVIDIA xStock",
+            "address": "0x0a2b3781e77157cf8a7aa46e09a877493ae0c777",
+            "first_seen_at": "2026-10-08T20:32:07Z",
+            "last_seen_at": "2026-10-08T20:32:07Z",
+            "volume_24h_usd": 1.0,
+            "guard_url": "/guard/robinhood/0x0a2b3781e77157cf8a7aa46e09a877493ae0c777",
+            "reason": "Legacy persisted watch row.",
+            "on_chain_symbol": symbol,
+            "on_chain_name": name
+        }))
+        .expect("legacy watch entry")
+    }
+
+    fn backed_nvda_registry() -> Registry {
+        vec![Entry {
+            issuer: "Backed xStocks".to_owned(),
+            ticker: "NVDA".to_owned(),
+            name: "NVIDIA".to_owned(),
+            chain: Chain::Ethereum,
+            contract: "0xc845b2894dBddd03858fd2D643B4eF725fE0849d".to_owned(),
+            decimals: None,
+            source: "Backed xStocks registry".to_owned(),
+            source_url: "https://api.xstocks.fi/api/v2/public/assets".to_owned(),
+            last_checked: "2026-10-08T20:31:59Z".to_owned(),
+            removed_at: None,
+            stale_since: None,
+            official_deployments: vec![crate::domain::registry::OfficialDeployment {
+                network: "Ethereum".to_owned(),
+                address: "0xc845b2894dbddd03858fd2d643b4ef725fe0849d".to_owned(),
+                wrapper_address: None,
+                wrapper_address_v2: None,
+            }],
+        }]
+    }
+
+    fn backed_nvda_metadata(
+        registry: &Registry,
+    ) -> HashMap<String, crate::domain::pool::TokenMeta> {
+        let entry = &registry[0];
+        HashMap::from([(
+            crate::domain::guard::issuer_metadata_key(entry.chain, &entry.contract),
+            crate::domain::pool::TokenMeta {
+                address: entry.contract.clone(),
+                symbol: Some("NVDAx".to_owned()),
+                name: Some("NVIDIA xStock".to_owned()),
+                decimals: None,
+                total_supply: None,
+            },
+        )])
+    }
+
+    #[test]
+    fn legacy_watch_tier_uses_guard_published_metadata_and_exact_identity() {
+        let registry = backed_nvda_registry();
+        let complete = HashSet::from(["Backed xStocks".to_owned()]);
+        let published = backed_nvda_metadata(&registry);
+        let mut observation = legacy_watch_entry("NVDAx", "NVIDIA xStock");
+        assert_eq!(observation.tier, crate::domain::guard::PublisherProductTier::Caution);
+        assert_eq!(
+            classify_impostor_tier(&observation, &Registry::new(), &published, &complete),
+            crate::domain::guard::PublisherProductTier::Caution
+        );
+        assert_eq!(
+            classify_impostor_tier(&observation, &registry, &HashMap::new(), &complete),
+            crate::domain::guard::PublisherProductTier::Caution
+        );
+        assert_eq!(
+            classify_impostor_tier(&observation, &registry, &published, &HashSet::new()),
+            crate::domain::guard::PublisherProductTier::Caution
+        );
+        assert_eq!(
+            classify_impostor_tier(&observation, &registry, &published, &complete),
+            crate::domain::guard::PublisherProductTier::Confirmed
+        );
+
+        observation.on_chain_name = Some("NVIDIA xStock ".to_owned());
+        assert_eq!(
+            classify_impostor_tier(&observation, &registry, &published, &complete),
+            crate::domain::guard::PublisherProductTier::Caution
+        );
+        observation.on_chain_name = Some("NVIDIA xStock".to_owned());
+        observation.on_chain_symbol = Some("nvdax".to_owned());
+        assert_eq!(
+            classify_impostor_tier(&observation, &registry, &published, &complete),
+            crate::domain::guard::PublisherProductTier::Caution
+        );
+    }
 
     #[test]
     fn robinhood_explorer_url_uses_blockscout() {
@@ -4083,7 +4411,10 @@ mod tests {
             address: pool.to_owned(),
             first_seen_at: "2026-10-06T00:00:00Z".to_owned(),
             last_seen_at: "2026-10-06T00:00:00Z".to_owned(),
+            tier: crate::domain::guard::PublisherProductTier::Caution,
             volume_24h_usd: None,
+            liquidity_24h_usd: None,
+            pool_count: None,
             source: MarketSource::Dexscreener,
             guard_url: format!("/guard/robinhoodchain/{pool}"),
             reason: "catalog observation".to_owned(),
@@ -4123,7 +4454,10 @@ mod tests {
             address: "0x0000000000000000000000000000000000000001".to_owned(),
             first_seen_at: "2026-10-07T00:00:00Z".to_owned(),
             last_seen_at: "2026-10-07T00:00:00Z".to_owned(),
+            tier: crate::domain::guard::PublisherProductTier::Caution,
             volume_24h_usd: None,
+            liquidity_24h_usd: None,
+            pool_count: None,
             source: MarketSource::Geckoterminal,
             guard_url: "/guard/base/0x0000000000000000000000000000000000000001".to_owned(),
             reason: "catalog observation".to_owned(),
@@ -4140,11 +4474,16 @@ mod tests {
             .as_object_mut()
             .expect("legacy watch row")
             .remove("source");
+        legacy["impostors"]["entries"][0].as_object_mut().expect("legacy watch row").remove("tier");
 
         let restored: Leaderboard =
             serde_json::from_value(legacy).expect("legacy source-less leaderboard");
         assert_eq!(restored.entries[0].source, MarketSource::Dexscreener);
         assert_eq!(restored.impostors.entries[0].source, MarketSource::Dexscreener);
+        assert_eq!(
+            restored.impostors.entries[0].tier,
+            crate::domain::guard::PublisherProductTier::Caution
+        );
     }
 
     #[derive(Debug, Deserialize)]
@@ -4456,8 +4795,8 @@ mod tests {
         );
         {
             let mut budget = client.budget.lock().await;
-            budget.request_limit = usize::MAX;
-            budget.backoff_duration = Duration::ZERO;
+            budget.request_limit = Some(usize::MAX);
+            budget.backoff_duration = Some(Duration::ZERO);
         }
         let pairs = client
             .search("NVIDIA xStock", "robinhood", None)
@@ -4529,7 +4868,7 @@ mod tests {
             reqwest::Client::new(),
             format!("{base_url}/api/v2"),
         );
-        client.budget.lock().await.request_limit = usize::MAX;
+        client.budget.lock().await.request_limit = Some(usize::MAX);
         let addresses = (0..630).map(|index| format!("0x{:040x}", index + 1)).collect::<Vec<_>>();
         let registry = Registry::new();
         let mut refresh_budget = GeckoRegistryBudget::default();
@@ -4634,7 +4973,7 @@ mod tests {
         let registry = state.registry.read().await.clone();
         let http = state.http.clone();
         let gecko = GeckoTerminalClient::with_base_url(http, format!("{base_url}/api/v2"));
-        gecko.budget.lock().await.request_limit = 100;
+        gecko.budget.lock().await.request_limit = Some(100);
         let client = MarketDataClient::with_clients(
             DexScreenerClient::with_base_url(state.http.clone(), base_url.clone()),
             gecko,
@@ -4768,7 +5107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warm_tickers_preserve_featured_then_rank_order_and_deduplicate() {
+    async fn warm_tickers_prioritize_volume_and_append_featured_once() {
         let featured = std::sync::Arc::new(tokio::sync::RwLock::new(vec![
             FeaturedPool {
                 chain: Chain::Base,
@@ -4809,7 +5148,7 @@ mod tests {
                 updated_at: String::new(),
             },
         ]));
-        let leaderboard_entry = |rank, ticker: &str| LeaderboardEntry {
+        let leaderboard_entry = |rank, ticker: &str, volume| LeaderboardEntry {
             rank,
             chain: "base".to_owned(),
             chain_label: "Base".to_owned(),
@@ -4826,7 +5165,7 @@ mod tests {
             read_reason: None,
             price_usd: None,
             change_24h_pct: None,
-            volume_24h_usd: None,
+            volume_24h_usd: volume,
             liquidity_usd: None,
             txns_24h: None,
             detail_url: String::new(),
@@ -4837,14 +5176,14 @@ mod tests {
         };
         let leaderboard = std::sync::Arc::new(tokio::sync::RwLock::new(Leaderboard {
             entries: vec![
-                leaderboard_entry(2, "second"),
-                leaderboard_entry(1, "first"),
-                leaderboard_entry(3, "third"),
+                leaderboard_entry(2, "second", Some(200.0)),
+                leaderboard_entry(1, "first", Some(100.0)),
+                leaderboard_entry(3, "third", Some(300.0)),
             ],
             ..Leaderboard::default()
         }));
         let index = DiscoveryPoolIndex::new(featured, leaderboard);
-        assert_eq!(index.warm_tickers().await, ["FIRST", "DUP", "SECOND", "THIRD"]);
+        assert_eq!(index.warm_tickers().await, ["THIRD", "SECOND", "FIRST", "DUP"]);
     }
     #[tokio::test]
     async fn discovery_pool_index_reads_featured_and_attested_leaderboard_rows() {
@@ -5483,10 +5822,10 @@ mod tests {
             source: MarketSource::Dexscreener,
         }
     }
-    struct TransientPositionReader(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    struct RpcLimitPositionReader(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
     #[async_trait]
-    impl crate::ports::ChainReader for TransientPositionReader {
+    impl crate::ports::ChainReader for RpcLimitPositionReader {
         fn chain(&self) -> Chain {
             Chain::Base
         }
@@ -5505,26 +5844,26 @@ mod tests {
 
         async fn record_position(&self) -> Result<(), crate::domain::pool::PoolError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Err(crate::domain::pool::PoolError::Reader("temporary timeout".to_owned()))
+            Err(crate::domain::pool::PoolError::RpcLimit("test request budget"))
         }
     }
 
     #[tokio::test]
-    async fn transient_leaderboard_read_is_retried_on_the_next_refresh() {
+    async fn non_checked_leaderboard_read_is_retried_on_the_next_refresh() {
         let pool = "0x0000000000000000000000000000000000000011";
         let registry =
             vec![entry(Chain::Base, "0x0000000000000000000000000000000000000022", "NVDA")];
         let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let state = crate::adapters::state::AppState::for_tests(
             registry.clone(),
-            vec![Box::new(TransientPositionReader(std::sync::Arc::clone(&reads)))],
+            vec![Box::new(RpcLimitPositionReader(std::sync::Arc::clone(&reads)))],
             false,
         );
         let initial = check::check(&state.app, pool).await;
         let candidate = leaderboard_candidate(Chain::Base, pool, None);
         let initial_entry = leaderboard_entry(1, candidate.clone(), initial.clone());
         assert_eq!(initial_entry.read_status, "not_read_yet");
-        assert_eq!(initial_entry.read_reason.as_deref(), Some("transient"));
+        assert_eq!(initial_entry.read_reason.as_deref(), Some("rpc_limit"));
         state
             .leaderboard_check_cache
             .insert((Chain::Base, pool.to_ascii_lowercase()), initial)
@@ -5533,12 +5872,13 @@ mod tests {
             Leaderboard { total: 1, entries: vec![initial_entry], ..Leaderboard::default() };
 
         let directory = tempfile::tempdir().expect("temporary leaderboard directory");
-        refresh_leaderboard(&state, directory.path(), &registry, vec![candidate]).await;
+        refresh_leaderboard(&state, directory.path(), &registry, vec![candidate], &HashSet::new())
+            .await;
 
         assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 4);
         let refreshed = state.leaderboard.read().await;
         assert_eq!(refreshed.entries[0].read_status, "not_read_yet");
-        assert_eq!(refreshed.entries[0].read_reason.as_deref(), Some("transient"));
+        assert_eq!(refreshed.entries[0].read_reason.as_deref(), Some("rpc_limit"));
     }
 
     #[test]
@@ -5639,6 +5979,95 @@ mod tests {
             ranked.iter().map(|candidate| candidate.pool.as_str()).collect::<Vec<_>>(),
             vec!["high", "low", "missing"]
         );
+        let now = Utc::now();
+        let recent = (now - chrono::Duration::hours(23)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let stale = (now - chrono::Duration::hours(24)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let mut previous = provisional_leaderboard_entry(51, &ranked[1]);
+        previous.read_status = "checked".to_owned();
+        previous.checked_at = Some(recent);
+        let high_previous = provisional_leaderboard_entry(1, &ranked[0]);
+        let extra_hot = HashSet::new();
+        assert!(leaderboard_check_is_due(0, &ranked[0], Some(&high_previous), &extra_hot, &now));
+        assert!(!leaderboard_check_is_due(
+            crate::app::warm::HOT_POOLS,
+            &ranked[1],
+            Some(&previous),
+            &extra_hot,
+            &now
+        ));
+        for (read_status, read_reason) in [
+            ("not_read_yet", Some("transient")),
+            ("not_read_yet", Some("rpc_limit")),
+            ("not_read_yet", Some("unsupported")),
+            ("unsupported_venue", Some("unsupported_venue")),
+        ] {
+            let failed_previous = LeaderboardEntry {
+                read_status: read_status.to_owned(),
+                read_reason: read_reason.map(str::to_owned),
+                ..previous.clone()
+            };
+            assert!(
+                leaderboard_check_is_due(
+                    crate::app::warm::HOT_POOLS,
+                    &ranked[1],
+                    Some(&failed_previous),
+                    &extra_hot,
+                    &now
+                ),
+                "{read_status} {read_reason:?} must retry on the next pass"
+            );
+        }
+        previous.checked_at = Some(stale);
+        assert!(leaderboard_check_is_due(
+            crate::app::warm::HOT_POOLS,
+            &ranked[1],
+            Some(&previous),
+            &extra_hot,
+            &now
+        ));
+        assert!(leaderboard_check_is_due(
+            crate::app::warm::HOT_POOLS,
+            &ranked[1],
+            None,
+            &extra_hot,
+            &now
+        ));
+    }
+
+    #[test]
+    fn skipped_cold_leaderboard_rows_keep_their_real_check_time() {
+        let candidate = leaderboard_candidate(Chain::Base, "cold-pool", Some(1.0));
+        let checked_at = "2026-10-01T12:34:56Z".to_owned();
+        let mut previous = provisional_leaderboard_entry(51, &candidate);
+        previous.verdict = "mismatch".to_owned();
+        previous.read_status = "checked".to_owned();
+        previous.checked_at = Some(checked_at.clone());
+
+        let carried = carry_forward_leaderboard_check(
+            provisional_leaderboard_entry(51, &candidate),
+            &previous,
+        );
+
+        assert_eq!(carried.verdict, "mismatch");
+        assert_eq!(carried.read_status, "checked");
+        assert_eq!(carried.read_reason, None);
+        assert_eq!(carried.checked_at.as_deref(), Some(checked_at.as_str()));
+    }
+
+    #[test]
+    fn impostor_watch_refreshes_after_four_discovery_intervals() {
+        let now = Utc::now();
+        let recent = (now - chrono::Duration::hours(23)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let stale = (now - chrono::Duration::hours(24)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        assert!(!impostor_watch_refresh_is_due(
+            &ImpostorSnapshot { scanned_at: recent, ..ImpostorSnapshot::default() },
+            &now
+        ));
+        assert!(impostor_watch_refresh_is_due(
+            &ImpostorSnapshot { scanned_at: stale, ..ImpostorSnapshot::default() },
+            &now
+        ));
+        assert!(impostor_watch_refresh_is_due(&ImpostorSnapshot::default(), &now));
     }
 
     #[test]
@@ -5780,7 +6209,10 @@ mod tests {
                 address: address.to_owned(),
                 first_seen_at: first_seen_at.to_owned(),
                 last_seen_at: last_seen_at.to_owned(),
+                tier: crate::domain::guard::PublisherProductTier::Caution,
                 volume_24h_usd: Some(volume),
+                liquidity_24h_usd: None,
+                pool_count: None,
                 source: MarketSource::Dexscreener,
                 guard_url: format!("/guard/base/{address}"),
                 reason: format!("catalog observation at {last_seen_at}"),
@@ -5791,14 +6223,32 @@ mod tests {
                 evidence_truncated: false,
                 guard_document: None,
             };
-        let previous = make_entry("0xAbCd", "first", "old", 1.0);
-        let current = make_entry("0xabcd", "later", "latest", 2.0);
+        let address = "0x000000000000000000000000000000000000000A";
+        let mut previous = make_entry(address, "first", "old", 1.0);
+        previous.liquidity_24h_usd = Some(42.0);
+        previous.pool_count = Some(3);
+        let current = catalog_absent_entry(
+            CatalogAbsence {
+                chain: Chain::Base,
+                scanned_at: "latest",
+                symbol: "NVDAx".to_owned(),
+                name: "NVIDIA xStock".to_owned(),
+                volume_24h_usd: Some(2.0),
+                source: MarketSource::Dexscreener,
+                publisher_catalog_snapshot_hash: Some("d".repeat(64)),
+            },
+            watch_deny_guard(&address.to_ascii_lowercase()),
+        )
+        .expect("valid recheck observation")
+        .expect("catalog-deny recheck");
         let (merged, evicted) = merge_impostor_entries(vec![previous], vec![current]);
         assert_eq!(evicted, 0);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].first_seen_at, "first");
         assert_eq!(merged[0].last_seen_at, "latest");
         assert_eq!(merged[0].volume_24h_usd, Some(2.0));
+        assert_eq!(merged[0].liquidity_24h_usd, None);
+        assert_eq!(merged[0].pool_count, None);
     }
 
     fn hours_ago(hours: i64) -> String {
@@ -6015,13 +6465,15 @@ mod tests {
     fn large_guard_deny_keeps_compact_identity_evidence_and_is_counted() {
         let address = "0x0000000000000000000000000000000000000001";
         let observation = catalog_absent_entry(
-            Chain::Base,
-            "2026-10-07T12:00:00Z",
-            "NVDAx".to_owned(),
-            "NVIDIA xStock".to_owned(),
-            Some(12.5),
-            MarketSource::Dexscreener,
-            Some("c".repeat(64)),
+            CatalogAbsence {
+                chain: Chain::Base,
+                scanned_at: "2026-10-07T12:00:00Z",
+                symbol: "NVDAx".to_owned(),
+                name: "NVIDIA xStock".to_owned(),
+                volume_24h_usd: Some(12.5),
+                source: MarketSource::Dexscreener,
+                publisher_catalog_snapshot_hash: Some("c".repeat(64)),
+            },
             watch_deny_guard(address),
         )
         .expect("well-formed Guard observation")
@@ -6122,13 +6574,15 @@ mod tests {
         assert!(guard.reasons[0].detail.contains("XLayer"));
         assert!(guard.reasons[0].detail.len() > MAX_IMPOSTOR_REASON_BYTES);
         let reason_observation = catalog_absent_entry(
-            Chain::RobinhoodChain,
-            "2026-10-07T12:00:00Z",
-            "NVDAx".to_owned(),
-            "NVIDIA xStock".to_owned(),
-            Some(12.5),
-            MarketSource::Dexscreener,
-            Some("c".repeat(64)),
+            CatalogAbsence {
+                chain: Chain::RobinhoodChain,
+                scanned_at: "2026-10-07T12:00:00Z",
+                symbol: "NVDAx".to_owned(),
+                name: "NVIDIA xStock".to_owned(),
+                volume_24h_usd: Some(12.5),
+                source: MarketSource::Dexscreener,
+                publisher_catalog_snapshot_hash: Some("c".repeat(64)),
+            },
             guard,
         )
         .expect("valid token address and registry hash")
@@ -6149,13 +6603,15 @@ mod tests {
         label_guard.reads[0].raw_result = Some(serde_json::json!(long_symbol));
         label_guard.reads[1].raw_result = Some(serde_json::json!(long_name));
         let label_observation = catalog_absent_entry(
-            Chain::Base,
-            "2026-10-07T12:00:00Z",
-            "NVDAx".repeat(20),
-            "NVIDIA • xStock ".repeat(8),
-            Some(12.5),
-            MarketSource::Dexscreener,
-            Some("c".repeat(64)),
+            CatalogAbsence {
+                chain: Chain::Base,
+                scanned_at: "2026-10-07T12:00:00Z",
+                symbol: "NVDAx".repeat(20),
+                name: "NVIDIA • xStock ".repeat(8),
+                volume_24h_usd: Some(12.5),
+                source: MarketSource::Dexscreener,
+                publisher_catalog_snapshot_hash: Some("c".repeat(64)),
+            },
             label_guard,
         )
         .expect("valid token address and registry hash")
@@ -6248,13 +6704,15 @@ mod tests {
         let address = format!("0x9d70{:036x}", 1);
         let scanned_at = now_rfc3339();
         let observation = catalog_absent_entry(
-            Chain::RobinhoodChain,
-            &scanned_at,
-            "NVDAx".to_owned(),
-            "NVIDIA xStock".to_owned(),
-            Some(12.5),
-            MarketSource::Geckoterminal,
-            Some("c".repeat(64)),
+            CatalogAbsence {
+                chain: Chain::RobinhoodChain,
+                scanned_at: &scanned_at,
+                symbol: "NVDAx".to_owned(),
+                name: "NVIDIA xStock".to_owned(),
+                volume_24h_usd: Some(12.5),
+                source: MarketSource::Geckoterminal,
+                publisher_catalog_snapshot_hash: Some("c".repeat(64)),
+            },
             real_catalog_absence_guard(&address),
         )
         .expect("valid token address and registry hash")
@@ -6289,7 +6747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn impostor_search_outage_keeps_last_results_and_one_failed_query_does_not_abort() {
+    async fn impostor_search_outages_and_guard_failures_retain_last_scan() {
         let no_pairs =
             (axum::http::StatusCode::OK, r#"{"schemaVersion":"1.0.0","pairs":[]}"#.to_owned());
         let failure = (axum::http::StatusCode::SERVICE_UNAVAILABLE, "unavailable".to_owned());
@@ -6371,17 +6829,19 @@ mod tests {
         )));
         assert!(!headline.contains("catalog observations are currently flagged"));
 
-        let last_success = (chrono::Utc::now() - chrono::Duration::hours(1))
+        let last_success = (chrono::Utc::now() - chrono::Duration::hours(25))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let address = format!("0x9d70{:036x}", 2);
         let observation = catalog_absent_entry(
-            Chain::RobinhoodChain,
-            &last_success,
-            "NVDAx".to_owned(),
-            "NVIDIA xStock".to_owned(),
-            Some(12.5),
-            MarketSource::Dexscreener,
-            hash.clone(),
+            CatalogAbsence {
+                chain: Chain::RobinhoodChain,
+                scanned_at: &last_success,
+                symbol: "NVDAx".to_owned(),
+                name: "NVIDIA xStock".to_owned(),
+                volume_24h_usd: Some(12.5),
+                source: MarketSource::Dexscreener,
+                publisher_catalog_snapshot_hash: hash.clone(),
+            },
             real_catalog_absence_guard(&address),
         )
         .expect("valid observation")
@@ -6419,7 +6879,48 @@ mod tests {
             "Impostor search source unavailable since {since}; from the last successful search at {last_success}, 1 catalog observations are currently flagged"
         )));
 
-        set_response("NVDA", no_pairs);
+        set_response(
+            "NVDA",
+            (
+                axum::http::StatusCode::OK,
+                serde_json::json!({"schemaVersion": "1.0.0", "pairs": [{
+                    "chainId": "base",
+                    "dexId": "uniswap",
+                    "pairAddress": "0x00000000000000000000000000000000000000b0",
+                    "baseToken": {
+                        "address": "0x00000000000000000000000000000000000000b1",
+                        "name": "NVIDIA xStock",
+                        "symbol": "NVDAx"
+                    },
+                    "quoteToken": {
+                        "address": "0x00000000000000000000000000000000000000b2",
+                        "symbol": "USDC"
+                    }
+                }]})
+                .to_string(),
+            ),
+        );
+        set_response("NVDAx", no_pairs.clone());
+        let guard_failed =
+            refresh_impostor_watch(&state, &client, &registry, hash.clone(), failed.clone()).await;
+        assert_eq!(guard_failed.scanned_at, last_success);
+        assert_eq!(guard_failed.entries, last_good.entries);
+        assert_eq!(guard_failed.source_unavailable_since, None);
+        assert!(impostor_watch_refresh_is_due(&guard_failed, &chrono::Utc::now()));
+        let guard_stats = stats_headline(guard_failed.clone()).await;
+        assert!(
+            !guard_stats["headline"]
+                .as_str()
+                .expect("stats headline")
+                .contains("Impostor search source unavailable")
+        );
+        assert!(guard_stats["publisher_catalog_watch"]["source_unavailable_since"].is_null());
+        let snapshot = state.stats_snapshot.read().await.clone().expect("stats snapshot");
+        assert!(
+            !String::from_utf8_lossy(&snapshot.html)
+                .contains("impostor search source has been unavailable")
+        );
+        set_response("NVDA", no_pairs.clone());
         set_response(
             "NVDAx",
             (
@@ -6438,10 +6939,12 @@ mod tests {
                 .to_string(),
             ),
         );
-        let recovered = refresh_impostor_watch(&state, &client, &registry, hash, failed).await;
+        let recovery_input = ImpostorSnapshot { entries: Vec::new(), ..guard_failed };
+        let recovered =
+            refresh_impostor_watch(&state, &client, &registry, hash, recovery_input).await;
         assert_eq!(recovered.source_unavailable_since, None);
         assert_ne!(recovered.scanned_at, last_success);
-        assert_eq!(recovered.entries.len(), 1);
+        assert!(recovered.entries.is_empty());
         assert_eq!(recovered.unsupported_candidates.len(), 1);
         assert_eq!(recovered.unsupported_candidates[0].dex_chain_id, "arc");
         assert_eq!(recovered.unsupported_candidates[0].source, MarketSource::Dexscreener);
@@ -6571,7 +7074,10 @@ mod tests {
             address: "0x0000000000000000000000000000000000000001".to_owned(),
             first_seen_at: scanned_at.clone(),
             last_seen_at: scanned_at.clone(),
+            tier: crate::domain::guard::PublisherProductTier::Caution,
             volume_24h_usd: Some(12.5),
+            liquidity_24h_usd: None,
+            pool_count: None,
             source: MarketSource::Dexscreener,
             guard_url: "/guard/robinhood/0x0000000000000000000000000000000000000001".to_owned(),
             reason: "Publisher deployment not listed.".to_owned(),
@@ -6605,13 +7111,15 @@ mod tests {
         let scanned_at = now_rfc3339();
         let address = "0x9d70000000000000000000000000000000000001";
         let observation = catalog_absent_entry(
-            Chain::Base,
-            &scanned_at,
-            "NVDAx".to_owned(),
-            "NVIDIA xStock".to_owned(),
-            Some(12.5),
-            MarketSource::Geckoterminal,
-            Some("e".repeat(64)),
+            CatalogAbsence {
+                chain: Chain::Base,
+                scanned_at: &scanned_at,
+                symbol: "NVDAx".to_owned(),
+                name: "NVIDIA xStock".to_owned(),
+                volume_24h_usd: Some(12.5),
+                source: MarketSource::Geckoterminal,
+                publisher_catalog_snapshot_hash: Some("e".repeat(64)),
+            },
             real_catalog_absence_guard(address),
         )
         .expect("valid observation")

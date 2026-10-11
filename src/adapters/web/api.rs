@@ -1,4 +1,3 @@
-use super::pages;
 use crate::{
     adapters::{
         discovery::{self, FeaturedPool, LeaderboardEntry},
@@ -230,7 +229,7 @@ struct StatsApiPage<'a> {
 const STATS_API_PAGE_SIZE: usize = 50;
 pub(crate) const MAX_SIGNED_STATS_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 
-const IMPOSTOR_STATS_TABLE_LIMIT: usize = 20;
+pub(crate) const IMPOSTOR_STATS_TABLE_LIMIT: usize = 20;
 const IMPOSTOR_STATS_METHOD: &str = concat!(
     "DexScreener is queried first; a cached USDC search returning no pairs marks it unavailable for five minutes. ",
     "On DexScreener errors or canary unavailability, GeckoTerminal searches registry product names across Robinhood, Solana, Ethereum, Base, BNB Chain, Arc, and TON for the top 10 active tickers, with a 10-call-per-minute budget. ",
@@ -348,8 +347,24 @@ pub(crate) fn leaderboard_stats(
             is_within_last_7_days(&entry.last_seen_at, last_7_days_cutoff, now_timestamp)
         })
         .count();
-    let catalog_absent_tokens_truncated =
-        currently_flagged_last_7_days > IMPOSTOR_STATS_TABLE_LIMIT;
+    let table_limit_exceeded = [
+        crate::domain::guard::PublisherProductTier::Confirmed,
+        crate::domain::guard::PublisherProductTier::Caution,
+    ]
+    .into_iter()
+    .any(|tier| {
+        board
+            .impostors
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.tier == tier
+                    && is_within_last_7_days(&entry.last_seen_at, last_7_days_cutoff, now_timestamp)
+            })
+            .count()
+            > IMPOSTOR_STATS_TABLE_LIMIT
+    });
+    let catalog_absent_tokens_truncated = table_limit_exceeded;
     let listed_pools = board.entries.len();
     let catalog_summary = match board.impostors.source_unavailable_since.as_deref() {
         Some(since) if board.impostors.scanned_at.is_empty() => {
@@ -440,15 +455,49 @@ pub(crate) async fn api_stats(
 }
 
 async fn build_stats_cache(state: &AppState) -> Result<StatsSnapshotCache, String> {
-    let board = discovery::normalize_leaderboard(state.leaderboard.read().await.clone());
-    let registry = state.registry.read().await.clone();
+    let (registry, complete_issuers) = {
+        let registry = state.registry.read().await;
+        let complete_issuers =
+            state.app.publisher_catalog_complete.read().map_err(|error| error.to_string())?;
+        (registry.clone(), complete_issuers.clone())
+    };
+    let original_board = state.leaderboard.read().await.clone();
+    let previous_impostors = original_board.impostors.clone();
+    let mut board = discovery::normalize_leaderboard(original_board);
+    discovery::reclassify_impostor_tiers(
+        &mut board.impostors,
+        &registry,
+        &complete_issuers,
+        &state.app,
+    )
+    .await;
+    let changed = board.impostors != previous_impostors;
+    let persist_tiers = changed || board.restored;
+    let current_matches = {
+        let mut current = state.leaderboard.write().await;
+        if current.impostors == previous_impostors {
+            current.impostors.clone_from(&board.impostors);
+            true
+        } else {
+            false
+        }
+    };
+    if persist_tiers && current_matches {
+        // The data directory is the registry file's parent; an unset registry path (tests)
+        // must never fall back to the working directory.
+        if let Some(data_dir) =
+            state.registry_path.parent().filter(|dir| !dir.as_os_str().is_empty())
+        {
+            discovery::save_leaderboard(data_dir, &board);
+        }
+        state.board_store.persist_leaderboard(&board).await;
+    }
     let stats = leaderboard_stats(&board, &registry);
     let recent_catalog_entries =
         recent_catalog_entries(&board.impostors.entries, Utc::now().timestamp());
-    let visible_catalog_entries =
-        &recent_catalog_entries[..recent_catalog_entries.len().min(IMPOSTOR_STATS_TABLE_LIMIT)];
-    let html = super::pages::render_stats_page(state, &stats, visible_catalog_entries)
-        .map_err(|status| format!("rendering stats page failed with {status}"))?;
+    let html =
+        super::pages::render_stats_page(state, &stats, &recent_catalog_entries, &board, &registry)
+            .map_err(|status| format!("rendering stats page failed with {status}"))?;
     let document = build_stats_document(state, stats, &board, &registry)?;
     let json = serde_json::to_vec(&document).map_err(|error| error.to_string())?;
     let csv = stats_csv(&document).map_err(|error| error.to_string())?;
@@ -571,21 +620,22 @@ fn build_stats_document(
     let observed_at = Utc::now().to_rfc3339();
     let public_key = attest::public_key_b58(&state.app);
     let dev = state.app.dev_signer;
-    let payload = StatsDocumentPayload {
-        kind,
-        stats: &stats,
-        reducer_inputs: &reducer_inputs,
-        observed_at: &observed_at,
-        public_key: &public_key,
-        dev,
+    let (id, signature) = {
+        let payload = StatsDocumentPayload {
+            kind,
+            stats: &stats,
+            reducer_inputs: &reducer_inputs,
+            observed_at: &observed_at,
+            public_key: &public_key,
+            dev,
+        };
+        let payload_bytes = crate::domain::attestation::canonical_json(&payload)
+            .map_err(|error| error.to_string())?;
+        if payload_bytes.len() > MAX_SIGNED_STATS_DOCUMENT_BYTES {
+            return Err("stats snapshot exceeds the maximum signed document size".to_owned());
+        }
+        attest::sign_document_payload(&state.app, &payload_bytes)?
     };
-    let payload_bytes =
-        crate::domain::attestation::canonical_json(&payload).map_err(|error| error.to_string())?;
-    if payload_bytes.len() > MAX_SIGNED_STATS_DOCUMENT_BYTES {
-        return Err("stats snapshot exceeds the maximum signed document size".to_owned());
-    }
-    let (id, signature) = attest::sign_document_payload(&state.app, &payload_bytes)?;
-    drop(payload);
     Ok(StatsDocument {
         id,
         kind: kind.to_owned(),
@@ -612,7 +662,7 @@ pub(crate) async fn stats_snapshot_json(State(state): State<AppState>) -> Respon
     }
 }
 
-const STATS_CSV_COLUMNS: usize = 14;
+const STATS_CSV_COLUMNS: usize = 15;
 
 fn push_csv_record(output: &mut String, fields: &[&str]) {
     debug_assert!(fields.len() <= STATS_CSV_COLUMNS);
@@ -754,6 +804,10 @@ fn stats_csv(document: &StatsDocument) -> Result<String, serde_json::Error> {
     );
     for entry in recent_catalog_entries.into_iter().take(IMPOSTOR_STATS_TABLE_LIMIT) {
         let volume = entry.volume_24h_usd.map(|value| value.to_string()).unwrap_or_default();
+        let tier = match entry.tier {
+            crate::domain::guard::PublisherProductTier::Confirmed => "confirmed",
+            crate::domain::guard::PublisherProductTier::Caution => "caution",
+        };
         push_csv_record(
             &mut csv,
             &[
@@ -771,6 +825,7 @@ fn stats_csv(document: &StatsDocument) -> Result<String, serde_json::Error> {
                 &entry.last_seen_at,
                 &entry.guard_url,
                 &entry.reason,
+                tier,
             ],
         );
     }
@@ -1111,9 +1166,14 @@ pub(crate) async fn api_guard_post(
         .map_err(|error| super::guard_error_status(&error))
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct WalletRequest {
+    address: String,
+}
+
 pub(crate) async fn api_wallet(
     State(state): State<AppState>,
-    Json(request): Json<pages::WalletRequest>,
+    Json(request): Json<WalletRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let holdings = crate::app::wallet::wallet_holdings(&state.app, &request.address)
         .await
@@ -1455,6 +1515,36 @@ mod tests {
     use tower::ServiceExt;
     fn test_state(dev_signer: bool) -> AppState {
         AppState::for_tests(Vec::new(), Vec::new(), dev_signer)
+    }
+    struct PublisherMetadataReader {
+        chain: Chain,
+        contract: String,
+        metadata: crate::domain::pool::TokenMeta,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ports::ChainReader for PublisherMetadataReader {
+        fn chain(&self) -> Chain {
+            self.chain
+        }
+
+        async fn read_pool(
+            &self,
+            _address: &str,
+        ) -> Result<crate::domain::pool::PoolInfo, crate::domain::pool::PoolError> {
+            Err(crate::domain::pool::PoolError::Unknown("unused test read".to_owned()))
+        }
+
+        async fn token_meta(
+            &self,
+            address: &str,
+        ) -> Result<crate::domain::pool::TokenMeta, crate::domain::pool::PoolError> {
+            if address.eq_ignore_ascii_case(&self.contract) {
+                Ok(self.metadata.clone())
+            } else {
+                Err(crate::domain::pool::PoolError::Unknown("unexpected token address".to_owned()))
+            }
+        }
     }
 
     #[tokio::test]
@@ -1910,7 +2000,10 @@ mod tests {
             address: "0x0000000000000000000000000000000000000002".to_owned(),
             first_seen_at: scanned_at.clone(),
             last_seen_at: scanned_at.clone(),
+            tier: crate::domain::guard::PublisherProductTier::Caution,
             volume_24h_usd: Some(1234.5),
+            liquidity_24h_usd: None,
+            pool_count: None,
             source: discovery::MarketSource::Dexscreener,
             guard_url: "/guard/base/0x0000000000000000000000000000000000000002".to_owned(),
             reason: "The address is absent from the publisher's published deployment catalog."
@@ -2117,9 +2210,56 @@ mod tests {
             .await
             .expect("stats HTML response");
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 1_048_576).await.unwrap();
-        let html = String::from_utf8(body.to_vec()).expect("stats HTML");
-        assert_eq!(html.matches("<tr>").count(), IMPOSTOR_STATS_TABLE_LIMIT + 1);
+    }
+
+    #[tokio::test]
+    async fn signed_stats_rederive_legacy_watch_tier_from_real_registry_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/discovery/backed-nvda-watch.json"
+        ))
+        .expect("trimmed public watch fixture");
+        let observation: discovery::ImpostorEntry =
+            serde_json::from_value(fixture["observation"].clone()).expect("legacy watch row");
+        assert_eq!(observation.tier, crate::domain::guard::PublisherProductTier::Caution);
+        let registry: crate::domain::registry::Registry =
+            serde_json::from_value(fixture["registry"].clone()).expect("registry snapshot");
+        let published: crate::domain::pool::TokenMeta =
+            serde_json::from_value(fixture["published"].clone()).expect("published token metadata");
+        let reader = PublisherMetadataReader {
+            chain: registry[0].chain,
+            contract: registry[0].contract.clone(),
+            metadata: published,
+        };
+        let mut state = AppState::for_tests(registry, vec![Box::new(reader)], true);
+        let persisted_dir = tempfile::tempdir().expect("temporary persisted board");
+        state.registry_path = Arc::new(persisted_dir.path().join("registry.json"));
+        state.leaderboard.write().await.entries.push(entry("fixture-pool", 1, None, None));
+        state.leaderboard.write().await.impostors.entries.push(observation);
+
+        let response = crate::adapters::web::router(state.clone())
+            .oneshot(Request::get("/stats.json").body(Body::empty()).unwrap())
+            .await
+            .expect("signed stats endpoint");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), MAX_SIGNED_STATS_DOCUMENT_BYTES + 1024)
+            .await
+            .expect("signed stats response body");
+        let document: StatsDocument = serde_json::from_slice(&body).expect("stats JSON");
+        document.verify().expect("signed stats document");
+        assert_eq!(
+            document.reducer_inputs.impostor_watch.entries[0].tier,
+            crate::domain::guard::PublisherProductTier::Confirmed
+        );
+        assert_eq!(
+            state.leaderboard.read().await.impostors.entries[0].tier,
+            crate::domain::guard::PublisherProductTier::Confirmed
+        );
+        let persisted = discovery::load_leaderboard(persisted_dir.path())
+            .expect("reclassified board persisted");
+        assert_eq!(
+            persisted.impostors.entries[0].tier,
+            crate::domain::guard::PublisherProductTier::Confirmed
+        );
     }
 
     #[tokio::test]
@@ -2212,8 +2352,8 @@ mod tests {
         // Every free-text field is over its cap and JSON-escapes to six bytes per byte, so
         // the clipped retained set is the largest one the watch can store and sign.
         let over_cap = |bytes: usize| "\u{1}".repeat(bytes * 2);
-        let mut persisted = discovery::Leaderboard::default();
-        persisted.updated_at = scanned_at.to_owned();
+        let mut persisted =
+            discovery::Leaderboard { updated_at: scanned_at.to_owned(), ..Default::default() };
         persisted.entries.push(entry("fixture-pool", 1, None, None));
         persisted.impostors.entries = (0..129)
             .map(|index| {
@@ -2239,7 +2379,10 @@ mod tests {
                     address: address.clone(),
                     first_seen_at: scanned_at.to_owned(),
                     last_seen_at: scanned_at.to_owned(),
+                    tier: crate::domain::guard::PublisherProductTier::Caution,
                     volume_24h_usd: Some(1.0),
+                    liquidity_24h_usd: None,
+                    pool_count: None,
                     source: discovery::MarketSource::Dexscreener,
                     guard_url: format!("/guard/base/{address}"),
                     reason: over_cap(discovery::MAX_IMPOSTOR_REASON_BYTES),
@@ -2423,7 +2566,10 @@ mod tests {
             address: "0x0000000000000000000000000000000000000002".to_owned(),
             first_seen_at: first_seen_at.clone(),
             last_seen_at: first_seen_at,
+            tier: crate::domain::guard::PublisherProductTier::Caution,
             volume_24h_usd: Some(1234.56789),
+            liquidity_24h_usd: None,
+            pool_count: None,
             source: discovery::MarketSource::Dexscreener,
             guard_url: "/guard/base/0x0000000000000000000000000000000000000002".to_owned(),
             reason: "The address is absent from the publisher's published deployment catalog."
@@ -2443,32 +2589,14 @@ mod tests {
         assert_eq!(page_response.status(), StatusCode::OK);
         let page_body = to_bytes(page_response.into_body(), 32_768).await.unwrap();
         let page_html = String::from_utf8(page_body.to_vec()).expect("stats page HTML");
-        assert!(page_html.contains("Publisher deployment catalog watch"));
-        assert!(page_html.contains("Last searched at"));
-        assert!(page_html.contains("Market data: <a href=\"https://dexscreener.com\""));
-        assert!(page_html.contains("href=\"https://www.geckoterminal.com\""));
-        assert!(page_html.contains("href=\"https://www.coingecko.com/en/api_terms\""));
-        assert!(page_html.contains("class=\"market-data-attribution\""));
-        assert!(page_html.contains("<dl class=\"statement-summary-grid\">"));
-        assert!(page_html.contains("Download signed JSON"));
-        assert!(
-            page_html
-                .contains("catalog observations are currently flagged (seen in the last 7 days)")
-        );
-        assert!(page_html.contains("All retained observations seen in the last 7 days are shown."));
-        assert!(
-            page_html
-                .contains("1 official deployments on unsupported chains were counted separately")
-        );
-        let home_response = crate::adapters::web::router(state.clone())
-            .oneshot(Request::get("/").body(Body::empty()).unwrap())
-            .await
-            .expect("home page response");
-        assert_eq!(home_response.status(), StatusCode::OK);
-        let home_body = to_bytes(home_response.into_body(), 1_048_576).await.unwrap();
-        let home_html = String::from_utf8(home_body.to_vec()).expect("home page HTML");
-        assert!(home_html.contains("1 currently flagged (seen in the last 7 days)"));
-        assert!(home_html.contains("1 new this UTC week"));
+        assert_eq!(page_html.matches("<article class=\"stats-number-card").count(), 4);
+        assert!(page_html.contains("Confirmed mismatches"));
+        assert!(page_html.contains("Caution — near matches"));
+        assert!(page_html.contains(
+            "<p class=\"stats-number\">0</p><p>Pools not checked: 0 not read yet · 0 unsupported venues</p>"
+        ));
+        assert!(page_html.contains("<details class=\"stats-details\">"));
+        assert!(!page_html.contains("<details class=\"stats-details\" open>"));
         let json_response = crate::adapters::web::router(state.clone())
             .oneshot(Request::get("/stats.json").body(Body::empty()).unwrap())
             .await
@@ -2488,6 +2616,10 @@ mod tests {
         assert_eq!(
             snapshot_value["reducer_inputs"]["impostor_watch"]["entries"][0]["source"],
             "dexscreener"
+        );
+        assert_eq!(
+            snapshot_value["reducer_inputs"]["impostor_watch"]["entries"][0]["tier"],
+            "caution"
         );
         let catalog_entry = &document.reducer_inputs.impostor_watch.entries[0];
         assert_eq!(catalog_entry.volume_24h_usd, Some(1234.56789));
@@ -2618,6 +2750,7 @@ mod tests {
         assert!(csv.contains("\"section\",\"metric\",\"value\""));
         assert!(csv.contains("publisher_catalog_method"));
         assert!(csv.contains("publisher_catalog_currently_flagged_last_7_days"));
+        assert!(csv.contains("\"caution\""));
         assert!(csv.contains("1234.56789"));
         assert!(csv.contains("\"' \t=IMPORTXML\""));
     }
@@ -2637,7 +2770,10 @@ mod tests {
                 address: format!("0x{index:040x}"),
                 first_seen_at: now.clone(),
                 last_seen_at: now.clone(),
+                tier: crate::domain::guard::PublisherProductTier::Caution,
                 volume_24h_usd: Some(index as f64),
+                liquidity_24h_usd: None,
+                pool_count: None,
                 source: discovery::MarketSource::Dexscreener,
                 guard_url: format!("/guard/base/0x{index:040x}"),
                 reason: "On-chain metadata matches a publisher product; deployment is absent."

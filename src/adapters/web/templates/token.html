@@ -35,7 +35,7 @@
       <div class="contract-address">
         <span class="contract-card-label">Contract address</span>
         <code>{{ contract.contract }}</code>
-        <button class="copy-button" type="button" data-copy="{{ contract.contract }}" aria-label="Copy {{ contract.chain }} contract address">Copy</button>
+        <button class="copy-button" type="button" data-copy="{{ contract.contract }}" aria-label="Copy {{ contract.chain }} contract address" title="Copy {{ contract.chain }} contract address"><svg aria-hidden="true" focusable="false"><use href="/static/icons.svg#copy"></use></svg></button>
       </div>
       <div class="contract-actions" aria-label="{{ contract.chain }} contract links">
         <a class="button secondary-button" href="{{ contract.explorer_url }}" target="_blank" rel="noopener noreferrer">Explorer <span aria-hidden="true">↗</span></a>
@@ -59,7 +59,7 @@
           <dd>{% if contract.powers.can_change_rules.len() == 0 %}{% if contract.powers.unavailable.len() > 0 %}unavailable (transient){% else %}No evidence observed{% endif %}{% else %}<ul>{% for reason in contract.powers.can_change_rules %}<li>{{ reason }}</li>{% endfor %}</ul>{% endif %}</dd>
           {% if contract.powers.unavailable.len() > 0 %}<dt>Unavailable reads (transient)</dt><dd><ul>{% for reason in contract.powers.unavailable %}<li>{{ reason }}</li>{% endfor %}</ul></dd>{% endif %}
           <dt>{{ contract.powers.source_verified_subject }}</dt><dd>{{ contract.powers.source_verified }}{% if contract.powers.source_verified_proxy.len() > 0 %}; proxy: {{ contract.powers.source_verified_proxy }}{% endif %}</dd>
-          <dt>Observed at</dt><dd><time>{{ contract.powers.observed_at }}</time></dd>
+          <dt>Observed at</dt><dd><time datetime="{{ contract.powers.observed_at }}">{{ contract.powers.observed_at }}</time></dd>
         </dl>
         {% else %}
         <p>Power evidence is unavailable for this page request.</p>

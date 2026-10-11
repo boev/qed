@@ -40,10 +40,7 @@
     </nav>
   </aside>
   <div class="docs-main">
-      {% if whats_new.available %}
-      <p class="release-whats-new"><strong>New in {{ whats_new.release_label }}: {{ whats_new.headline }}</strong> <a href="{{ whats_new.changelog_href }}">→ Changelog</a>{% if whats_new.has_latest_blog %} <span class="latest-blog-link">· Latest post: <a href="{{ whats_new.latest_blog_href }}">{{ whats_new.latest_blog_title }}</a></span>{% endif %}</p>
-      {% endif %}
-    <header class="page-intro">
+    <header class="page-intro content-page-intro docs-page-intro">
       <p class="eyebrow">{{ eyebrow }}</p>
       <h1 class="page-title">{{ heading }}</h1>
       <p>{{ intro }}</p>

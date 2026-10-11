@@ -1,15 +1,22 @@
 # QED brand assets
 
-QED uses the following official, unmodified brand references for chain and DEX labels. The page keeps logos in their source colours only where the source publishes them; interface icons remain `currentColor` and the QED palette stays limited to Solana green (`#14F195`), Solana purple (`#9945FF`), coral (`#FF5C5C`) and neutrals.
+QED keeps chain glyphs one-colour in the UI and uses local, first-party issuer/source marks only where available. External brand assets stay in their source colours; interface accents use the QED palette of Solana green (`#14F195`), Solana purple (`#9945FF`), coral (`#FF5C5C`) and neutrals.
 
 | File / label | Official source | Terms / handling |
 | --- | --- | --- |
 | `solana-mark.svg` | https://solana.com/branding and https://solana.com/src/img/branding/solanaLogoMark.svg | Solana Foundation brand guidance. The source mark is reproduced unmodified. Follow the linked clear-space and no-distortion rules. |
+| `xstocks-mark.svg` | https://xstocks.fi/favicon.svg | xStocks issuer brand mark. Local SVG reference from the official site, scaled without recolouring. |
+| `ondo-mark.svg` | https://ondo.finance/ | Ondo issuer mark. Local SVG reference from the official site, shown in white on a dark chip background. |
+| `robinhood-mark.ico` | https://robinhood.com/favicon.ico | First-party Robinhood site icon, stored locally without alteration; terms were not independently established. |
+| `dexscreener-mark.ico` | https://dexscreener.com/favicon.ico | First-party DexScreener site icon, stored locally without alteration; terms were not independently established. |
+| `geckoterminal-mark.ico` | https://www.geckoterminal.com/favicon.ico | First-party GeckoTerminal site icon, stored locally without alteration; terms were not independently established. |
+| `sourcify-mark.png` | https://sourcify.dev/sourcify_blue_rounded.png | First-party Sourcify mark, stored locally without alteration; terms were not independently established. |
+| `uniswap-mark.ico` | https://app.uniswap.org/favicon.ico | First-party Uniswap site icon, stored locally without alteration; terms were not independently established. |
 | Robinhood Chain | https://docs.robinhood.com/chain/connecting/ | The docs publish a feather mark but no redistributable asset licence. QED uses a one-colour chain glyph in the UI, not a copied logo. |
 | Base | https://base.org/brand | Coinbase/Base brand assets are subject to their brand guidelines. QED uses a one-colour glyph until an approved downloadable asset is available. |
 | Ethereum | https://ethereum.org/assets/ | Ethereum.org lists the diamond SVG for download. QED uses a one-colour diamond glyph in the UI to keep the palette and avoid altering the source artwork. |
 | BNB Chain | https://www.bnbchain.org/en/brand-guidelines | BNB Chain's yellow logo is published under its brand guidelines. QED uses a one-colour glyph in the UI rather than recolouring or modifying it. |
-| PumpSwap / Raydium / Uniswap / PancakeSwap | https://pump.fun/ , https://raydium.io/ , https://uniswap.org/brand , https://www.pancakeswap.finance/brand | Brand ownership remains with each project. QED uses text labels and `currentColor` DEX glyphs; no project logo is altered or redistributed. |
+| PumpSwap / Raydium / Uniswap / PancakeSwap | https://pump.fun/ , https://raydium.io/ , https://uniswap.org/brand , https://www.pancakeswap.finance/brand | Brand ownership remains with each project. QED uses local one-colour DEX glyphs where available and text labels otherwise; no project logo is altered or redistributed. |
 
 `logo.svg` in the parent directory is QED's own wordmark and is not an issuer or chain logo.
 

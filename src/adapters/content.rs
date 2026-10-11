@@ -10,7 +10,7 @@ pub(crate) struct ChangelogEntry {
     pub(crate) label: String,
     pub(crate) headline: String,
     legacy_anchor: Option<String>,
-    date: Option<String>,
+    pub(crate) date: Option<String>,
     summary_html: String,
     details_html: Option<String>,
 }
@@ -58,23 +58,65 @@ fn render_blog_markdown(source: &str) -> String {
     while paragraph_index < paragraphs.len() {
         let (start, end) = paragraphs[paragraph_index];
         transformed.extend(events[cursor..start].iter().cloned());
-        if let Some(image) = image_paragraph(&events, start, end) {
+        if let (Some((copy_start, copy_end)), Some((image_start, image_end))) = (
+            paragraphs.get(paragraph_index + 1).copied(),
+            paragraphs.get(paragraph_index + 2).copied(),
+        ) && copy_start == end + 1
+            && image_start == copy_end + 1
+            && let Some(heading) = step_heading(&events, start, end)
+            && let Some(image) = image_paragraph(&events, image_start, image_end)
+        {
+            let action = paragraphs.get(paragraph_index + 3).copied().filter(
+                |(action_start, action_end)| {
+                    *action_start == image_end + 1
+                        && try_action_paragraph(&events, *action_start, *action_end)
+                },
+            );
+            transformed.push(Event::Html(
+                "<div class=\"blog-step\"><div class=\"blog-step-copy\">".into(),
+            ));
+            transformed.push(Event::Html(format!("<h2>{heading}</h2>").into()));
+            transformed.extend(events[copy_start..=copy_end].iter().cloned());
+            transformed.push(Event::Html("</div>".into()));
             transformed.push(Event::Html(blog_image_figure(&image).into()));
-            cursor = end + 1;
-            paragraph_index += 1;
+            if let Some((action_start, action_end)) = action {
+                transformed.extend(events[action_start..=action_end].iter().cloned());
+                cursor = action_end + 1;
+                paragraph_index += 4;
+            } else {
+                cursor = image_end + 1;
+                paragraph_index += 3;
+            }
+            transformed.push(Event::Html("</div>".into()));
         } else if let Some((next_start, next_end)) = paragraphs.get(paragraph_index + 1).copied()
             && next_start == end + 1
             && let Some(image) = image_paragraph(&events, next_start, next_end)
         {
+            let action = paragraphs.get(paragraph_index + 2).copied().filter(
+                |(action_start, action_end)| {
+                    *action_start == next_end + 1
+                        && try_action_paragraph(&events, *action_start, *action_end)
+                },
+            );
             transformed.push(Event::Html(
                 "<div class=\"blog-step\"><div class=\"blog-step-copy\">".into(),
             ));
             transformed.extend(events[start..=end].iter().cloned());
             transformed.push(Event::Html("</div>".into()));
             transformed.push(Event::Html(blog_image_figure(&image).into()));
+            if let Some((action_start, action_end)) = action {
+                transformed.extend(events[action_start..=action_end].iter().cloned());
+                cursor = action_end + 1;
+                paragraph_index += 3;
+            } else {
+                cursor = next_end + 1;
+                paragraph_index += 2;
+            }
             transformed.push(Event::Html("</div>".into()));
-            cursor = next_end + 1;
-            paragraph_index += 2;
+        } else if let Some(image) = image_paragraph(&events, start, end) {
+            transformed.push(Event::Html(blog_image_figure(&image).into()));
+            cursor = end + 1;
+            paragraph_index += 1;
         } else {
             transformed.extend(events[start..=end].iter().cloned());
             cursor = end + 1;
@@ -122,6 +164,21 @@ fn top_level_paragraphs(events: &[Event<'_>]) -> Vec<(usize, usize)> {
     }
     paragraphs
 }
+fn step_heading(events: &[Event<'_>], start: usize, end: usize) -> Option<String> {
+    if end != start + 4
+        || !matches!(events.get(start), Some(Event::Start(Tag::Paragraph)))
+        || !matches!(events.get(start + 1), Some(Event::Start(Tag::Strong)))
+        || !matches!(events.get(start + 3), Some(Event::End(TagEnd::Strong)))
+        || !matches!(events.get(end), Some(Event::End(TagEnd::Paragraph)))
+    {
+        return None;
+    }
+    let Event::Text(heading) = events.get(start + 2)? else {
+        return None;
+    };
+    let heading = heading.trim();
+    (!heading.is_empty()).then(|| html_escape(heading))
+}
 
 struct BlogImage {
     url: String,
@@ -162,6 +219,21 @@ fn image_paragraph(events: &[Event<'_>], start: usize, end: usize) -> Option<Blo
         return None;
     }
     Some(BlogImage { url, alt, title })
+}
+fn try_action_paragraph(events: &[Event<'_>], start: usize, end: usize) -> bool {
+    let Some(paragraph) = events.get(start..=end) else {
+        return false;
+    };
+    matches!(paragraph.first(), Some(Event::Start(Tag::Paragraph)))
+        && matches!(paragraph.last(), Some(Event::End(TagEnd::Paragraph)))
+        && paragraph.iter().any(|event| matches!(event, Event::Start(Tag::Link { .. })))
+        && paragraph
+            .iter()
+            .find_map(|event| match event {
+                Event::Text(text) => Some(text.trim()),
+                _ => None,
+            })
+            .is_some_and(|text| text.starts_with("Try "))
 }
 
 fn is_markdown_whitespace(event: &Event<'_>) -> bool {
@@ -240,16 +312,13 @@ fn parse_changelog_entries(source: &str) -> Vec<ChangelogEntry> {
             let Some((version, date_label)) = header.split_once(']') else {
                 continue;
             };
-            let version = version.trim();
-            let numeric_version = version.strip_prefix("RC-").unwrap_or(version);
-            let mut components = numeric_version.split('.');
-            let major_valid = components.next().is_some_and(|part| {
-                !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
-            });
-            let minor_valid = components.next().is_none_or(|part| {
-                !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
-            }) && components.next().is_none();
-            if !major_valid || !minor_valid {
+            let components =
+                version.strip_prefix("RC-").unwrap_or(version).split('.').collect::<Vec<_>>();
+            let supported_shape = (1..=3).contains(&components.len())
+                && components
+                    .iter()
+                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+            if !supported_shape {
                 continue;
             }
             let date_label = date_label.trim().trim_start_matches('-').trim();
@@ -266,11 +335,6 @@ fn parse_changelog_entries(source: &str) -> Vec<ChangelogEntry> {
     entries
 }
 
-pub(crate) fn latest_released_changelog_entry() -> io::Result<Option<ChangelogEntry>> {
-    let source = fs::read_to_string("CHANGELOG.md")?;
-    Ok(parse_changelog_entries(&source).into_iter().next())
-}
-
 fn finish_changelog_entry(
     entries: &mut Vec<ChangelogEntry>,
     current: Option<(String, Option<String>, String)>,
@@ -280,17 +344,16 @@ fn finish_changelog_entry(
         let mut headline = None;
         let mut summary_markdown = String::new();
         for line in short_source.lines() {
-            if headline.is_none() {
-                if let Some(value) = line
+            if headline.is_none()
+                && let Some(value) = line
                     .trim()
                     .strip_prefix("**")
                     .and_then(|value| value.strip_suffix("**"))
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
-                {
-                    headline = Some(value.to_owned());
-                    continue;
-                }
+            {
+                headline = Some(value.to_owned());
+                continue;
             }
             summary_markdown.push_str(line);
             summary_markdown.push('\n');
@@ -406,11 +469,8 @@ pub(crate) fn blog_posts() -> io::Result<Vec<BlogPost>> {
 pub(crate) fn published_blog_posts(posts: Vec<BlogPost>) -> Vec<BlogPost> {
     posts.into_iter().filter(|post| !post.draft).collect()
 }
-pub(crate) fn latest_published_blog_post(posts: &[BlogPost]) -> Option<&BlogPost> {
-    posts.iter().find(|post| !post.draft)
-}
 
-fn parse_blog_post(file_name: &str, source: &str) -> io::Result<BlogPost> {
+pub(crate) fn parse_blog_post(file_name: &str, source: &str) -> io::Result<BlogPost> {
     let invalid = invalid_blog_file;
     let source = source.strip_prefix("---\n").ok_or_else(invalid)?;
     let (frontmatter, markdown) = source.split_once("\n---\n").ok_or_else(invalid)?;
@@ -499,10 +559,11 @@ pub(crate) fn blog_index_html(posts: &[BlogPost]) -> String {
         .filter(|post| !post.draft)
         .map(|post| {
             format!(
-                "<article class=\"blog-listing\"><h2><a href=\"/blog/{}\">{}</a></h2><p class=\"blog-date\">{}</p><p>{}</p></article>",
+                "<article class=\"blog-listing\"><a href=\"/blog/{}\"><time class=\"blog-date\" datetime=\"{}\">{}</time><h2>{}</h2><p>{}</p></a></article>",
                 html_escape(&post.slug),
-                html_escape(&post.title),
                 html_escape(&post.date),
+                html_escape(&post.date),
+                html_escape(&post.title),
                 html_escape(&post.summary),
             )
         })
@@ -525,7 +586,8 @@ pub(crate) fn blog_post_html(post: &BlogPost) -> String {
         _ => String::new(),
     };
     format!(
-        "<article class=\"blog-article\"><p class=\"blog-date\">{}</p>{poster}{}</article>",
+        "<article class=\"blog-article\"><time class=\"blog-date\" datetime=\"{}\">{}</time>{poster}{}</article>",
+        html_escape(&post.date),
         html_escape(&post.date),
         post.body_html,
     )
@@ -622,7 +684,7 @@ mod tests {
         assert_eq!(posts.len(), 1);
         let index = blog_index_html(&posts);
         let feed = blog_atom("https://qed.example", &posts);
-        assert!(index.contains("/blog/published-post"));
+        assert!(index.contains("<article class=\"blog-listing\"><a href=\"/blog/published-post\"><time class=\"blog-date\" datetime=\"2026-10-04\">2026-10-04</time><h2>Test post</h2><p>A summary</p></a></article>"));
         assert!(!index.contains("draft-post"));
         assert!(feed.contains("/blog/published-post"));
         assert!(!feed.contains("draft-post"));
@@ -632,21 +694,28 @@ mod tests {
     #[test]
     fn released_changelog_entries_render_in_reverse_chronological_order() {
         let entries = changelog_entries();
-        assert_eq!(entries[0].anchor, "release-1.0");
-        assert_eq!(entries[0].label, "1.0");
-        assert_eq!(entries[0].headline, "Impostor watch, reliable reads, and easier QED workflows");
+        assert_eq!(entries[0].anchor, "release-1.0.2");
+        assert_eq!(entries[0].label, "1.0.2");
+        assert_eq!(entries[0].headline, "Lighter background reads with honest check times");
+        assert_eq!(entries[1].label, "1.0.1");
         let page = changelog_html();
         let feed = changelog_atom("https://qed.example");
-        assert!(page.contains("id=\"release-1.0\""));
+        assert!(page.contains("id=\"release-1.0.2\""));
+        assert!(page.contains("id=\"release-1.0.1\""));
         assert!(page.contains("id=\"release-9\""));
         assert!(page.contains("id=\"release-1\""));
         assert!(page.contains(">RC-8.1</span>"));
-        assert!(feed.contains("<title>1.0 — Impostor watch"));
+        assert!(
+            feed.contains(
+                "<title>1.0.2 — Lighter background reads with honest check times</title>"
+            )
+        );
+        assert!(feed.contains("<title>1.0.1 — A calmer QED with clearer evidence</title>"));
         assert!(feed.contains("<title>RC-8.1 — Pages open"));
         assert!(!page.contains("Unreleased"));
         assert!(!feed.contains("Unreleased"));
         assert!(!page.contains("RC-8.2"));
-        assert_eq!(feed.matches("<entry>").count(), 10);
+        assert_eq!(feed.matches("<entry>").count(), 12);
     }
     #[test]
     fn changelog_details_are_collapsed_and_excluded_from_the_atom_feed() {
@@ -688,16 +757,6 @@ mod tests {
     }
 
     #[test]
-    fn latest_blog_link_skips_drafts() {
-        let posts =
-            [post("2026-10-04-draft-post.md", true), post("2026-10-04-published-post.md", false)];
-        assert_eq!(
-            latest_published_blog_post(&posts).map(|post| post.slug.as_str()),
-            Some("published-post")
-        );
-    }
-
-    #[test]
     fn blog_markdown_images_render_as_linked_step_figures() {
         let post = parse_blog_post(
             "2026-10-06-image-post.md",
@@ -727,9 +786,12 @@ mod tests {
         )
         .expect("valid image post");
         let rendered = blog_post_html(&post);
-        assert!(rendered.contains(
-            "class=\"blog-image-link blog-image-light\" href=\"/static/blog/2026-10-06/1-guard.png\""
-        ));
+        assert!(
+            rendered.contains(
+                "class=\"blog-image-link blog-image-light\" href=\"/static/blog/2026-10-06/1-guard.png\""
+            ),
+            "rendered HTML: {rendered}"
+        );
         assert!(rendered.contains(
             "class=\"blog-image-link blog-image-dark\" href=\"/static/blog/2026-10-06/1-guard-dark.png\""
         ));
@@ -746,6 +808,39 @@ mod tests {
         let rendered = blog_post_html(post);
         assert_eq!(rendered.matches("<div class=\"blog-step\">").count(), 3);
         assert_eq!(rendered.matches("<figure class=\"blog-figure\">").count(), 3);
+        for (heading, sentence, image, action) in [
+            (
+                "1. Is it the real one?",
+                "Guard compares the token with the contract its issuer published.",
+                "1-guard.png",
+                "Try Guard",
+            ),
+            (
+                "2. Who can freeze it?",
+                "See in plain words whether the issuer can pause, freeze, blocklist or upgrade it.",
+                "2-powers.png",
+                "Try Powers",
+            ),
+            (
+                "3. Can you prove what you hold?",
+                "Create a signed Statement of your wallets at a block height. Anyone can check it at ",
+                "3-statement.png",
+                "Try Statement",
+            ),
+        ] {
+            let step_start = rendered.find(&format!("<h2>{heading}</h2>")).expect("step heading");
+            let sentence_start = rendered[step_start..].find(sentence).expect("step sentence");
+            let image_start = rendered[step_start..]
+                .find(&format!("src=\"/static/blog/2026-10-06/{image}\""))
+                .expect("step screenshot");
+            let action_start =
+                rendered[step_start..].find(&format!(">{action}</a>")).expect("step action");
+            let step_close =
+                rendered[step_start + action_start..].find("</div>").expect("step closing wrapper")
+                    + action_start;
+            assert!(sentence_start < image_start, "{heading}");
+            assert!(image_start < action_start && action_start < step_close, "{heading}");
+        }
     }
 
     #[test]

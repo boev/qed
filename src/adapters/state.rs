@@ -329,6 +329,11 @@ impl AppState {
             ports::{Clock, IssuerRegistry},
         };
 
+        let publisher_catalog_complete = entries
+            .iter()
+            .filter(|entry| !entry.official_deployments.is_empty())
+            .map(|entry| entry.issuer.clone())
+            .collect::<HashSet<_>>();
         let registry = Arc::new(RwLock::new(Arc::new(entries)));
         let readers = Arc::new(readers);
         let http = reqwest::Client::new();
@@ -343,6 +348,10 @@ impl AppState {
         let powers_cache = Cache::builder()
             .max_capacity(10_000)
             .time_to_live(crate::app::warm::POWERS_CACHE_TTL)
+            .build();
+        let publisher_metadata_cache = Cache::builder()
+            .max_capacity(10_000)
+            .time_to_live(crate::app::guard::PUBLISHER_METADATA_CACHE_TTL)
             .build();
         let powers_retry_cache = Cache::builder().max_capacity(10_000).build();
         let powers_failure_cache = Cache::builder().max_capacity(10_000).build();
@@ -372,6 +381,7 @@ impl AppState {
             check_cache: Arc::new(check_cache.clone()),
             statement_cache: Arc::new(statement_cache.clone()),
             powers_cache: Arc::new(powers_cache.clone()),
+            publisher_metadata_cache: Arc::new(publisher_metadata_cache.clone()),
             powers_retry_cache: Arc::new(powers_retry_cache.clone()),
             powers_failure_cache: Arc::new(powers_failure_cache.clone()),
             powers_locks: Arc::new(powers_locks.clone()),
@@ -387,6 +397,7 @@ impl AppState {
             dev_signer,
             attest_store,
             registry_hash,
+            publisher_catalog_complete: Arc::new(StdRwLock::new(publisher_catalog_complete)),
             registry_version,
             source_verifier: Arc::new(crate::app::context::test_support::TestSourceVerifier),
             clock,
