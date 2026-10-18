@@ -87,6 +87,15 @@ pub enum PoolError {
     CodeLookupUnsupported,
     #[error("pool discovery budget exhausted: {0}")]
     BudgetExceeded(&'static str),
+    #[error("QED daily RPC read budget reached")]
+    DailyBudgetExceeded,
     #[error("pool reader failed: {0}")]
     Reader(String),
+}
+
+impl PoolError {
+    pub(crate) fn is_daily_budget_exceeded(&self) -> bool {
+        matches!(self, Self::DailyBudgetExceeded)
+            || matches!(self, Self::Reader(reason) if reason.contains("QED_DAILY_RPC_BUDGET_REACHED"))
+    }
 }

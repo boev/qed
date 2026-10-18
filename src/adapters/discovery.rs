@@ -49,6 +49,7 @@ where
 
 #[derive(Clone, Default)]
 pub struct DurableBoardStore {
+    pub(crate) database: Option<Arc<super::storage::DurableStore>>,
     #[cfg(feature = "s3")]
     client: Option<S3Client>,
     #[cfg(feature = "s3")]
@@ -56,24 +57,39 @@ pub struct DurableBoardStore {
 }
 
 impl DurableBoardStore {
-    pub async fn new(bucket: Option<String>) -> Self {
+    pub async fn new(
+        bucket: Option<String>,
+        database: Option<Arc<super::storage::DurableStore>>,
+    ) -> Self {
         #[cfg(feature = "s3")]
         {
             let Some(bucket) = bucket.filter(|bucket| !bucket.is_empty()) else {
-                return Self::default();
+                return Self { database, ..Self::default() };
             };
             let config = aws_config::defaults(aws_config::BehaviorVersion::latest()).load().await;
-            Self { client: Some(S3Client::new(&config)), bucket: Some(bucket) }
+            Self { database, client: Some(S3Client::new(&config)), bucket: Some(bucket) }
         }
         #[cfg(not(feature = "s3"))]
         {
             let _ = bucket;
-            Self::default()
+            Self { database }
         }
     }
 
     #[cfg(feature = "s3")]
     async fn read<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
+        if let Some(database) = &self.database {
+            if let Ok(Some(bytes)) = database.get(key).await {
+                return serde_json::from_slice(&bytes).ok();
+            }
+            if let Some(bytes) = database.working_snapshot(key).await {
+                return serde_json::from_slice(&bytes).ok();
+            }
+            // S3 discovery snapshots stop advancing after cutover. Never restore them on outage.
+            if !database.available() {
+                return None;
+            }
+        }
         let (Some(client), Some(bucket)) = (&self.client, &self.bucket) else {
             return None;
         };
@@ -111,12 +127,27 @@ impl DurableBoardStore {
 
     #[cfg(not(feature = "s3"))]
     async fn read<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
-        let _ = key;
-        None
+        let database = self.database.as_ref()?;
+        let bytes = match database.get(key).await.ok().flatten() {
+            Some(bytes) => bytes,
+            None => database.working_snapshot(key).await?,
+        };
+        serde_json::from_slice(&bytes).ok()
     }
 
     #[cfg(feature = "s3")]
     async fn write<T: Serialize>(&self, key: &str, value: &T) {
+        if let Some(database) = &self.database {
+            match serde_json::to_vec(value) {
+                Ok(bytes) => {
+                    if database.put(key, bytes).await.is_err() {
+                        warn!(key, "durable board capture failed");
+                    }
+                }
+                Err(_) => warn!(key, "serializing durable board failed"),
+            }
+            return;
+        }
         let (Some(client), Some(bucket)) = (&self.client, &self.bucket) else {
             return;
         };
@@ -146,7 +177,16 @@ impl DurableBoardStore {
 
     #[cfg(not(feature = "s3"))]
     async fn write<T: Serialize>(&self, key: &str, value: &T) {
-        let _ = (key, value);
+        if let Some(database) = &self.database {
+            match serde_json::to_vec(value) {
+                Ok(bytes) => {
+                    if database.put(key, bytes).await.is_err() {
+                        warn!(key, "durable board capture failed");
+                    }
+                }
+                Err(_) => warn!(key, "serializing durable board failed"),
+            }
+        }
     }
 
     pub async fn load_leaderboard(&self) -> Option<Leaderboard> {
@@ -550,17 +590,17 @@ pub(crate) async fn reclassify_impostor_tiers(
     use crate::domain::{chain::Chain, pool::TokenMeta};
 
     let mut metadata_by_observation =
-        HashMap::<(String, String, String, String), HashMap<String, TokenMeta>>::new();
+        HashMap::<(String, String, String, String), (HashMap<String, TokenMeta>, bool)>::new();
     for observation in &mut snapshot.entries {
-        let tier = crate::domain::guard::PublisherProductTier::Caution;
+        if crate::ports::rpc_reads_rejected() {
+            break;
+        }
         let Some(chain) = Chain::from_network_name(&observation.chain) else {
-            observation.tier = tier;
             continue;
         };
         let (Some(symbol), Some(name)) =
             (observation.on_chain_symbol.as_deref(), observation.on_chain_name.as_deref())
         else {
-            observation.tier = tier;
             continue;
         };
         if !registry.iter().any(|entry| {
@@ -568,7 +608,7 @@ pub(crate) async fn reclassify_impostor_tiers(
                 && entry.issuer == observation.publisher
                 && entry.ticker == observation.ticker
         }) {
-            observation.tier = tier;
+            observation.tier = crate::domain::guard::PublisherProductTier::Caution;
             continue;
         }
         let cache_key = (
@@ -585,7 +625,7 @@ pub(crate) async fn reclassify_impostor_tiers(
                 decimals: None,
                 total_supply: None,
             };
-            let publisher_metadata = crate::app::guard::publisher_metadata_for_observation(
+            let metadata = crate::app::guard::publisher_metadata_for_observation(
                 context,
                 chain,
                 &observation.address,
@@ -593,14 +633,15 @@ pub(crate) async fn reclassify_impostor_tiers(
                 Arc::clone(registry),
             )
             .await;
-            metadata_by_observation.insert(cache_key.clone(), publisher_metadata);
+            metadata_by_observation.insert(cache_key.clone(), metadata);
         }
-        observation.tier = classify_impostor_tier(
-            observation,
-            registry,
-            metadata_by_observation.get(&cache_key).expect("observation metadata cached"),
-            complete_issuers,
-        );
+        let (publisher_metadata, unavailable) =
+            metadata_by_observation.get(&cache_key).expect("observation metadata cached");
+        if *unavailable || crate::ports::rpc_reads_rejected() {
+            continue;
+        }
+        observation.tier =
+            classify_impostor_tier(observation, registry, publisher_metadata, complete_issuers);
     }
 }
 
@@ -1111,7 +1152,7 @@ pub(crate) fn normalize_leaderboard(mut leaderboard: Leaderboard) -> Leaderboard
             let slug = chain_slug(chain);
             entry.chain = slug.to_owned();
             entry.chain_label = chain_label(chain).to_owned();
-            entry.detail_url = format!("/validated/{slug}/{}", entry.pool);
+            entry.detail_url = format!("/assets/{slug}/pool/{}", entry.pool);
             entry.trade_url = canonical_market_url_for_source(
                 chain,
                 &entry.pool,
@@ -2363,7 +2404,7 @@ fn dedup_leaderboard_candidates(
 ) -> Vec<LeaderboardCandidate> {
     let mut by_pool: HashMap<(Chain, String), LeaderboardCandidate> = HashMap::new();
     for candidate in candidates {
-        let key = (candidate.chain, candidate.pool.to_ascii_lowercase());
+        let key = (candidate.chain, crate::domain::check::cache_key(&candidate.pool));
         match by_pool.get_mut(&key) {
             None => {
                 by_pool.insert(key, candidate);
@@ -2424,7 +2465,7 @@ pub fn dedup_and_order(
     let mut by_pool: HashMap<(Chain, String), DiscoveryCandidate> = HashMap::new();
     let mut curated_keys = Vec::new();
     for candidate in candidates {
-        let key = (candidate.chain, candidate.pool.to_ascii_lowercase());
+        let key = (candidate.chain, crate::domain::check::cache_key(&candidate.pool));
         match by_pool.get_mut(&key) {
             None => {
                 if candidate.curated {
@@ -2705,11 +2746,20 @@ async fn refresh_featured(
         if index > 0 {
             sleep(REQUEST_INTERVAL).await;
         }
-        let key = (candidate.chain, candidate.pool.to_ascii_lowercase());
+        let key = (candidate.chain, crate::domain::check::cache_key(&candidate.pool));
         let result = match shared_checks.get(&key) {
             Some(result) => result.clone(),
-            None => check::check(&state.app, &candidate.pool).await,
+            None => check::check_on_chain(&state.app, candidate.chain, &candidate.pool).await,
         };
+        if crate::ports::rpc_reads_rejected() {
+            defer_featured_refresh(
+                state,
+                "daily RPC read budget unavailable",
+                DISCOVERY_REFRESH_SECS,
+            )
+            .await;
+            return;
+        }
         featured.push(featured_from_check(candidate, result));
     }
     let previous_count = state.featured.read().await.len();
@@ -2747,7 +2797,9 @@ async fn refresh_featured(
         refreshing: false,
         empty_successful: false,
     };
-    save_featured(data_dir, &snapshot);
+    if state.board_store.database.is_none() {
+        save_featured(data_dir, &snapshot);
+    }
     state.board_store.persist_featured(&snapshot).await;
     *state.featured.write().await = snapshot.pools;
     *state.featured_status.write().await = FeaturedStatus {
@@ -2764,16 +2816,26 @@ async fn cached_leaderboard_check(
     candidate: &LeaderboardCandidate,
     force_refresh: bool,
 ) -> CheckResult {
-    let key = (candidate.chain, candidate.pool.to_ascii_lowercase());
+    let key = (candidate.chain, crate::domain::check::cache_key(&candidate.pool));
     if force_refresh {
         state.leaderboard_check_cache.invalidate(&key).await;
-        state.app.check_cache.invalidate(&crate::domain::check::cache_key(&candidate.pool)).await;
+        state
+            .app
+            .check_cache
+            .invalidate(&format!(
+                "{}:{}",
+                candidate.chain,
+                crate::domain::check::cache_key(&candidate.pool)
+            ))
+            .await;
     }
     if let Some(result) = state.leaderboard_check_cache.get(&key).await {
         return result;
     }
-    let result = check::check(&state.app, &candidate.pool).await;
-    state.leaderboard_check_cache.insert(key, result.clone()).await;
+    let result = check::check_on_chain(&state.app, candidate.chain, &candidate.pool).await;
+    if !crate::ports::rpc_reads_rejected() {
+        state.leaderboard_check_cache.insert(key, result.clone()).await;
+    }
     result
 }
 
@@ -2801,7 +2863,7 @@ fn provisional_leaderboard_entry(
         liquidity_usd: candidate.liquidity_usd,
         txns_24h: candidate.txns_24h,
         source: candidate.source,
-        detail_url: format!("/validated/{}/{}", chain_slug(candidate.chain), candidate.pool),
+        detail_url: format!("/assets/{}/pool/{}", chain_slug(candidate.chain), candidate.pool),
         trade_url: candidate.trade_url.clone(),
         explorer_url: explorer_url(candidate.chain, &candidate.pool),
         attestation_id: None,
@@ -2835,7 +2897,7 @@ fn leaderboard_entry(
         volume_24h_usd: candidate.volume_24h_usd,
         liquidity_usd: candidate.liquidity_usd,
         txns_24h: candidate.txns_24h,
-        detail_url: format!("/validated/{}/{}", chain_slug(candidate.chain), candidate.pool),
+        detail_url: format!("/assets/{}/pool/{}", chain_slug(candidate.chain), candidate.pool),
         trade_url: candidate.trade_url.clone(),
         explorer_url: explorer_url(candidate.chain, &candidate.pool),
         source: candidate.source,
@@ -2876,7 +2938,7 @@ fn leaderboard_check_is_due(
     );
     let read_failed = previous.is_some_and(|entry| entry.read_status != "checked");
     let is_hot = rank < crate::app::warm::HOT_POOLS
-        || extra_hot.contains(&(candidate.chain, candidate.pool.to_ascii_lowercase()))
+        || extra_hot.contains(&(candidate.chain, crate::domain::check::cache_key(&candidate.pool)))
         || read_failed;
     crate::app::warm::periodic_item_is_due(is_hot, checked_at.is_some(), cold_due)
 }
@@ -3746,6 +3808,9 @@ async fn refresh_impostor_watch(
                 continue;
             }
         };
+        if crate::ports::rpc_reads_rejected() {
+            return previous;
+        }
         successful_guard_checks += 1;
         if guard.identity.status == crate::domain::guard::IdentityStatus::Match {
             confirmed_official
@@ -3793,6 +3858,9 @@ async fn refresh_impostor_watch(
                 continue;
             }
         };
+        if crate::ports::rpc_reads_rejected() {
+            return previous;
+        }
         let observed_liquidity = pair
             .liquidity
             .as_ref()
@@ -3939,7 +4007,9 @@ async fn publish_leaderboard(
         impostors,
     };
     if persist {
-        save_leaderboard(data_dir, &leaderboard);
+        if state.board_store.database.is_none() {
+            save_leaderboard(data_dir, &leaderboard);
+        }
         state.board_store.persist_leaderboard(&leaderboard).await;
     }
     *state.leaderboard.write().await = leaderboard;
@@ -3957,7 +4027,10 @@ async fn defer_leaderboard_refresh(
         board.refreshing = false;
         board.clone()
     };
-    save_leaderboard(data_dir, &board);
+    if state.board_store.database.is_none() {
+        save_leaderboard(data_dir, &board);
+    }
+    state.board_store.persist_leaderboard(&board).await;
     warn!(
         reason,
         entries = board.entries.len(),
@@ -3984,7 +4057,7 @@ async fn refresh_leaderboard(
         .iter()
         .filter_map(|entry| {
             chain_from_dex_id(&entry.chain)
-                .map(|chain| ((chain, entry.pool.to_ascii_lowercase()), entry.clone()))
+                .map(|chain| ((chain, crate::domain::check::cache_key(&entry.pool)), entry.clone()))
         })
         .collect::<HashMap<_, _>>();
     let mut entries = candidates
@@ -4000,7 +4073,7 @@ async fn refresh_leaderboard(
         .collect::<HashSet<_>>();
     let mut checks_run = 0;
     for (index, candidate) in candidates.into_iter().enumerate() {
-        let key = (candidate.chain, candidate.pool.to_ascii_lowercase());
+        let key = (candidate.chain, crate::domain::check::cache_key(&candidate.pool));
         let previous = previous_by_pool.get(&key);
         if !leaderboard_check_is_due(index, &candidate, previous, extra_hot, &now) {
             if let Some(previous) = previous {
@@ -4017,6 +4090,16 @@ async fn refresh_leaderboard(
         checks_run += 1;
         let force_refresh = failed_read_keys.contains(&key);
         let result = cached_leaderboard_check(state, &candidate, force_refresh).await;
+        if crate::ports::rpc_reads_rejected() {
+            defer_leaderboard_refresh(
+                state,
+                data_dir,
+                "daily RPC read budget unavailable",
+                DISCOVERY_REFRESH_SECS,
+            )
+            .await;
+            return shared_checks;
+        }
         shared_checks.insert(key, result.clone());
         entries[index] = leaderboard_entry(index + 1, candidate, result);
     }
@@ -4102,10 +4185,15 @@ pub async fn refresh_discovery(
     let extra_hot = batch
         .featured
         .iter()
-        .map(|candidate| (candidate.chain, candidate.pool.to_ascii_lowercase()))
+        .map(|candidate| (candidate.chain, crate::domain::check::cache_key(&candidate.pool)))
         .collect::<HashSet<_>>();
     let shared_checks =
         refresh_leaderboard(state, data_dir, &registry, batch.leaderboard, &extra_hot).await;
+    if crate::ports::rpc_reads_rejected() {
+        defer_featured_refresh(state, "daily RPC read budget unavailable", DISCOVERY_REFRESH_SECS)
+            .await;
+        return false;
+    }
     if let Err(error) = crate::adapters::web::refresh_stats_snapshot(state).await {
         warn!(%error, "could not refresh prepared statistics after leaderboard refresh");
     }
@@ -4128,7 +4216,9 @@ pub async fn refresh_discovery(
         board.impostors = impostors;
         board.clone()
     };
-    save_leaderboard(data_dir, &persisted_board);
+    if state.board_store.database.is_none() {
+        save_leaderboard(data_dir, &persisted_board);
+    }
     state.board_store.persist_leaderboard(&persisted_board).await;
     crate::app::warm::notify_powers_warm_if_targets(&state.app, warm_notify).await;
     if let Err(error) = crate::adapters::web::refresh_stats_snapshot(state).await {
@@ -4372,6 +4462,49 @@ mod tests {
             crate::domain::guard::PublisherProductTier::Caution
         );
     }
+    struct BudgetRejectedMetadataReader;
+    #[async_trait::async_trait]
+    impl crate::ports::ChainReader for BudgetRejectedMetadataReader {
+        fn chain(&self) -> Chain {
+            Chain::Ethereum
+        }
+        async fn read_pool(
+            &self,
+            _address: &str,
+        ) -> Result<crate::domain::pool::PoolInfo, crate::domain::pool::PoolError> {
+            Err(crate::domain::pool::PoolError::Reader("unused".to_owned()))
+        }
+        async fn token_meta(
+            &self,
+            _address: &str,
+        ) -> Result<crate::domain::pool::TokenMeta, crate::domain::pool::PoolError> {
+            crate::ports::current_rpc_request_context()
+                .expect("metadata RPC context")
+                .mark(crate::ports::RPC_BUDGET_REJECTED);
+            Err(crate::domain::pool::PoolError::DailyBudgetExceeded)
+        }
+    }
+    #[tokio::test]
+    async fn budget_rejected_publisher_metadata_keeps_confirmed_watch_tier() {
+        let registry = backed_nvda_registry();
+        let context = crate::app::context::test_support::build(
+            vec![Box::new(BudgetRejectedMetadataReader)],
+            registry.clone(),
+            false,
+        );
+        let registry = Arc::new(registry);
+        let complete = HashSet::from(["Backed xStocks".to_owned()]);
+        let mut observation = legacy_watch_entry("NVDAx", "NVIDIA xStock");
+        observation.tier = crate::domain::guard::PublisherProductTier::Confirmed;
+        let mut snapshot = ImpostorSnapshot { entries: vec![observation], ..Default::default() };
+        let (_, outcome) = crate::ports::with_rpc_request_context(
+            crate::ports::RpcRequestContext::new(false, false),
+            reclassify_impostor_tiers(&mut snapshot, &registry, &complete, &context),
+        )
+        .await;
+        assert!(outcome.budget_rejected());
+        assert_eq!(snapshot.entries[0].tier, crate::domain::guard::PublisherProductTier::Confirmed);
+    }
 
     #[test]
     fn robinhood_explorer_url_uses_blockscout() {
@@ -4430,7 +4563,7 @@ mod tests {
         let entry = &normalized.entries[0];
         assert_eq!(entry.chain, "robinhood");
         assert_eq!(entry.chain_label, "Robinhood Chain");
-        assert_eq!(entry.detail_url, format!("/validated/robinhood/{pool}"));
+        assert_eq!(entry.detail_url, format!("/assets/robinhood/pool/{pool}"));
         assert_eq!(entry.trade_url, format!("https://dexscreener.com/robinhood/{pool}"));
         assert_eq!(
             entry.explorer_url,
@@ -5474,7 +5607,7 @@ mod tests {
     #[test]
     fn deduplicates_and_orders_by_liquidity() {
         let candidate = |pool: &str, liquidity: f64| DiscoveryCandidate {
-            chain: Chain::Solana,
+            chain: Chain::Base,
             dex: "pumpfun".to_owned(),
             pool: pool.to_owned(),
             base_symbol: "BASE".to_owned(),
@@ -5489,12 +5622,12 @@ mod tests {
             note: None,
         };
         let ordered = dedup_and_order([
-            candidate("0xA", 100.0),
-            candidate("0xa", 200.0),
-            candidate("0xB", 500.0),
+            candidate("0xAa00000000000000000000000000000000000001", 100.0),
+            candidate("0xaa00000000000000000000000000000000000001", 200.0),
+            candidate("0xbb00000000000000000000000000000000000002", 500.0),
         ]);
         assert_eq!(ordered.len(), 2);
-        assert_eq!(ordered[0].pool, "0xB");
+        assert_eq!(ordered[0].pool, "0xbb00000000000000000000000000000000000002");
         assert_eq!(ordered[1].liquidity_usd, Some(200.0));
     }
 
@@ -5822,7 +5955,7 @@ mod tests {
             source: MarketSource::Dexscreener,
         }
     }
-    struct RpcLimitPositionReader(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    struct RpcLimitPositionReader(Arc<std::sync::atomic::AtomicUsize>);
 
     #[async_trait]
     impl crate::ports::ChainReader for RpcLimitPositionReader {
@@ -5838,12 +5971,11 @@ mod tests {
         }
 
         async fn code_at(&self, _address: &str) -> Result<Vec<u8>, crate::domain::pool::PoolError> {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(vec![1])
         }
 
         async fn record_position(&self) -> Result<(), crate::domain::pool::PoolError> {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(crate::domain::pool::PoolError::RpcLimit("test request budget"))
         }
     }
@@ -5853,10 +5985,10 @@ mod tests {
         let pool = "0x0000000000000000000000000000000000000011";
         let registry =
             vec![entry(Chain::Base, "0x0000000000000000000000000000000000000022", "NVDA")];
-        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let state = crate::adapters::state::AppState::for_tests(
             registry.clone(),
-            vec![Box::new(RpcLimitPositionReader(std::sync::Arc::clone(&reads)))],
+            vec![Box::new(RpcLimitPositionReader(attempts.clone()))],
             false,
         );
         let initial = check::check(&state.app, pool).await;
@@ -5875,7 +6007,11 @@ mod tests {
         refresh_leaderboard(&state, directory.path(), &registry, vec![candidate], &HashSet::new())
             .await;
 
-        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 4);
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "next refresh executes the failed read again"
+        );
         let refreshed = state.leaderboard.read().await;
         assert_eq!(refreshed.entries[0].read_status, "not_read_yet");
         assert_eq!(refreshed.entries[0].read_reason.as_deref(), Some("rpc_limit"));
@@ -6412,11 +6548,101 @@ mod tests {
         assert!(load_leaderboard(dir.path()).is_none(), "no file yet");
         let first = sample_leaderboard(&hours_ago(1), 2);
         save_leaderboard(dir.path(), &first);
-        assert_eq!(load_leaderboard(dir.path()).as_ref(), Some(&first));
+        assert_eq!(
+            load_leaderboard(dir.path()).expect("first snapshot").updated_at,
+            first.updated_at
+        );
         let second = sample_leaderboard(&hours_ago(0), 50);
         save_leaderboard(dir.path(), &second);
-        assert_eq!(load_leaderboard(dir.path()).as_ref(), Some(&second));
-        assert!(!dir.path().join("leaderboard.json.tmp").exists(), "temp file renamed away");
+        assert_eq!(
+            load_leaderboard(dir.path()).expect("replacement snapshot").updated_at,
+            second.updated_at
+        );
+    }
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    async fn database_outage_restart_uses_latest_working_board_never_pre_cutover_s3() {
+        let Ok(url) = std::env::var("QED_TEST_DATABASE_URL") else {
+            return;
+        };
+        let (client, connection) =
+            tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let schema = format!("qed_board_restart_{:x}", rand::random::<u64>());
+        client.batch_execute(&format!("CREATE SCHEMA {schema}")).await.unwrap();
+        let mut scoped = reqwest::Url::parse(&url).unwrap();
+        scoped.query_pairs_mut().append_pair("options", &format!("-csearch_path={schema}"));
+        let dir = tempfile::tempdir().unwrap();
+        let database = super::super::storage::DurableStore::open(
+            scoped.as_str(),
+            dir.path(),
+            None,
+            32 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
+        let latest = sample_leaderboard(&hours_ago(0), 2);
+        let store = DurableBoardStore { database: Some(database.clone()), ..Default::default() };
+        store.persist_leaderboard(&latest).await;
+        database.flush().await.unwrap();
+        drop(store);
+        drop(database);
+        let stale = sample_leaderboard(&hours_ago(24), 1);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = requests.clone();
+        let server = axum::Router::new().fallback(axum::routing::get(move || {
+            let stale = stale.clone();
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                axum::Json(stale)
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, server).await.unwrap();
+        });
+        scoped.set_port(Some(1)).unwrap();
+        let database = super::super::storage::DurableStore::open(
+            scoped.as_str(),
+            dir.path(),
+            None,
+            32 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
+        let s3 = S3Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .behavior_version_latest()
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "synthetic",
+                    "synthetic",
+                    None,
+                    None,
+                    "local-test",
+                ))
+                .endpoint_url(format!("http://{address}"))
+                .force_path_style(true)
+                .build(),
+        );
+        let store = DurableBoardStore {
+            database: Some(database),
+            client: Some(s3),
+            bucket: Some("local-test".into()),
+        };
+        assert_eq!(store.load_leaderboard().await.unwrap().updated_at, latest.updated_at);
+        tokio::fs::remove_file(dir.path().join(LEADERBOARD_CACHE_FILE)).await.unwrap();
+        assert!(
+            store.load_leaderboard().await.is_none(),
+            "missing working cache is unavailable, not a stale S3 restore"
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+        client.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).await.unwrap();
     }
 
     fn watch_deny_guard(address: &str) -> crate::domain::guard::GuardDocument {
@@ -7103,7 +7329,8 @@ mod tests {
         });
 
         save_leaderboard(dir.path(), &board);
-        assert_eq!(load_leaderboard(dir.path()), Some(board));
+        let restored = load_leaderboard(dir.path()).expect("persisted catalog watch");
+        assert_eq!(restored.impostors, board.impostors);
     }
 
     #[test]
@@ -7158,7 +7385,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let stale = sample_leaderboard(&hours_ago(25), 50);
         save_leaderboard(dir.path(), &stale);
-        assert_eq!(load_leaderboard(dir.path()).as_ref(), Some(&stale));
+        assert_eq!(
+            load_leaderboard(dir.path()).expect("stale snapshot remains available").updated_at,
+            stale.updated_at
+        );
     }
 
     #[test]

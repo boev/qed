@@ -145,7 +145,7 @@ pub fn fresh(attestation: &Attestation) -> bool {
         && expires.is_some_and(|value| value > now.fixed_offset())
 }
 
-fn current_registry_entry(registry: &Registry, attestation: &Attestation) -> bool {
+pub(crate) fn current_registry_entry(registry: &Registry, attestation: &Attestation) -> bool {
     let Some(recorded) = attestation.registry_entry.as_ref() else {
         return !matches!(attestation.verdict, Verdict::Verified { .. });
     };
@@ -406,10 +406,6 @@ async fn persist(state: &Context, attestation: &Attestation) -> bool {
 }
 
 pub(crate) async fn hydrate_attestations(state: &Context) -> std::io::Result<()> {
-    let cutoff = state.clock.now() - Duration::days(30);
-    if let Err(error) = state.attest_store.prune_expired(cutoff).await {
-        tracing::warn!(%error, "could not prune expired attestations");
-    }
     let loaded = state.attest_store.load_recent().await?;
     let mut records = loaded.into_iter().collect::<Vec<_>>();
     records.sort_by(|left, right| {
@@ -849,6 +845,33 @@ mod tests {
 
         assert!(!valid_for_state(&state, &attestation.id, &attestation).await);
         assert!(certificate_valid_for_state(&state, &attestation.id, &attestation));
+    }
+
+    #[tokio::test]
+    async fn hydration_loads_old_expired_certificates_before_cleanup() {
+        let state = test_state(false);
+        let pool = sample().pool;
+        let now = Utc::now();
+        let attestation = sign_payload(
+            &state,
+            Chain::Base,
+            pool.pool.clone(),
+            Verdict::NoMatch,
+            None,
+            None,
+            pool,
+            None,
+            None,
+            (now - Duration::days(32)).to_rfc3339_opts(SecondsFormat::Secs, true),
+            (now - Duration::days(31)).to_rfc3339_opts(SecondsFormat::Secs, true),
+            ReadLog::default(),
+        )
+        .expect("old expired certificate");
+        state.attest_store.persist(&attestation).await.expect("persist expired certificate");
+
+        hydrate_attestations(&state).await.expect("hydrate persisted certificates");
+
+        assert!(state.attestations.read().is_ok_and(|index| index.contains_key(&attestation.id)));
     }
 
     #[test]

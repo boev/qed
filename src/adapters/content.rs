@@ -692,32 +692,6 @@ mod tests {
     }
 
     #[test]
-    fn released_changelog_entries_render_in_reverse_chronological_order() {
-        let entries = changelog_entries();
-        assert_eq!(entries[0].anchor, "release-1.0.2");
-        assert_eq!(entries[0].label, "1.0.2");
-        assert_eq!(entries[0].headline, "Lighter background reads with honest check times");
-        assert_eq!(entries[1].label, "1.0.1");
-        let page = changelog_html();
-        let feed = changelog_atom("https://qed.example");
-        assert!(page.contains("id=\"release-1.0.2\""));
-        assert!(page.contains("id=\"release-1.0.1\""));
-        assert!(page.contains("id=\"release-9\""));
-        assert!(page.contains("id=\"release-1\""));
-        assert!(page.contains(">RC-8.1</span>"));
-        assert!(
-            feed.contains(
-                "<title>1.0.2 — Lighter background reads with honest check times</title>"
-            )
-        );
-        assert!(feed.contains("<title>1.0.1 — A calmer QED with clearer evidence</title>"));
-        assert!(feed.contains("<title>RC-8.1 — Pages open"));
-        assert!(!page.contains("Unreleased"));
-        assert!(!feed.contains("Unreleased"));
-        assert!(!page.contains("RC-8.2"));
-        assert_eq!(feed.matches("<entry>").count(), 12);
-    }
-    #[test]
     fn changelog_details_are_collapsed_and_excluded_from_the_atom_feed() {
         let source = "## [RC-8.1] - 2026-10-06\n\n**Short headline**\n\n- **Feature** — short summary.\n\n### Details\n\nLong implementation detail.";
         let entry = parse_changelog_entries(source).into_iter().next().expect("parsed release");

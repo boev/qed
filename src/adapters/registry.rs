@@ -39,42 +39,71 @@ pub(crate) fn apply_registry_source(
     tombstone_missing: bool,
 ) -> (bool, bool) {
     match result {
-        Ok(entries) => match registry::reconcile_snapshot(
-            registry,
-            issuer,
-            entries,
-            checked_at,
-            tombstone_missing,
-        ) {
-            Ok(previous) => {
-                if tombstone_missing {
-                    info!(issuer, previous, "issuer registry full snapshot accepted");
-                } else {
-                    info!(
-                        issuer,
-                        previous,
-                        "issuer registry partial snapshot accepted; existing deployments retained"
-                    );
+        Ok(entries) => {
+            let before = issuer_entries_without_check_time(registry, issuer);
+            match registry::reconcile_snapshot(
+                registry,
+                issuer,
+                entries,
+                checked_at,
+                tombstone_missing,
+            ) {
+                Ok(previous) => {
+                    if tombstone_missing {
+                        info!(issuer, previous, "issuer registry full snapshot accepted");
+                    } else {
+                        info!(
+                            issuer,
+                            previous,
+                            "issuer registry partial snapshot accepted; existing deployments retained"
+                        );
+                    }
+                    let changed = issuer_entries_without_check_time(registry, issuer) != before;
+                    if changed {
+                        info!(issuer, "issuer registry entries changed");
+                    }
+                    (true, changed)
                 }
-                (true, true)
+                Err(rejected) => {
+                    let changed = registry::mark_source_failure(registry, issuer, checked_at);
+                    warn!(
+                        issuer,
+                        previous = rejected.previous,
+                        incoming = rejected.incoming,
+                        "issuer registry snapshot rejected as partial"
+                    );
+                    (false, changed)
+                }
             }
-            Err(rejected) => {
-                let changed = registry::mark_source_failure(registry, issuer, checked_at);
-                warn!(
-                    issuer,
-                    previous = rejected.previous,
-                    incoming = rejected.incoming,
-                    "issuer registry snapshot rejected as partial"
-                );
-                (false, changed)
-            }
-        },
+        }
         Err(error) => {
             let changed = registry::mark_source_failure(registry, issuer, checked_at);
             warn!(issuer, %error, "issuer registry refresh failed; previous snapshot retained");
             (false, changed)
         }
     }
+}
+
+/// One issuer's entries with the per-fetch `last_checked` stamp cleared, so a refresh that
+/// returns the same contracts does not count as a registry change.
+fn issuer_entries_without_check_time(registry: &Registry, issuer: &str) -> Vec<Entry> {
+    let mut entries = registry
+        .iter()
+        .filter(|entry| entry.issuer == issuer)
+        .cloned()
+        .map(|mut entry| {
+            entry.last_checked.clear();
+            entry
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        (left.chain.to_string(), &left.contract, &left.ticker).cmp(&(
+            right.chain.to_string(),
+            &right.contract,
+            &right.ticker,
+        ))
+    });
+    entries
 }
 
 pub(crate) use crate::domain::registry::{active_count, active_issuers, matchable};
@@ -155,6 +184,7 @@ pub(crate) async fn refresh_registry(state: &AppState) {
         &state.http,
         &state.registry_path,
         Some(&state.app),
+        state.board_store.database.as_deref(),
     )
     .await;
     if let Some(hash) = updated_hash
@@ -282,7 +312,13 @@ pub(crate) async fn refresh_registry_entries(
     http: &reqwest::Client,
     registry_path: &Path,
     invalidate: Option<&Context>,
+    durable: Option<&super::storage::DurableStore>,
 ) -> (bool, Option<String>) {
+    if let (Some(store), Some(dir)) = (durable, registry_path.parent())
+        && store.restore_runtime_files(dir).await.is_err()
+    {
+        warn!("restoring registry database snapshots failed; using local cache");
+    }
     {
         let mut status = registry_status.write().await;
         status.next_refresh_at = discovery::timestamp_after(discovery::REGISTRY_REFRESH_SECS);
@@ -301,6 +337,7 @@ pub(crate) async fn refresh_registry_entries(
                 &endpoints.ondo,
                 endpoints.ondo_api_key.as_deref(),
                 registry_path,
+                durable,
             )
             .await
             .map_err(|error| error.to_string());
@@ -353,7 +390,9 @@ pub(crate) async fn refresh_registry_entries(
                     registry_path,
                     &outcome,
                     &plan.pending_removals,
+                    durable,
                 )
+                .await
             {
                 apply_registry_source(&mut next, "Ondo", Err(error.to_string()), &checked_at, false)
             } else {
@@ -378,14 +417,26 @@ pub(crate) async fn refresh_registry_entries(
         // Keep registry readers from observing new entries with cached old verdicts.
         context.registry_version.fetch_add(1, Ordering::AcqRel);
         context.check_cache.invalidate_all();
-        context.powers_cache.invalidate_all();
+        context.guard_cache.invalidate_all();
     }
     *current = Arc::clone(&snapshot);
     drop(current);
+    if let Some(context) = invalidate {
+        crate::app::asset_history::registry_changed(context).await;
+    }
 
-    let updated_hash = if changed {
+    // Persist every accepted refresh so `last_checked` survives restarts and `/api/registry`
+    // reflects it; only real contract changes clear caches above.
+    let updated_hash = if accepted || changed {
         match save_to_file(registry_path, &snapshot) {
-            Ok(()) => Some(file_hash(registry_path)),
+            Ok(()) => {
+                if let Some(store) = durable
+                    && store.capture_runtime_file(registry_path).await.is_err()
+                {
+                    warn!("capturing registry database snapshot failed");
+                }
+                Some(file_hash(registry_path))
+            }
             Err(error) => {
                 warn!(%error, "could not persist reconciled registry");
                 None
@@ -640,6 +691,7 @@ pub(crate) mod registries {
             endpoint_url: &str,
             api_key: Option<&str>,
             registry_path: &Path,
+            durable: Option<&crate::adapters::storage::DurableStore>,
         ) -> Result<FetchOutcome, Error> {
             if api_key.is_some_and(|key| !key.is_empty()) {
                 return fetch(client, endpoint_url, api_key).await.map(|entries| FetchOutcome {
@@ -656,10 +708,18 @@ pub(crate) mod registries {
                 });
             }
             let cache_path = public_cache_path(registry_path);
-            fetch_cached_at(&cache_path, Utc::now(), &LAST_PUBLIC_ATTEMPT_AT, fetch_public_catalog)
-                .await
+            fetch_cached_at_for_version(
+                &cache_path,
+                Utc::now(),
+                &LAST_PUBLIC_ATTEMPT_AT,
+                env!("CARGO_PKG_VERSION"),
+                durable,
+                fetch_public_catalog,
+            )
+            .await
         }
 
+        #[cfg(test)]
         async fn fetch_cached_at<F, Fut>(
             cache_path: &Path,
             now: DateTime<Utc>,
@@ -675,6 +735,7 @@ pub(crate) mod registries {
                 now,
                 last_attempt_at,
                 env!("CARGO_PKG_VERSION"),
+                None,
                 fetch,
             )
             .await
@@ -685,6 +746,7 @@ pub(crate) mod registries {
             now: DateTime<Utc>,
             last_attempt_at: &Mutex<Option<DateTime<Utc>>>,
             version: &str,
+            durable: Option<&crate::adapters::storage::DurableStore>,
             fetch: F,
         ) -> Result<FetchOutcome, Error>
         where
@@ -749,6 +811,12 @@ pub(crate) mod registries {
             }
 
             save_attempt_marker(&marker_path, version, now)?;
+            if let Some(store) = durable {
+                store
+                    .capture_runtime_file(&marker_path)
+                    .await
+                    .map_err(|error| Error::Cache(error.to_string()))?;
+            }
             let pending_removals =
                 cache.as_ref().map_or_else(Vec::new, |cached| cached.pending_removals.clone());
             let catalog = fetch().await?;
@@ -784,10 +852,11 @@ pub(crate) mod registries {
             })
         }
 
-        pub fn persist_accepted_snapshot(
+        pub async fn persist_accepted_snapshot(
             registry_path: &Path,
             outcome: &FetchOutcome,
             pending_removals: &[crate::domain::registry::DeploymentKey],
+            durable: Option<&crate::adapters::storage::DurableStore>,
         ) -> Result<(), Error> {
             let catalog = ParsedCatalog {
                 entries: outcome.entries.clone(),
@@ -812,7 +881,14 @@ pub(crate) mod registries {
                 &catalog,
                 last_attempt_at,
                 pending_removals,
-            )
+            )?;
+            if let Some(store) = durable {
+                store
+                    .capture_runtime_file(&public_cache_path(registry_path))
+                    .await
+                    .map_err(|error| Error::Cache(error.to_string()))?;
+            }
+            Ok(())
         }
 
         fn public_cache_path(registry_path: &Path) -> PathBuf {
@@ -1864,6 +1940,7 @@ pub(crate) mod registries {
                         now,
                         &Mutex::new(None),
                         env!("CARGO_PKG_VERSION"),
+                        None,
                         || async {
                             fetches.fetch_add(1, Ordering::Relaxed);
                             Err(Error::DisallowedPublicUrl)
@@ -1880,6 +1957,7 @@ pub(crate) mod registries {
                     now + Duration::hours(1),
                     &Mutex::new(None),
                     env!("CARGO_PKG_VERSION"),
+                    None,
                     || async {
                         fetches.fetch_add(1, Ordering::Relaxed);
                         Ok(catalog.clone())
@@ -1896,6 +1974,7 @@ pub(crate) mod registries {
                     now + Duration::hours(2),
                     &Mutex::new(None),
                     "next-release",
+                    None,
                     || async {
                         fetches.fetch_add(1, Ordering::Relaxed);
                         Ok(catalog.clone())
@@ -1921,6 +2000,7 @@ pub(crate) mod registries {
                     now + Duration::hours(1),
                     &Mutex::new(None),
                     env!("CARGO_PKG_VERSION"),
+                    None,
                     || async {
                         fetches.fetch_add(1, Ordering::Relaxed);
                         Ok(catalog.clone())
@@ -2616,5 +2696,53 @@ mod tests {
         ));
         assert!(lookup(&loaded, Chain::Ethereum, "0xabc").is_none());
         assert!(!matchable(&loaded[0]));
+    }
+
+    #[test]
+    fn refresh_with_same_contracts_is_not_a_change_but_a_new_contract_is() {
+        let entry = |contract: &str, checked_at: &str| Entry {
+            issuer: "Test".to_owned(),
+            ticker: "NVDA".to_owned(),
+            name: "NVIDIA".to_owned(),
+            chain: Chain::Ethereum,
+            contract: contract.to_owned(),
+            decimals: Some(18),
+            source: "manual".to_owned(),
+            source_url: "https://example.invalid".to_owned(),
+            last_checked: checked_at.to_owned(),
+            removed_at: None,
+            stale_since: None,
+            official_deployments: Vec::new(),
+        };
+        let first = "2026-10-15T08:00:00Z";
+        let second = "2026-10-15T09:00:00Z";
+        let mut registry = Vec::new();
+        let (accepted, changed) = super::apply_registry_source(
+            &mut registry,
+            "Test",
+            Ok(vec![entry("0xaaa", first)]),
+            first,
+            true,
+        );
+        assert!(accepted && changed);
+
+        let (accepted, changed) = super::apply_registry_source(
+            &mut registry,
+            "Test",
+            Ok(vec![entry("0xaaa", second)]),
+            second,
+            true,
+        );
+        assert!(accepted);
+        assert!(!changed, "only the check time moved");
+
+        let (accepted, changed) = super::apply_registry_source(
+            &mut registry,
+            "Test",
+            Ok(vec![entry("0xaaa", second), entry("0xbbb", second)]),
+            second,
+            true,
+        );
+        assert!(accepted && changed);
     }
 }

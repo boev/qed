@@ -9,6 +9,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
 #[cfg(feature = "s3")]
+use futures_util::{StreamExt, TryStreamExt};
+#[cfg(feature = "s3")]
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[cfg(feature = "s3")]
@@ -212,6 +214,28 @@ impl AttestationStore for FileAttestationStore {
         }
         std::fs::write(self.dir.join(format!("{}.json", attestation.id)), bytes)
     }
+    async fn import_raw(&self, id: &str, bytes: Vec<u8>) -> io::Result<()> {
+        if id.len() != 64
+            || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || bytes.len() > MAX_ATTESTATION_BYTES
+        {
+            return Err(io::Error::other("invalid attestation import"));
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        let path = self.dir.join(format!("{id}.json"));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                use std::io::Write;
+                if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+                    let _ = std::fs::remove_file(path);
+                    return Err(error);
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 
     async fn get(&self, id: &str) -> io::Result<Option<Attestation>> {
         if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -222,6 +246,17 @@ impl AttestationStore for FileAttestationStore {
             Ok(bytes) if bytes.len() <= MAX_ATTESTATION_BYTES => {
                 Ok(serde_json::from_slice(&bytes).ok())
             }
+            Ok(_) => Err(io::Error::other("attestation exceeds the size limit")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+    async fn raw_json(&self, id: &str) -> io::Result<Option<Vec<u8>>> {
+        if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(None);
+        }
+        match std::fs::read(self.dir.join(format!("{id}.json"))) {
+            Ok(bytes) if bytes.len() <= MAX_ATTESTATION_BYTES => Ok(Some(bytes)),
             Ok(_) => Err(io::Error::other("attestation exceeds the size limit")),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
@@ -266,6 +301,9 @@ impl AttestationStore for FileAttestationStore {
         Ok(())
     }
 }
+
+#[cfg(feature = "s3")]
+const S3_IO_CONCURRENCY: usize = 32;
 
 #[cfg(feature = "s3")]
 pub struct S3AttestationStore {
@@ -618,9 +656,14 @@ impl AttestationStore for S3AttestationStore {
                 ids.push(id);
             }
         }
+        let loaded = futures_util::stream::iter(
+            ids.into_iter().map(|id| async move { self.get(&id).await }),
+        )
+        .buffer_unordered(S3_IO_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
         let mut result = HashMap::new();
-        for id in ids {
-            let Some(attestation) = self.get(&id).await? else { continue };
+        for attestation in loaded.into_iter().flatten() {
             result.insert(attestation.id.clone(), attestation);
         }
         for id in repairs {
@@ -667,12 +710,45 @@ impl AttestationStore for S3AttestationStore {
             .map_err(|error| io::Error::other(error.to_string()))?;
         self.update_index(attestation).await
     }
+    async fn import_raw(&self, id: &str, bytes: Vec<u8>) -> io::Result<()> {
+        let attestation: Attestation = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        if attestation.id != id || bytes.len() > MAX_ATTESTATION_BYTES {
+            return Err(io::Error::other("invalid attestation import"));
+        }
+        match self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(self.object_key(&attestation))
+            .if_none_match("*")
+            .content_type("application/json")
+            .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
+            .send()
+            .await
+        {
+            Ok(_) => self.update_index(&attestation).await,
+            Err(error)
+                if error
+                    .raw_response()
+                    .is_some_and(|response| response.status().as_u16() == 412) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(io::Error::other(error.to_string())),
+        }
+    }
 
     async fn get(&self, id: &str) -> io::Result<Option<Attestation>> {
         if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Ok(None);
         }
         self.read_key(&format!("{}{id}.json", self.prefix)).await
+    }
+    async fn raw_json(&self, id: &str) -> io::Result<Option<Vec<u8>>> {
+        if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(None);
+        }
+        Ok(self.read_object(&format!("{}{id}.json", self.prefix)).await?.map(|(bytes, _)| bytes))
     }
 
     async fn prune_expired(&self, older_than: chrono::DateTime<Utc>) -> io::Result<()> {
@@ -685,15 +761,26 @@ impl AttestationStore for S3AttestationStore {
             }
             let output =
                 request.send().await.map_err(|error| io::Error::other(error.to_string()))?;
-            for object in output.contents() {
-                let Some(key) = object.key() else { continue };
-                if key.starts_with(&format!("{}quarantine/", self.prefix))
-                    || key.starts_with(&format!("{}repair/", self.prefix))
-                    || key == self.index_key()
-                {
-                    continue;
-                }
-                let Some(attestation) = self.read_key(key).await? else { continue };
+            let quarantine_prefix = format!("{}quarantine/", self.prefix);
+            let repair_prefix = self.repair_prefix();
+            let index_key = self.index_key();
+            let keys = output
+                .contents()
+                .iter()
+                .filter_map(|object| {
+                    let key = object.key()?;
+                    (!key.starts_with(&quarantine_prefix)
+                        && !key.starts_with(&repair_prefix)
+                        && key != index_key.as_str())
+                    .then(|| key.to_owned())
+                })
+                .collect::<Vec<_>>();
+            futures_util::stream::iter(keys.into_iter().map(|key| async move {
+                self.read_key(&key).await.map(|attestation| (key, attestation))
+            }))
+            .buffer_unordered(S3_IO_CONCURRENCY)
+            .try_for_each(|(key, attestation)| async move {
+                let Some(attestation) = attestation else { return Ok(()) };
                 let expired = chrono::DateTime::parse_from_rfc3339(&attestation.expires_at)
                     .ok()
                     .is_some_and(|expires| expires < older_than);
@@ -706,7 +793,9 @@ impl AttestationStore for S3AttestationStore {
                         .await
                         .map_err(|error| io::Error::other(error.to_string()))?;
                 }
-            }
+                Ok(())
+            })
+            .await?;
             continuation = output.next_continuation_token().map(str::to_owned);
             if continuation.is_none() {
                 break;

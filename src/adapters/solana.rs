@@ -701,6 +701,9 @@ impl SolanaReader {
         let request = RpcRequest { jsonrpc: "2.0", id: 1, method: method.to_owned(), params };
         for attempt in 0..RPC_MAX_ATTEMPTS {
             self.rpc_limiter.acquire().await;
+            if !self.rpc_limiter.debit(method) {
+                return Err(PoolError::DailyBudgetExceeded);
+            }
             let response = self
                 .client
                 .post(&self.rpc_url)

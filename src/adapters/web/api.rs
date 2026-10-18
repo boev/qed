@@ -1,6 +1,6 @@
 use crate::{
     adapters::{
-        discovery::{self, FeaturedPool, LeaderboardEntry},
+        discovery::{self, LeaderboardEntry},
         state::{AppState, RegistryApiCache, StatsSnapshotCache},
     },
     app::{attestation as attest, check},
@@ -31,12 +31,24 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, atomic::Ordering as AtomicOrdering};
-pub(crate) async fn healthz() -> impl IntoResponse {
-    Json(serde_json::json!({ "status": "ok" }))
+pub(crate) async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "status": "ok",
+        "storage": state.board_store.database.as_ref().map(|store| store.status()).unwrap_or_else(|| serde_json::json!({"primary": "legacy"})),
+        "history_degraded_since": state.app.history.degraded_since(),
+    }))
 }
 
 pub(crate) async fn admin_stats(State(state): State<AppState>) -> Response {
-    ([(header::CACHE_CONTROL, "no-store")], Json(state.usage_stats.snapshot())).into_response()
+    let mut stats = serde_json::to_value(state.usage_stats.snapshot())
+        .expect("usage statistics serialize to JSON");
+    let rpc_usage = serde_json::to_value(state.rate_limiter.rpc_budget().snapshot())
+        .expect("RPC usage statistics serialize to JSON");
+    stats
+        .as_object_mut()
+        .expect("usage statistics serialize as an object")
+        .insert("rpc_usage".to_owned(), rpc_usage);
+    ([(header::CACHE_CONTROL, "no-store")], Json(stats)).into_response()
 }
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -487,20 +499,35 @@ async fn build_stats_cache(state: &AppState) -> Result<StatsSnapshotCache, Strin
         // must never fall back to the working directory.
         if let Some(data_dir) =
             state.registry_path.parent().filter(|dir| !dir.as_os_str().is_empty())
+            && state.board_store.database.is_none()
         {
             discovery::save_leaderboard(data_dir, &board);
         }
         state.board_store.persist_leaderboard(&board).await;
     }
     let stats = leaderboard_stats(&board, &registry);
-    let recent_catalog_entries =
-        recent_catalog_entries(&board.impostors.entries, Utc::now().timestamp());
-    let html =
-        super::pages::render_stats_page(state, &stats, &recent_catalog_entries, &board, &registry)
-            .map_err(|status| format!("rendering stats page failed with {status}"))?;
     let document = build_stats_document(state, stats, &board, &registry)?;
     let json = serde_json::to_vec(&document).map_err(|error| error.to_string())?;
-    let csv = stats_csv(&document).map_err(|error| error.to_string())?;
+    if let Some(database) = &state.board_store.database {
+        database
+            .put("discovery/stats.json", json.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    stats_cache_from_document(state, &document, json, &board, &registry)
+}
+
+fn stats_cache_from_document(
+    state: &AppState,
+    document: &StatsDocument,
+    json: Vec<u8>,
+    board: &discovery::Leaderboard,
+    registry: &Registry,
+) -> Result<StatsSnapshotCache, String> {
+    let recent = recent_catalog_entries(&board.impostors.entries, Utc::now().timestamp());
+    let html = super::pages::render_stats_page(state, &document.stats, &recent, board, registry)
+        .map_err(|status| format!("rendering stats page failed with {status}"))?;
+    let csv = stats_csv(document).map_err(|error| error.to_string())?;
     let inputs = &document.reducer_inputs;
     let pages = inputs
         .leaderboard
@@ -548,6 +575,41 @@ async fn build_stats_cache(state: &AppState) -> Result<StatsSnapshotCache, Strin
     Ok(StatsSnapshotCache { html, json: Bytes::from(json), csv: Bytes::from(csv), api_pages })
 }
 
+pub(crate) async fn restore_stats_snapshot(state: &AppState) -> bool {
+    let Some(database) = &state.board_store.database else {
+        return false;
+    };
+    let Ok(Some(json)) = database.get("discovery/stats.json").await else {
+        return false;
+    };
+    let Ok(document) = serde_json::from_slice::<StatsDocument>(&json) else {
+        return false;
+    };
+    if document.verify().is_err()
+        || (document.public_key != attest::public_key_b58(&state.app)
+            && !state.app.trusted_signers.contains(&document.public_key))
+    {
+        return false;
+    }
+    let board = discovery::Leaderboard {
+        entries: document.reducer_inputs.leaderboard.clone(),
+        impostors: document.reducer_inputs.impostor_watch.clone(),
+        updated_at: document.observed_at.clone(),
+        ..Default::default()
+    };
+    let Ok(snapshot) = stats_cache_from_document(
+        state,
+        &document,
+        json,
+        &board,
+        &document.reducer_inputs.active_registry,
+    ) else {
+        return false;
+    };
+    *state.stats_snapshot.write().await = Some(Arc::new(snapshot));
+    true
+}
+
 pub(crate) async fn refresh_stats_snapshot(state: &AppState) -> Result<(), String> {
     let _refresh = state.stats_snapshot_refresh.lock().await;
     let snapshot = Arc::new(build_stats_cache(state).await?);
@@ -562,6 +624,14 @@ async fn get_stats_snapshot(state: &AppState) -> Result<Arc<StatsSnapshotCache>,
     let _refresh = state.stats_snapshot_refresh.lock().await;
     if let Some(snapshot) = state.stats_snapshot.read().await.clone() {
         return Ok(snapshot);
+    }
+    if restore_stats_snapshot(state).await {
+        return state
+            .stats_snapshot
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| "stats snapshot unavailable".to_owned());
     }
     let snapshot = Arc::new(build_stats_cache(state).await?);
     *state.stats_snapshot.write().await = Some(Arc::clone(&snapshot));
@@ -882,8 +952,10 @@ pub(crate) async fn api_registry(State(state): State<AppState>, headers: HeaderM
         .body(Body::from(body.as_ref().clone()))
         .expect("registry response headers are valid")
 }
-pub(crate) async fn api_featured(State(state): State<AppState>) -> Json<Vec<FeaturedPool>> {
-    Json(state.featured.read().await.clone())
+pub(crate) async fn api_featured(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let mut value = serde_json::json!({"entries": state.featured.read().await.clone()});
+    super::asset::decorate_entries(&state.app, &mut value);
+    Json(value["entries"].take())
 }
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct LeaderboardQuery {
@@ -952,7 +1024,7 @@ pub(crate) async fn api_leaderboard(
     let mut entries = board.entries;
     sort_entries(&mut entries, sort, descending);
     let entries = page_entries(entries, page, per);
-    Json(serde_json::json!({
+    let mut value = serde_json::json!({
         "page": page,
         "per": per,
         "total": total,
@@ -965,7 +1037,9 @@ pub(crate) async fn api_leaderboard(
         "source": board.source,
         "registry": board.registry,
         "entries": entries,
-    }))
+    });
+    super::asset::decorate_entries(&state.app, &mut value);
+    Json(value)
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1040,7 +1114,10 @@ pub(crate) async fn api_check(
     if !valid_public_input(address) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    Ok(Json(check::check(&state.app, address).await))
+    tokio::time::timeout(std::time::Duration::from_secs(20), check::check(&state.app, address))
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::GATEWAY_TIMEOUT)
 }
 pub(crate) async fn api_statement(
     State(state): State<AppState>,
@@ -1075,6 +1152,14 @@ fn statement_error_response(
         StatementError::ReadFailed(chain) => (
             StatusCode::BAD_GATEWAY,
             format!("The {chain} balance read failed. No statement was created."),
+        ),
+        StatementError::DailyBudgetExceeded => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            super::DAILY_RPC_BUDGET_MESSAGE.to_owned(),
+        ),
+        StatementError::CrawlerCacheMiss => (
+            StatusCode::FORBIDDEN,
+            "Automated crawlers get cached results only.".to_owned(),
         ),
         StatementError::DeadlineExceeded => (
             StatusCode::GATEWAY_TIMEOUT,
@@ -1122,6 +1207,9 @@ pub(crate) async fn api_powers(
         Err(crate::app::powers::LookupError::NotFound) => Err(StatusCode::NOT_FOUND),
         Err(crate::app::powers::LookupError::ReadFailed) => Err(StatusCode::BAD_GATEWAY),
         Err(crate::app::powers::LookupError::DeadlineExceeded) => Err(StatusCode::GATEWAY_TIMEOUT),
+        Err(crate::app::powers::LookupError::DailyBudgetExceeded) => {
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
     }
 }
 
@@ -1167,6 +1255,7 @@ pub(crate) async fn api_guard_post(
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WalletRequest {
     address: String,
 }
@@ -1190,6 +1279,20 @@ pub(crate) async fn api_attestation(
 ) -> Result<Response, StatusCode> {
     let attestation =
         attest::get_certificate_async(&state.app, &id).await.ok_or(StatusCode::NOT_FOUND)?;
+    if let Ok(Some(bytes)) = state.app.attest_store.raw_json(&id).await
+        && serde_json::from_slice::<crate::domain::attestation::Attestation>(&bytes).is_ok_and(
+            |stored| stored == attestation && crate::domain::attestation::verify(&stored).is_ok(),
+        )
+    {
+        return Ok((
+            [
+                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                (header::CONTENT_TYPE, "application/json"),
+            ],
+            bytes,
+        )
+            .into_response());
+    }
     let current_payload = crate::domain::attestation::canonical_payload_json(&attestation)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let current_id =
@@ -1598,6 +1701,80 @@ mod tests {
         }
     }
 
+    struct CacheableGuardReader {
+        contract: String,
+        reject_rpc: Arc<std::sync::atomic::AtomicBool>,
+        rpc_reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CacheableGuardReader {
+        fn reject_if_requested(&self) -> bool {
+            self.rpc_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !self.reject_rpc.load(std::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
+            if let Some(context) = crate::ports::current_rpc_request_context() {
+                context.mark(crate::ports::RPC_BUDGET_REJECTED);
+            }
+            true
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ports::ChainReader for CacheableGuardReader {
+        fn chain(&self) -> Chain {
+            Chain::Base
+        }
+
+        async fn read_pool(
+            &self,
+            _address: &str,
+        ) -> Result<crate::domain::pool::PoolInfo, crate::domain::pool::PoolError> {
+            if self.reject_if_requested() {
+                return Err(crate::domain::pool::PoolError::DailyBudgetExceeded);
+            }
+            Err(crate::domain::pool::PoolError::Unknown("not a pool".to_owned()))
+        }
+
+        async fn code_at(&self, _address: &str) -> Result<Vec<u8>, crate::domain::pool::PoolError> {
+            if self.reject_if_requested() {
+                return Err(crate::domain::pool::PoolError::DailyBudgetExceeded);
+            }
+            Ok(vec![0x60])
+        }
+
+        async fn token_meta(
+            &self,
+            address: &str,
+        ) -> Result<crate::domain::pool::TokenMeta, crate::domain::pool::PoolError> {
+            if self.reject_if_requested() {
+                return Err(crate::domain::pool::PoolError::DailyBudgetExceeded);
+            }
+            if !address.eq_ignore_ascii_case(&self.contract) {
+                return Err(crate::domain::pool::PoolError::Unknown(
+                    "unexpected token address".to_owned(),
+                ));
+            }
+            Ok(crate::domain::pool::TokenMeta {
+                address: self.contract.clone(),
+                symbol: Some("NVDA".to_owned()),
+                name: Some("NVIDIA".to_owned()),
+                decimals: Some(18),
+                total_supply: Some("1000000".to_owned()),
+            })
+        }
+
+        async fn power_facts(
+            &self,
+            _address: &str,
+        ) -> Result<crate::domain::powers::PowerFacts, crate::domain::pool::PoolError> {
+            if self.reject_if_requested() {
+                return Err(crate::domain::pool::PoolError::DailyBudgetExceeded);
+            }
+            Ok(crate::domain::powers::PowerFacts::default())
+        }
+    }
+
     #[tokio::test]
     async fn guard_get_and_json_post_documents_verify_over_the_rest_routes() {
         let address = "0x0000000000000000000000000000000000000001";
@@ -1651,6 +1828,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guard_rpc_budget_and_crawler_limits_preserve_cached_results() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let address = "0x0000000000000000000000000000000000000001";
+        let fresh_address = "0x0000000000000000000000000000000000000002";
+        let reject_rpc = Arc::new(AtomicBool::new(false));
+        let rpc_reads = Arc::new(AtomicUsize::new(0));
+        let entry = crate::domain::registry::Entry {
+            issuer: "Example Publisher".to_owned(),
+            ticker: "NVDA".to_owned(),
+            name: "NVIDIA".to_owned(),
+            chain: Chain::Base,
+            contract: address.to_owned(),
+            decimals: Some(18),
+            source: "test".to_owned(),
+            source_url: "https://issuer.example".to_owned(),
+            last_checked: crate::adapters::registry::now_rfc3339(),
+            removed_at: None,
+            stale_since: None,
+            official_deployments: vec![crate::domain::registry::OfficialDeployment {
+                network: "Base".to_owned(),
+                address: address.to_owned(),
+                wrapper_address: None,
+                wrapper_address_v2: None,
+            }],
+        };
+        let mut state = AppState::for_tests(
+            vec![entry],
+            vec![Box::new(CacheableGuardReader {
+                contract: address.to_owned(),
+                reject_rpc: Arc::clone(&reject_rpc),
+                rpc_reads: Arc::clone(&rpc_reads),
+            })],
+            false,
+        );
+        Arc::get_mut(&mut state.app).expect("unique test context").source_verifier =
+            Arc::new(crate::app::context::test_support::VerifiedSourceVerifier);
+        let app = crate::adapters::web::router(state);
+        let request = |subject: &str, user_agent: Option<&str>| {
+            let mut builder =
+                Request::post("/api/guard").header(header::CONTENT_TYPE, "application/json");
+            if let Some(user_agent) = user_agent {
+                builder = builder.header(header::USER_AGENT, user_agent);
+            }
+            builder
+                .body(Body::from(
+                    serde_json::json!({ "address": subject, "chain": "base" }).to_string(),
+                ))
+                .expect("Guard request")
+        };
+
+        let first =
+            app.clone().oneshot(request(address, None)).await.expect("initial Guard response");
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = to_bytes(first.into_body(), 64 * 1024).await.expect("Guard body");
+        let first_guard: serde_json::Value =
+            serde_json::from_slice(&first_body).expect("Guard JSON");
+        assert_eq!(first_guard["verdict"], "allow");
+
+        reject_rpc.store(true, Ordering::Relaxed);
+        let fresh = app
+            .clone()
+            .oneshot(request(fresh_address, None))
+            .await
+            .expect("fresh budget-limited Guard response");
+        assert_eq!(fresh.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let reads_after_fresh = rpc_reads.load(Ordering::Relaxed);
+
+        let cached =
+            app.clone().oneshot(request(address, None)).await.expect("cached Guard response");
+        assert_eq!(cached.status(), StatusCode::OK);
+        let cached_body = to_bytes(cached.into_body(), 64 * 1024).await.expect("cached Guard body");
+        let cached_guard: serde_json::Value =
+            serde_json::from_slice(&cached_body).expect("cached Guard JSON");
+        assert_eq!(cached_guard["verdict"], "allow");
+        assert_eq!(rpc_reads.load(Ordering::Relaxed), reads_after_fresh);
+
+        let uncached_crawler = app
+            .clone()
+            .oneshot(request("0x0000000000000000000000000000000000000003", Some("Googlebot")))
+            .await
+            .expect("uncached crawler response");
+        assert_eq!(uncached_crawler.status(), StatusCode::FORBIDDEN);
+        assert_eq!(rpc_reads.load(Ordering::Relaxed), reads_after_fresh);
+
+        let cached_crawler = app
+            .oneshot(request(address, Some("Googlebot")))
+            .await
+            .expect("cached crawler response");
+        assert_eq!(cached_crawler.status(), StatusCode::OK);
+        assert_eq!(rpc_reads.load(Ordering::Relaxed), reads_after_fresh);
+    }
+
+    #[tokio::test]
+    async fn budget_rejected_pool_check_is_unsigned_and_not_cached() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let address = "0x0000000000000000000000000000000000000015";
+        let state = AppState::for_tests(
+            Vec::new(),
+            vec![Box::new(CacheableGuardReader {
+                contract: address.to_owned(),
+                reject_rpc: Arc::new(AtomicBool::new(true)),
+                rpc_reads: Arc::new(AtomicUsize::new(0)),
+            })],
+            false,
+        );
+        let cache_key = crate::domain::check::cache_key(address);
+        let (result, outcome) = crate::ports::with_rpc_request_context(
+            crate::ports::RpcRequestContext::new(true, false),
+            async { crate::app::check::check(&state.app, address).await },
+        )
+        .await;
+
+        assert!(outcome.budget_rejected());
+        assert_eq!(result.attestation_id, None);
+        assert!(state.app.check_cache.get(&cache_key).await.is_none());
+    }
+
+    #[tokio::test]
     async fn guard_api_rejects_missing_chain_invalid_token_and_invalid_wallet() {
         let app = crate::adapters::web::router(test_state(false));
         let address = "0x0000000000000000000000000000000000000001";
@@ -1669,16 +1966,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wallet_api_rejects_malformed_addresses_before_reader_access() {
+        let response = crate::adapters::web::router(test_state(false))
+            .oneshot(
+                Request::post("/api/wallet")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"address":"not-a-wallet"}"#))
+                    .expect("wallet request"),
+            )
+            .await
+            .expect("wallet response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
 
     async fn powers_api_accepts_an_unregistered_evm_contract_without_any_filter() {
         let address = "0x0000000000000000000000000000000000000011";
         let state = AppState::for_tests(Vec::new(), vec![Box::new(GuardReviewReader)], false);
-        let version = state.app.registry_version.load(AtomicOrdering::Acquire);
         state
             .app
             .powers_cache
             .insert(
-                (crate::domain::chain::Chain::Base, address.to_owned(), version),
+                (crate::domain::chain::Chain::Base, address.to_owned()),
                 crate::domain::powers::PowersRecord {
                     chain: crate::domain::chain::Chain::Base,
                     contract: address.to_owned(),
@@ -1732,7 +2043,6 @@ mod tests {
                 })
                 .collect(),
         );
-        let version = state.app.registry_version.load(std::sync::atomic::Ordering::Acquire);
         for chain in
             [crate::domain::chain::Chain::RobinhoodChain, crate::domain::chain::Chain::Base]
         {
@@ -1740,7 +2050,7 @@ mod tests {
                 .app
                 .powers_cache
                 .insert(
-                    (chain, address.to_owned(), version),
+                    (chain, address.to_owned()),
                     crate::domain::powers::PowersRecord {
                         chain,
                         contract: address.to_owned(),
@@ -2830,6 +3140,7 @@ mod tests {
         state.usage_stats.record_request(true, true, false, false, false, false);
         state.usage_stats.record_html_page_view();
         state.usage_stats.record_response(200);
+        assert!(state.rate_limiter.rpc_buckets().base.debit("eth_call"));
 
         let response = admin_stats(State(state)).await;
         assert_eq!(response.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
@@ -2845,6 +3156,9 @@ mod tests {
         assert_eq!(value["health_requests"], 0);
         assert_eq!(value["static_asset_requests"], 0);
         assert_eq!(value["responses"]["2xx"], 1);
+        assert_eq!(value["rpc_usage"]["est_cu_total"], 26);
+        assert_eq!(value["rpc_usage"]["background"], 26);
+        assert_eq!(value["rpc_usage"]["by_chain_method"][0]["method"], "eth_call");
     }
     #[tokio::test]
     async fn admin_route_rejects_without_auth_and_accepts_basic_auth() {
@@ -3244,7 +3558,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "wallets": ["not-a-wallet"],
+                            "wallets": ["0x0000000000000000000000000000000000000001"],
                             "chains": ["solana"]
                         })
                         .to_string(),

@@ -15,7 +15,7 @@
 </section>
 <section class="lookup lookup-secondary" aria-label="Try a public Guard example">
   <h2>Try a public example</h2>
-  <p><a href="/guard/robinhood/0x6444a8e0b267406a15db74ca00c4a24bdfa81ed3180f5b6d0851f8ed6f4f29c5">Review a published NVDA pool</a> · <a href="/guard/robinhood/0x9D70341316BE25ca3732A6351d443fcc8527910e">Review a token claiming unpublished NVDA</a></p>
+  <p><a href="/guard/robinhood/0x6444a8e0b267406a15db74ca00c4a24bdfa81ed3180f5b6d0851f8ed6f4f29c5" rel="nofollow">Review a published NVDA pool</a> · <a href="/guard/robinhood/0x9D70341316BE25ca3732A6351d443fcc8527910e" rel="nofollow">Review a token claiming unpublished NVDA</a></p>
 </section>
 <section class="lookup" aria-labelledby="guard-form-title">
   <h2 id="guard-form-title">Run a Guard review</h2>
@@ -23,7 +23,8 @@
     {% if !error.is_empty() %}<p class="guard-form-error" role="alert">{{ error }}</p>{% endif %}
     <div class="guard-field">
       <label for="guard-address">Token contract or supported pool address</label>
-      <input id="guard-address" name="address" type="text" inputmode="text" autocomplete="off" spellcheck="false" placeholder="Paste a contract or pool address" value="{{ address }}" required>
+      <input id="guard-address" name="address" type="text" inputmode="text" autocomplete="off" spellcheck="false" maxlength="68" pattern="\s*(?:0x[0-9a-fA-F]{40}|0x[0-9a-fA-F]{64}|[1-9A-HJ-NP-Za-km-z]{32,44})\s*" data-address-hint="guard-address-hint" data-validation-hint="Enter a 20-byte EVM address, a 32-byte pool ID, or a Solana address." data-validation-error="Enter a valid EVM, pool-ID, or Solana address." aria-describedby="guard-address-hint" placeholder="Paste a contract or pool address" value="{{ address }}" required>
+      <p id="guard-address-hint" class="lookup-note" aria-live="polite">Enter a 20-byte EVM address, a 32-byte pool ID, or a Solana address.</p>
     </div>
     <div class="guard-field">
       <label for="guard-chain">Chain</label>
@@ -38,7 +39,8 @@
     </div>
     <div class="guard-field">
       <label for="guard-wallet">Optional wallet address</label>
-      <input id="guard-wallet" name="wallet" type="text" inputmode="text" autocomplete="off" spellcheck="false" placeholder="Leave blank to omit wallet-specific checks" value="{{ wallet }}">
+      <input id="guard-wallet" name="wallet" type="text" inputmode="text" autocomplete="off" spellcheck="false" maxlength="46" pattern="\s*(?:0x[0-9a-fA-F]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})?\s*" data-address-hint="guard-wallet-hint" data-validation-hint="Enter an EVM or Solana wallet matching the selected chain, or leave blank." data-validation-error="Enter a valid EVM or Solana wallet address." aria-describedby="guard-wallet-hint" placeholder="Leave blank to omit wallet-specific checks" value="{{ wallet }}">
+      <p id="guard-wallet-hint" class="lookup-note" aria-live="polite">Enter an EVM or Solana wallet matching the selected chain, or leave blank.</p>
     </div>
     <button class="button primary-button" type="submit">Review <span aria-hidden="true">→</span></button>
   </form>

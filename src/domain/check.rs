@@ -42,7 +42,11 @@ pub struct CheckResult {
 
 pub(crate) fn cache_key(address: &str) -> String {
     let address = address.trim();
-    if Chain::is_evm_address(address) { address.to_ascii_lowercase() } else { address.to_owned() }
+    if Chain::is_evm_address(address) || Chain::is_v4_pool_id(address) {
+        address.to_ascii_lowercase()
+    } else {
+        address.to_owned()
+    }
 }
 
 pub(crate) fn valid_public_input(address: &str) -> bool {

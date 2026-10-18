@@ -8,15 +8,26 @@
 {% block canonical_url %}{{ result_url }}{% endblock %}
 {% block canonical_link %}{{ result_url }}{% endblock %}
 {% block content %}
-<section class="page-intro">
+<section class="page-intro guard-card guard-card--{{ verdict_class }}">
   <p class="eyebrow">Guard · {{ chain }}</p>
-  <h1 class="page-title guard-verdict {{ verdict_class }}">{{ headline }}</h1>
-  <p class="guard-facts">{{ identity_sentence }}</p>
-  <p class="guard-facts">{{ powers_sentence }}</p>
-  <p class="guard-facts">{{ source_sentence }}</p>
-  <p class="muted">QED is read-only by design: it never holds keys, never submits transactions, and never recommends; that is why anyone can integrate it.</p>
-  <p class="muted">This point-in-time review does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Re-check before relying on changed chain or issuer facts.</p>
-  <p class="muted"><strong>How to read the verdict:</strong> Allow means completed checks found no contradiction or active restriction; Deny means QED observed a contradiction or active restriction; Unknown means a check was incomplete or could not be verified. These are not safety ratings.</p>
+  <div class="guard-card-head">
+    <h1 class="page-title guard-verdict {{ verdict_class }}"><span class="guard-badge guard-badge--{{ verdict_class }}">{{ headline }}</span></h1>
+    <ul class="guard-chips" aria-label="Key facts">
+      <li class="guard-chip guard-chip--{{ identity_tone }}"><span>Issuer identity</span>{{ identity_status }}</li>
+      <li class="guard-chip"><span>Publisher</span>{{ publisher }}</li>
+      <li class="guard-chip"><span>Ticker</span>{{ ticker }}</li>
+      <li class="guard-chip guard-chip--{{ source_tone }}"><span>Source</span>{{ source_status }}</li>
+    </ul>
+  </div>
+  <p class="guard-lead">{{ identity_sentence }}</p>
+  {{ address_comparison|safe }}
+  <p class="guard-facts">{{ powers_sentence }} {{ source_sentence }}</p>
+  <details class="guard-about">
+    <summary>How to read this verdict</summary>
+    <p class="muted"><strong>How to read the verdict:</strong> Allow means completed checks found no contradiction or active restriction; Deny means QED observed a contradiction or active restriction; Unknown means a check was incomplete or could not be verified. These are not safety ratings.</p>
+    <p class="muted">QED is read-only by design: it never holds keys, never submits transactions, and never recommends; that is why anyone can integrate it.</p>
+    <p class="muted">This point-in-time review does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Re-check before relying on changed chain or issuer facts.</p>
+  </details>
 </section>
 <section class="lookup" aria-labelledby="guard-identity-title">
   <h2 id="guard-identity-title">Issuer identity</h2>

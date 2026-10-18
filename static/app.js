@@ -268,6 +268,16 @@
       }
     }
   };
+  const updateAddressHint = (input, forceError = false) => {
+    const hint = document.getElementById(input.dataset.addressHint || '');
+    if (!hint) return;
+    hint.textContent = forceError || (input.value && !input.validity.valid)
+      ? input.dataset.validationError
+      : input.dataset.validationHint;
+  };
+  const initAddressHints = (root = document) => {
+    root.querySelectorAll?.('[data-address-hint]').forEach((input) => updateAddressHint(input));
+  };
   window.addEventListener('resize', initIntegrationMarquee, { passive: true });
 
   const boot = () => {
@@ -277,6 +287,7 @@
     formatTimes();
     initTickerLookup();
     initIntegrationMarquee();
+    initAddressHints();
     const params = new URLSearchParams(window.location.search);
     if (params.get('hero') === 'open') document.documentElement.classList.add('hero-open');
     if (params.get('nerd') === '1') {
@@ -300,7 +311,15 @@
     if (event.target instanceof HTMLInputElement && event.target.id === 'ticker') {
       void loadTickerSuggestions();
     }
+    if (event.target instanceof HTMLInputElement && event.target.hasAttribute('data-address-hint')) {
+      updateAddressHint(event.target);
+    }
   });
+  document.addEventListener('invalid', (event) => {
+    if (event.target instanceof HTMLInputElement && event.target.hasAttribute('data-address-hint')) {
+      updateAddressHint(event.target, true);
+    }
+  }, true);
   document.addEventListener('pointerdown', (event) => {
     if (event.target instanceof Element && event.target.closest('.ticker-suggestion')) {
       event.preventDefault();
@@ -332,6 +351,7 @@
     formatTimes();
     initTickerLookup();
     initIntegrationMarquee();
+    initAddressHints();
     window.__qedLeaderboardBoot?.();
   });
   document.addEventListener('htmx:historyRestore', () => {
@@ -339,6 +359,7 @@
     formatTimes();
     initTickerLookup();
     initIntegrationMarquee();
+    initAddressHints();
     window.__qedLeaderboardBoot?.();
   });
   boot();

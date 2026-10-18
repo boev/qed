@@ -23,10 +23,15 @@ COPY Cargo.toml Cargo.lock askama.toml rustfmt.toml ./
 COPY CHANGELOG.md SECURITY.md ./
 COPY docs ./docs
 COPY src ./src
+COPY migrations ./migrations
+COPY rds-global-bundle.pem ./
 COPY static ./static
 COPY registry ./registry
 COPY release ./release
-RUN cargo build --release --locked
+RUN echo '90a6f1a7978a1b1b096dca6c57511ca48d3b8cf052f8e704baf358f34ea2f21b  rds-global-bundle.pem' \
+        | sha256sum --check --strict \
+    && chmod 0644 rds-global-bundle.pem \
+    && cargo build --release --locked
 
 FROM --platform=linux/amd64 registry.access.redhat.com/ubi9/ubi-micro:9.7@sha256:efa877c7a38fc7f37a3f942ed4b6d357bec75360f572099c59da1ce09ca37917 AS ubi-micro-base
 FROM --platform=linux/amd64 registry.access.redhat.com/ubi9/ubi:9.7@sha256:ee3871c273cc65a2bd24970b47c15b90fbf962841bc2e41e4f915b1c4c0208e2 AS runtime-packages
@@ -57,6 +62,7 @@ COPY --from=runtime-packages /rootfs/ /
 WORKDIR /app
 COPY --from=builder /src/target/release/qed /usr/local/bin/qed
 COPY --from=builder /src/target/release/qed-healthcheck /usr/local/bin/qed-healthcheck
+COPY --from=builder /src/rds-global-bundle.pem /etc/qed/rds-global-bundle.pem
 COPY --from=builder /src/static ./static
 COPY --from=builder /src/registry ./registry
 COPY --from=builder /src/release ./release

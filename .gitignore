@@ -5,6 +5,8 @@
 !.env.example
 *.log
 *.pem
+# Public Amazon RDS CA bundle (no private key; sha256 pinned in Dockerfile).
+!/rds-global-bundle.pem
 *.key
 *.p12
 *.pfx

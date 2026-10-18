@@ -1,3 +1,4 @@
+pub(crate) mod asset_history;
 pub(crate) mod attestation;
 pub(crate) mod chain;
 pub(crate) mod check;

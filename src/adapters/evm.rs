@@ -1,4 +1,4 @@
-use crate::adapters::state::RpcRateLimiter;
+use crate::adapters::state::{RpcDailyBudgetExceeded, RpcRateLimiter};
 use crate::domain::chain::Chain;
 use crate::domain::pool::{
     PoolError, PoolInfo, TokenMeta, TokenSide, WalletHolding, cap_token_text,
@@ -564,6 +564,15 @@ where
         Box::pin(async move {
             for (attempt, backoff) in RPC_BACKOFF.iter().enumerate() {
                 limiter.acquire().await;
+                let admitted = match &request {
+                    RequestPacket::Single(request) => limiter.debit(request.method()),
+                    RequestPacket::Batch(requests) => {
+                        limiter.debit_methods(requests.iter().map(|request| request.method()))
+                    }
+                };
+                if !admitted {
+                    return Err(TransportErrorKind::custom(RpcDailyBudgetExceeded));
+                }
                 let result: Result<ResponsePacket, TransportError> = match tokio::time::timeout(
                     Duration::from_secs(30),
                     inner.call(request.clone()),
@@ -648,25 +657,49 @@ impl EvmReader {
                 multicall =
                     multicall.add_dynamic(Erc20::new(*token, &self.provider).balanceOf(owner));
             }
-            let (successful, fallback_tokens) =
-                classify_multicall_results(chunk, multicall.try_aggregate(false).await);
+            let multicall_result = multicall.try_aggregate(false).await;
+            if crate::ports::rpc_reads_rejected() {
+                return Err(if crate::ports::rpc_budget_rejected() {
+                    PoolError::DailyBudgetExceeded
+                } else {
+                    PoolError::Reader("crawler cache miss".to_owned())
+                });
+            }
+            let (successful, fallback_tokens) = classify_multicall_results(chunk, multicall_result);
             balances.extend(successful);
             if !fallback_tokens.is_empty() {
                 let fallback_concurrency = Arc::new(tokio::sync::Semaphore::new(8));
+                let request_context = crate::ports::current_rpc_request_context();
                 let mut tasks = tokio::task::JoinSet::new();
                 for token in fallback_tokens {
                     let provider = self.provider.clone();
                     let fallback_concurrency = Arc::clone(&fallback_concurrency);
+                    let task_context = request_context.clone();
                     tasks.spawn(async move {
-                        let Ok(permit) = fallback_concurrency.acquire_owned().await else {
-                            return (token, false, None);
+                        let operation = async move {
+                            let Ok(permit) = fallback_concurrency.acquire_owned().await else {
+                                return (token, false, None);
+                            };
+                            let balance =
+                                Erc20::new(token, &provider).balanceOf(owner).call().await;
+                            drop(permit);
+                            (token, true, balance.ok())
                         };
-                        let balance = Erc20::new(token, &provider).balanceOf(owner).call().await;
-                        drop(permit);
-                        (token, true, balance.ok())
+                        if let Some(context) = task_context {
+                            crate::ports::with_rpc_request_context(context, operation).await.0
+                        } else {
+                            operation.await
+                        }
                     });
                 }
                 while let Some(result) = tasks.join_next().await {
+                    if crate::ports::rpc_reads_rejected() {
+                        return Err(if crate::ports::rpc_budget_rejected() {
+                            PoolError::DailyBudgetExceeded
+                        } else {
+                            PoolError::Reader("crawler cache miss".to_owned())
+                        });
+                    }
                     match result {
                         Ok((token, true, Some(balance))) => balances.push((token, balance)),
                         Ok(_) | Err(_) => {

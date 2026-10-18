@@ -25,13 +25,15 @@ The attestation ID is the lowercase SHA-256 digest of recursively key-sorted pay
 
 A `Verified` result is a point-in-time contract-to-registry match, not proof of backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Signed records include the check time, registry hash, and expiry. Re-check after expiry or when the issuer registry changes; a re-check is a new observation. Trade links open external venues and are provided for navigation only.
 
+HTML uses a separate unsigned last-confirmed projection for pool contract match, token controls and public Guard. Only scheduled attempts advance it, at most once per facet/UTC hour, including a due attempt blocked by the daily budget: one or two misses retain the original result/time; three show Unverified with the last confirmation available. On-demand misses are journal-only; on-demand zero-provider budget/admission/crawler rejections are not misses. Non-confirming on-demand outcomes for untracked assets create no public state. Completed real results apply immediately on any path. Registry staleness/removal and unsupported venues are not misses. Failed facets retry hourly within RPC budgets, bypassing cached Guard allow/deny; exhausted workers record only the due UTC-hour slot, without provider access. Healthy 6/24-hour cadences, signed payloads, latest-attempt statistics and expiry are unchanged.
+
 ## QED Guard
 
 `GET /api/guard/{address}?chain={chain}` and the `/guard` review page return a signed point-in-time document for a supported token or pool. It includes registry identity (`match`, `mismatch`, `no_publisher`, `registry_stale`, or `registry_removed`), observed token powers, source-verification status, known pools with quote-side facts, and an overall `allow`, `deny`, or `unknown` verdict. A deny requires an exact normalized registry ticker plus a matching registry name or issuer in on-chain token metadata on the same chain, or an observed active restriction for a supplied wallet (including an active token-wide pause). Authority capability alone does not deny. An active token-wide pause without a supplied wallet is `unknown` with the structured `token_paused` reason and the human-readable detail `The token-wide pause is active; transfers are blocked until it is lifted.` Guard is read-only: it never holds keys, submits transactions, or recommends. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Verify its signature with `POST /verify`.
 
 Pool identity must be established through QED's known-pool index or on-chain factory/derivation checks; an unindexed Solana account is reviewed as a token.
 
-Prefer `POST /api/guard` with `{"address":"…","chain":"base","wallet":"…"}` over the legacy wallet query parameter: query-string wallets may be exposed in browser history or request URLs. `reasons[].code` is an enum: `publisher_contract_match`, `publisher_contract_mismatch`, `name_resembles_registry_entry`, `publisher_metadata_unavailable`, `no_publisher`, `registry_stale`, `registry_removed`, `token_paused`, `powers_incomplete`, `powers_unavailable`, `wallet_check_not_applicable`, `wallet_check_unavailable`, `wallet_frozen`, `wallet_blocked`, `wallet_sanctioned`, `source_unverified`, `source_unavailable`, and `pool_unavailable`.
+Prefer `POST /api/guard` with `{"address":"…","chain":"base","wallet":"…"}` over the legacy wallet query parameter: query-string wallets may be exposed in browser history or request URLs. `reasons[].code` is an enum: `publisher_contract_match`, `publisher_contract_mismatch`, `name_resembles_registry_entry`, `publisher_metadata_unavailable`, `no_publisher`, `registry_stale`, `registry_removed`, `token_paused`, `powers_incomplete`, `powers_unavailable`, `wallet_check_not_applicable`, `wallet_check_unavailable`, `wallet_frozen`, `wallet_blocked`, `wallet_sanctioned`, `source_unverified`, `source_unavailable`, `pool_unavailable`, and `no_contract_at_address`.
 
 `publisher_metadata_unavailable` means QED could not read complete current publisher metadata for a resembling registry candidate; it is not a mismatch and remains unknown unless another candidate proves a contradiction.
 
@@ -40,16 +42,18 @@ Prefer `POST /api/guard` with `{"address":"…","chain":"base","wallet":"…"}` 
 Examples below use `https://qed.example`; replace it with the deployed public URL.
 Supported chain values use the lowercase slugs `solana`, `robinhood`, `base`, `ethereum`, and `bnb` in URLs, JSON, and OpenAPI. QED verifies existing signed records that used the previous variant spellings.
 
-- `GET /healthz` returns `{"status":"ok"}`.
+- `GET /healthz` returns `status: "ok"` plus storage-primary/degradation/capture-gap flags and `history_degraded_since`; it does not wait for the database.
 - `GET /` returns the home page and live pools.
 - `GET /check` permanently redirects to `/guard`.
 - `GET /registry` and `GET /registry/table` serve the issuer registry and table fragment.
 - `GET /tokens/{ticker}` and `GET /chains/{chain_name}` serve token and chain directories.
+- `GET /assets/{chain}/{kind}/{address}` serves a cache/journal-only exact `pool` or `token` view, accessible SVG timeline and equivalent table. It never initiates chain reads/prefetch, for people or crawlers; use its Guard action explicitly. Use `?days=7`, `30`, or `90`.
+- `GET /assets/{chain}/{kind}/{address}/history.csv` and `/history.json` export public wallet-free observation metadata labelled **not a signed attestation**. `limit` is 1–200; follow `Link: rel=next` (also JSON `next`) with exact fractional `before_time` and `before_id`. Views, exports and detail share the per-client read limiter. Postgres keyset reads have three-second deadlines. Database-unavailable reads return 503, never apparently complete empty history; a capture-gap notice alone does not block healthy database reads, and JSON includes `recording_degraded_since`. `/observations/{id}` retrieves one full operational observation for that exact identity, including recorded evidence/document. Startup hydrates asset/facet metadata in 512-row keyset pages, plus up to 512 recent summaries, never the full journal.
 - `GET /glossary` and `GET /guide/verify-a-stock-token` serve explanatory pages.
 - `GET /docs`, `/docs/llm`, and `/docs/api-quick-start` serve the contract-first guide, MCP client guide, and API quick start; `/about` and `/security` provide product and security information.
 - `GET /changelog` and `GET /changelog.xml` serve the anchored release history and its Atom feed.
 - `GET /blog` and `GET /blog/{slug}` serve published blog pages; `GET /blog.xml` is the Atom feed. Draft posts are excluded from the index, article pages, feed, and sitemap.
-- `GET /validated` and `GET /validated/{chain}/{subject}` serve current contract matches and pool summaries.
+- `GET /validated` and `/validated/{chain}/{subject}` retain their existing directory and exact-address Guard redirects.
 - `GET /validated.xml` returns the current contract-match feed.
 - `GET /v/{id}` serves a signed certificate; `POST /v/{id}/recheck` re-runs its recorded reads.
 - `GET /imprint`, `/privacy`, and `/terms` return the legal pages.
@@ -60,6 +64,7 @@ Supported chain values use the lowercase slugs `solana`, `robinhood`, `base`, `e
 - `GET /openapi.json` returns the OpenAPI 3.1 route document.
 - `GET /pools/featured` returns the featured-pool HTML page.
 - `GET /stats` serves leaderboard, issuer-registry, and publisher deployment-catalog watch statistics, including scan method/time, counts last seen within the last 7 days, and entries first seen this UTC week.
+- `GET /copies` serves the confirmed publisher-watch copies leaderboard, with chain filters, reported volume, and Guard links.
 - `GET /stats.json` downloads the signed point-in-time `kind: "stats"` JSON document.
 - `GET /stats.csv` downloads CSV whose first record embeds that exact signed JSON document.
 - `GET /api/stats?page={page}` returns the leaderboard summary and one page of signed reducer inputs: leaderboard rows, complete retained publisher-watch and unsupported-chain candidates, active registry rows, and their hashes. Pages hold up to 50 rows per input.

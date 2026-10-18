@@ -1,4 +1,5 @@
 use super::pages;
+use crate::ports::{rpc_budget_rejected, rpc_crawler_blocked};
 use crate::{
     adapters::{registry, state::AppState},
     app::check,
@@ -116,8 +117,22 @@ pub(crate) async fn handle(
             if let Err(message) = validate_tool_arguments(name, arguments) {
                 return rpc_error(id, -32602, message, StatusCode::OK);
             }
+            if !state.rate_limiter.allow_on_demand_request() {
+                return (StatusCode::TOO_MANY_REQUESTS, "QED is busy — try again in a minute")
+                    .into_response();
+            }
             let result = run_tool(&state, name, arguments).await;
-            rpc_result(id, result, modern_request)
+            if rpc_budget_rejected() {
+                rpc_result(id, tool_error(super::DAILY_RPC_BUDGET_MESSAGE), modern_request)
+            } else if rpc_crawler_blocked() {
+                rpc_result(
+                    id,
+                    tool_error("Automated crawlers get cached results only."),
+                    modern_request,
+                )
+            } else {
+                rpc_result(id, result, modern_request)
+            }
         }
         _ => rpc_error(id, -32601, "Method not found", StatusCode::NOT_FOUND),
     }
@@ -394,7 +409,15 @@ async fn run_tool(state: &AppState, name: &str, arguments: &Value) -> Value {
             if !valid_public_input(address) {
                 return tool_error("Address is not a supported pool or token address.");
             }
-            let result = check::check(&state.app, address).await;
+            let result = match tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                check::check(&state.app, address),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => return tool_error("QED check exceeded the 20-second request deadline."),
+            };
             let text = match &result.verdict {
                 Verdict::Verified { issuer, ticker } => {
                     format!("Verified: {ticker} matches {issuer}'s registry contract.")
@@ -500,6 +523,9 @@ async fn run_tool(state: &AppState, name: &str, arguments: &Value) -> Value {
                 }
                 Err(crate::app::powers::LookupError::DeadlineExceeded) => {
                     tool_error("QED power reads exceeded the 15 second deadline.")
+                }
+                Err(crate::app::powers::LookupError::DailyBudgetExceeded) => {
+                    tool_error(super::DAILY_RPC_BUDGET_MESSAGE)
                 }
             }
         }
@@ -1461,6 +1487,30 @@ mod tests {
         }
         assert_eq!(allowed, 60);
         assert_eq!(limited, 10);
+    }
+
+    #[tokio::test]
+    async fn global_on_demand_limit_counts_only_mcp_tool_calls() {
+        use crate::adapters::state::RateLimiter;
+        use std::sync::Arc;
+        let mut state = test_state();
+        state.rate_limiter = Arc::new(RateLimiter::with_rpc_limits(4, 8, 10_000, 10_000, 1));
+        for method in ["ping", "tools/list"] {
+            let response = post_rpc_with_state(state.clone(), method, json!({})).await;
+            assert_eq!(response.status(), StatusCode::OK, "{method}");
+        }
+        let tool_call = || {
+            post_rpc_with_state(
+                state.clone(),
+                "tools/call",
+                json!({
+                    "name": "qed_check",
+                    "arguments": { "address": "0x0000000000000000000000000000000000000001" }
+                }),
+            )
+        };
+        assert_eq!(tool_call().await.status(), StatusCode::OK);
+        assert_eq!(tool_call().await.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

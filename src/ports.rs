@@ -9,7 +9,17 @@ use crate::domain::{
 use async_trait::async_trait;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{cell::RefCell, collections::HashMap, future::Future, hash::Hash, io};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    future::Future,
+    hash::Hash,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReadLog {
@@ -39,6 +49,78 @@ where
             (output, captured)
         })
         .await
+}
+pub(crate) const RPC_BUDGET_REJECTED: u8 = 1;
+pub(crate) const RPC_CRAWLER_BLOCKED: u8 = 2;
+
+tokio::task_local! {
+    static RPC_REQUEST_CONTEXT: RpcRequestContext;
+}
+
+#[derive(Clone)]
+pub(crate) struct RpcRequestContext {
+    pub(crate) on_demand: bool,
+    pub(crate) crawler: bool,
+    flags: Arc<AtomicU8>,
+}
+
+impl RpcRequestContext {
+    pub(crate) fn new(on_demand: bool, crawler: bool) -> Self {
+        Self { on_demand, crawler, flags: Arc::new(AtomicU8::new(0)) }
+    }
+
+    pub(crate) fn mark(&self, flag: u8) {
+        self.flags.fetch_or(flag, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RpcRequestOutcome(u8);
+
+impl RpcRequestOutcome {
+    pub(crate) fn budget_rejected(self) -> bool {
+        self.0 & RPC_BUDGET_REJECTED != 0
+    }
+
+    pub(crate) fn crawler_blocked(self) -> bool {
+        self.0 & RPC_CRAWLER_BLOCKED != 0
+    }
+}
+
+pub(crate) async fn with_rpc_request_context<F, T>(
+    context: RpcRequestContext,
+    future: F,
+) -> (T, RpcRequestOutcome)
+where
+    F: Future<Output = T>,
+{
+    let flags = Arc::clone(&context.flags);
+    let result = RPC_REQUEST_CONTEXT.scope(context, future).await;
+    (result, RpcRequestOutcome(flags.load(Ordering::Relaxed)))
+}
+
+pub(crate) fn current_rpc_request_context() -> Option<RpcRequestContext> {
+    RPC_REQUEST_CONTEXT.try_with(Clone::clone).ok()
+}
+
+pub(crate) fn rpc_reads_rejected() -> bool {
+    RPC_REQUEST_CONTEXT
+        .try_with(|context| {
+            context.flags.load(Ordering::Relaxed) & (RPC_BUDGET_REJECTED | RPC_CRAWLER_BLOCKED) != 0
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn rpc_budget_rejected() -> bool {
+    RPC_REQUEST_CONTEXT
+        .try_with(|context| context.flags.load(Ordering::Relaxed) & RPC_BUDGET_REJECTED != 0)
+        .unwrap_or(false)
+}
+
+pub(crate) fn rpc_crawler_blocked() -> bool {
+    RPC_REQUEST_CONTEXT
+        .try_with(|context| context.flags.load(Ordering::Relaxed) & RPC_CRAWLER_BLOCKED != 0)
+        .unwrap_or(false)
 }
 
 pub(crate) fn record_read(
@@ -230,9 +312,53 @@ pub(crate) trait AttestationStore: Send + Sync {
     async fn load_recent(&self) -> io::Result<HashMap<String, Attestation>>;
     async fn latest_for_pool(&self, chain: &str, pool: &str) -> io::Result<Option<Attestation>>;
     async fn persist(&self, attestation: &Attestation) -> io::Result<()>;
+    /// Import original bytes without replacing an existing record or retention tombstone.
+    async fn import_raw(&self, id: &str, bytes: Vec<u8>) -> io::Result<()>;
     async fn get(&self, id: &str) -> io::Result<Option<Attestation>>;
+    /// Original JSON document bytes, before any parsing or chain-name normalization.
+    async fn raw_json(&self, id: &str) -> io::Result<Option<Vec<u8>>>;
     async fn prune_expired(&self, older_than: chrono::DateTime<chrono::Utc>) -> io::Result<()>;
     async fn quarantine(&self, id: &str) -> io::Result<()>;
+}
+
+/// Public, wallet-free observations: metadata projection in memory, bounded database reads.
+#[async_trait]
+pub(crate) trait AssetHistoryStore: Send + Sync {
+    async fn append(
+        &self,
+        event: crate::domain::asset_history::Observation,
+    ) -> Result<bool, String>;
+    async fn flush(&self) -> Result<(), String>;
+    fn states(
+        &self,
+    ) -> Vec<(
+        crate::domain::asset_history::AssetKey,
+        crate::domain::asset_history::Facet,
+        crate::domain::asset_history::AssetState,
+    )>;
+    fn state(
+        &self,
+        asset: &crate::domain::asset_history::AssetKey,
+        facet: crate::domain::asset_history::Facet,
+    ) -> Option<crate::domain::asset_history::AssetState>;
+    async fn observation(
+        &self,
+        asset: &crate::domain::asset_history::AssetKey,
+        id: &str,
+    ) -> Result<Option<std::sync::Arc<crate::domain::asset_history::Observation>>, String>;
+    async fn history(
+        &self,
+        assets: &[crate::domain::asset_history::AssetKey],
+        since: chrono::DateTime<chrono::Utc>,
+        before: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: usize,
+    ) -> Result<Vec<std::sync::Arc<crate::domain::asset_history::Observation>>, String>;
+    async fn inventory(
+        &self,
+        asset: &crate::domain::asset_history::AssetKey,
+    ) -> Result<(Option<chrono::DateTime<chrono::Utc>>, usize), String>;
+    fn degraded_since(&self) -> Option<chrono::DateTime<chrono::Utc>>;
+    fn durable(&self) -> bool;
 }
 
 #[async_trait]

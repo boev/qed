@@ -2,6 +2,74 @@
 
 Notable QED changes, in reverse chronological order. Entries describe shipped releases and current unreleased work; QED does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.
 
+## [1.1.0] - 2026-10-17
+
+**Postgres storage, stable status and public asset history**
+
+- **Last-confirmed status** — Per-chain, per-address and per-facet display state retains a confirmed result through two scheduled misses (one per UTC hour), including budget-blocked due attempts. Three show Unverified; real results apply immediately on any path. On-demand misses are journal-only; on-demand zero-provider rejections never count. Untracked assets' non-confirming on-demand results, including Guard Unknown/no-contract answers, create no public state; Guard Allow/Deny still create or advance it. Registry removal suppresses current Verified claims. Signed payloads and expiry remain unchanged.
+- **Observation journal** — Checksummed Postgres migrations, atomic observation/state updates, idempotent event IDs and bounded local spooling. Startup hydrates lean asset/facet projections only, not the journal; recent memory holds at most 512 payload-free summaries. History and 200-row metadata exports use deadline-bounded keyset queries; detail retrieves the original document. History has no attestation retention TTL.
+- **Failed-only recovery** — Supported failed assets retry hourly at known chain/address, sharing existing locks and RPC budgets. Exhausted workers record one miss for the due hour without provider access; Guard retries bypass cached allow/deny. Failed probes of unknown chains never create phantom asset states.
+- **Asset pages** — Cache-only exact pool/token pages lead with a status badge, miss dots, facts and explicit Guard actions. All asset views/details/exports share the read limiter. Ticker pages combine history with chain chips and a compact mobile table. SVG timeline groups expose keyboard-focusable record links, counted points, UTC ticks and automatic 24h/7d/30d/90d windows. CSV/JSON metadata exports are operational history, not signed attestations; wallet Guard stays private.
+- **Storage recovery and freshness** — Capture-gap warnings remain visible without blocking healthy database history/detail/export reads; database failures have a separate recoverable read circuit. Ordered migrations ensure storage indexes even after history-first startup and repair scheduling/projection eligibility. Migration 6 removes legacy Unknown-only public state without deleting observations or signed documents. Projection hydration uses bounded keyset pages. Dated last-confirmed status replaces the former separate 24-hour stale marker; signed record freshness still follows its original expiry.
+- **Local backfill** — An explicit local-only command validates signatures, IDs, signer allowlist and environment, preserving original bytes and times without replacing existing records or retention tombstones. Valid expired proofs remain historical; missing reads are never reconstructed.
+- **Primary storage** — Postgres holds exact signed attestation bytes, registry/Ondo snapshots and daily attempts, discovery/watch snapshots, featured pools and signed statistics. Background import resumes by committed object key; trusted-signer quarantine and retention tombstones protect old records. Local capture never waits for a database flush; request reads have deadlines/circuit breaking and startup query failures use disk/outbox. Outage restart never restores the stale pre-cutover S3 board. Two four-connection pools cap each task at eight connections.
+- **Large JSON and RDS TLS** — Payloads above 1 MiB use the existing S3 prefixes with a stored key and SHA-256. The image ships the checksum-pinned Amazon RDS CA bundle; `QED_DATABASE_CA_FILE` adds trust roots without weakening hostname verification. Health reports database degradation and persistent capture gaps.
+- **Budget recovery** — Discovery budget rejection waits until the next UTC day or six-hour pass rather than spinning every 30 seconds. No-contract observations cache for 10 minutes. Stats/watch reclassification retains the last confirmed tier when publisher reads fail or budgets are exhausted.
+- **Scoped admission** — `QED_ON_DEMAND_REQUESTS_PER_MINUTE` replaces the old global setting. MCP discovery/list/ping/verify and crawler token cache reads do not consume chain-read admission. Startup and registry-triggered stats reads use background accounting; statement form/recheck failures keep the normal page frame.
+- **RPC guardrails** — Track estimated Alchemy compute units by method and enforce process-local daily/on-demand read budgets. Eligible on-demand HTTP and MCP tool calls share a process-wide admission cap (default 300 per minute across clients); admission exhaustion returns 429, daily exhaustion returns HTTP 503 for synchronous chain-read endpoints, and MCP reports a tool error. `/admin/stats` reports the counters.
+- **Crawler reads** — Automated crawlers receive cached Guard and token-detail data only. Guard cache misses return 403; token-detail pages stay 200 and show powers as unavailable when uncached. Robots excludes Guard, API, verification, and recheck paths while keeping `/tokens/` crawlable.
+- **Input checks** — Validate wallet and statement addresses before chain reads, reject malformed Guard addresses, and sign an `Unknown` `no_contract_at_address` result for EVM addresses confirmed to have no bytecode.
+- **Guard form** — Show address-format guidance and client-side validation hints without changing signed-document formats or existing allow/deny rules.
+
+## [1.0.9] - 2026-10-15
+
+**Token powers kept across registry updates**
+
+- **Powers cache** — Token powers are chain facts per contract, so issuer-catalog updates no longer clear them; only their own 6-hour (top tickers) or daily refresh reads the chain again.
+
+## [1.0.8] - 2026-10-15
+
+**Fewer chain reads, same answers**
+
+- **Registry refresh** — The hourly issuer-catalog refresh counts as a change only when contracts or deployments change. Before, every refresh cleared the cached token powers and Guard answers, so all 156 tracked contracts were re-read from the chain every hour.
+- **Powers cadence** — Token powers for the top 25 tickers refresh every 6 hours (was 100 minutes) and the rest daily (was about 6 h 40 min); every answer still shows when it was observed.
+- **Guard answers** — Allow and deny answers are reused for up to 6 hours (was 1 hour); unknown answers are always checked again.
+
+## [1.0.7] - 2026-10-15
+
+**Steady leaderboard columns**
+
+- **Venue names** — Long venue names (raw contract addresses) are shortened, with the full address on hover, so they no longer shift the leaderboard's verdict column.
+
+## [1.0.6] - 2026-10-13
+
+**Clearer verdicts**
+
+- **Verdict card** — Guard results open with a large Allow/Deny/Unknown badge and key facts (issuer identity, publisher, ticker, source); the explanation folds away.
+- **Address comparison** — Guard and `/copies` show the issuer-published address above the reviewed one in the same size, with every differing character marked.
+- **No copying flagged addresses** — The copy button is disabled for flagged addresses on `/copies`.
+
+## [1.0.5] - 2026-10-13
+
+**Steadier answers**
+
+- **Final answers only** — Guard reuses only allow and deny answers; unknown answers are always checked again.
+- **Memory** — The Guard answer cache holds at most 256 answers, and the service runs with 2 GB instead of 1 GB of memory.
+
+## [1.0.4] - 2026-10-12
+
+**Copied stock tokens, ranked by chain**
+
+- **Copies page** — `/copies` ranks confirmed publisher-watch copies by reported 24h volume, with chain filters, the largest copy beside its issuer-published address, and a Guard link per row.
+
+## [1.0.3] - 2026-10-12
+
+**Faster repeat Guard checks**
+
+- **Repeat checks** — Reuse successful signed Guard answers without a wallet for up to one hour; transient pool and publisher-metadata failures are retried.
+- **Longer limit** — Allow Guard reads up to 30 seconds for slower chains.
+- **Faster start** — Load persisted evidence in parallel; run expired-evidence cleanup after the server starts.
+
 ## [1.0.2] - 2026-10-09
 
 **Lighter background reads with honest check times**

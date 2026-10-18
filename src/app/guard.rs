@@ -1,5 +1,8 @@
 use crate::{
-    app::{context::Context, powers},
+    app::{
+        context::{CachedGuardDocument, CachedNoContract, Context, GuardCacheKey},
+        powers,
+    },
     domain::{
         attestation::MAX_ATTESTATION_BYTES,
         chain::Chain,
@@ -12,14 +15,18 @@ use crate::{
         powers::{PowersRecord, SourceVerified},
         registry::{self, Entry},
     },
-    ports::{ChainReader, ReadLog, capture_reads},
+    ports::{
+        ChainReader, ReadLog, capture_reads, current_rpc_request_context, rpc_budget_rejected,
+        rpc_crawler_blocked, rpc_reads_rejected,
+    },
 };
 use chrono::SecondsFormat;
 use futures_util::StreamExt;
 use std::time::Duration;
 use thiserror::Error;
 
-const GUARD_DEADLINE: Duration = Duration::from_secs(15);
+const GUARD_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const GUARD_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const MAX_GUARD_ADDRESS_CHARS: usize = 66;
 const MAX_GUARD_POOLS: usize = 16;
 const MAX_GUARD_READS: usize = 256;
@@ -33,19 +40,22 @@ pub(crate) enum GuardError {
     InvalidWallet,
     #[error("no reader is configured for the selected chain")]
     ReaderUnavailable,
-    #[error("guard reads exceeded the 15 second deadline")]
+    #[error("guard reads exceeded the 30 second deadline")]
     DeadlineExceeded,
     #[error("guard signing failed")]
     Signing,
+    #[error("daily RPC read budget reached")]
+    DailyBudgetExceeded,
+    #[error("automated crawlers get cached results only")]
+    CrawlerCacheMiss,
 }
-
 pub(crate) async fn create(
     state: &Context,
     address: &str,
     chain: Chain,
     wallet: Option<&str>,
 ) -> Result<GuardDocument, GuardError> {
-    create_with_metadata_cache(state, address, chain, wallet, false).await
+    create_with_metadata_cache(state, address, chain, wallet, false, GUARD_DEADLINE).await
 }
 
 pub(crate) async fn create_for_watch(
@@ -53,7 +63,7 @@ pub(crate) async fn create_for_watch(
     address: &str,
     chain: Chain,
 ) -> Result<GuardDocument, GuardError> {
-    create_with_metadata_cache(state, address, chain, None, true).await
+    create_with_metadata_cache(state, address, chain, None, true, GUARD_DEADLINE).await
 }
 
 async fn create_with_metadata_cache(
@@ -62,9 +72,35 @@ async fn create_with_metadata_cache(
     chain: Chain,
     wallet: Option<&str>,
     cache_published_metadata: bool,
+    deadline: Duration,
+) -> Result<GuardDocument, GuardError> {
+    let state = state.clone();
+    let address = address.to_owned();
+    let wallet = wallet.map(str::to_owned);
+    crate::app::asset_history::finish_execution(async move {
+        create_execution(
+            &state,
+            &address,
+            chain,
+            wallet.as_deref(),
+            cache_published_metadata,
+            deadline,
+        )
+        .await
+    })
+    .await
+}
+
+async fn create_execution(
+    state: &Context,
+    address: &str,
+    chain: Chain,
+    wallet: Option<&str>,
+    cache_published_metadata: bool,
+    deadline: Duration,
 ) -> Result<GuardDocument, GuardError> {
     let address = canonical_input(address, chain)?;
-    if wallet.is_some_and(|wallet| wallet.len() > Chain::MAX_SOLANA_ADDRESS_CHARS) {
+    if wallet.is_some_and(|wallet| wallet.trim().len() > Chain::MAX_SOLANA_ADDRESS_CHARS) {
         return Err(GuardError::InvalidWallet);
     }
     let wallet = wallet
@@ -72,12 +108,203 @@ async fn create_with_metadata_cache(
         .filter(|value| !value.is_empty())
         .map(|wallet| canonical_wallet(wallet, chain))
         .transpose()?;
-    tokio::time::timeout(
-        GUARD_DEADLINE,
-        create_inner(state, &address, chain, wallet.as_deref(), cache_published_metadata),
-    )
+    let cache_enabled = wallet.is_none() && !cache_published_metadata;
+    let registry_version = state.registry_version.load(std::sync::atomic::Ordering::Acquire);
+    let cache_key: GuardCacheKey = (chain, address.clone(), registry_version);
+    if cache_enabled && let Some(document) = cached_guard_document(state, &cache_key).await {
+        return Ok(document);
+    }
+    let executed = std::sync::atomic::AtomicBool::new(false);
+    let mut cache_guard = None;
+    let result = tokio::time::timeout(deadline, async {
+        cache_guard = if wallet.is_none() {
+            Some(
+                state
+                    .guard_locks
+                    .get_or_insert(
+                        cache_key.clone(),
+                        std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                    )
+                    .await
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
+        if cache_enabled && let Some(document) = cached_guard_document(state, &cache_key).await {
+            return Ok(document);
+        }
+        if wallet.is_none()
+            && [
+                crate::domain::asset_history::SubjectKind::Pool,
+                crate::domain::asset_history::SubjectKind::Token,
+            ]
+            .into_iter()
+            .any(|kind| {
+                crate::domain::asset_history::AssetKey::new(chain, kind, &address).is_some_and(
+                    |asset| {
+                        crate::app::asset_history::already_missed_slot(
+                            state,
+                            &asset,
+                            crate::domain::asset_history::Facet::Guard,
+                        )
+                        .is_some()
+                    },
+                )
+            })
+        {
+            return Err(GuardError::ReaderUnavailable);
+        }
+        if current_rpc_request_context().is_some_and(|context| context.crawler) {
+            return Err(GuardError::CrawlerCacheMiss);
+        }
+        executed.store(true, std::sync::atomic::Ordering::Relaxed);
+        create_inner(state, &address, chain, wallet.as_deref(), cache_published_metadata).await
+    })
     .await
-    .map_err(|_| GuardError::DeadlineExceeded)?
+    .unwrap_or(Err(GuardError::DeadlineExceeded));
+    if wallet.is_none() && executed.load(std::sync::atomic::Ordering::Relaxed) {
+        record_guard_observation(state, &address, chain, &result).await;
+    }
+    if rpc_reads_rejected() {
+        return Err(if rpc_budget_rejected() {
+            GuardError::DailyBudgetExceeded
+        } else {
+            GuardError::CrawlerCacheMiss
+        });
+    }
+    if cache_enabled
+        && let Ok(document) = &result
+        && cacheable_guard_document(document)
+        && let Ok(cached_at) = chrono::DateTime::parse_from_rfc3339(&document.observed_at)
+    {
+        state
+            .guard_cache
+            .insert(
+                cache_key,
+                CachedGuardDocument {
+                    cached_at: cached_at.with_timezone(&chrono::Utc),
+                    document: document.clone(),
+                },
+            )
+            .await;
+    }
+    drop(cache_guard);
+    result
+}
+
+async fn record_guard_observation(
+    state: &Context,
+    address: &str,
+    chain: Chain,
+    result: &Result<GuardDocument, GuardError>,
+) {
+    use crate::domain::asset_history::{AssetKey, Facet, Outcome, SubjectKind};
+    if rpc_crawler_blocked() {
+        return;
+    }
+    let kind = match result {
+        Ok(document) if document.subject_type == crate::domain::guard::GuardSubjectType::Pool => {
+            SubjectKind::Pool
+        }
+        Ok(_) => SubjectKind::Token,
+        Err(_) => state
+            .history
+            .states()
+            .into_iter()
+            .find(|(asset, facet, _)| {
+                asset.chain == chain && asset.address == address && *facet == Facet::Guard
+            })
+            .map(|(asset, _, _)| asset.kind)
+            .unwrap_or(SubjectKind::Token),
+    };
+    let Some(asset) = AssetKey::new(chain, kind, address) else {
+        return;
+    };
+    match result {
+        Ok(document) => {
+            let incomplete = document.reasons.iter().any(|reason| {
+                matches!(
+                    reason.code.as_str(),
+                    "pool_unavailable"
+                        | "publisher_metadata_unavailable"
+                        | "powers_unavailable"
+                        | "powers_incomplete"
+                )
+            });
+            let outcome = if incomplete && document.verdict == GuardVerdict::Unknown {
+                Outcome::Miss
+            } else {
+                match document.verdict {
+                    GuardVerdict::Allow => Outcome::Allow,
+                    GuardVerdict::Deny => Outcome::Deny,
+                    GuardVerdict::Unknown => Outcome::Unknown,
+                }
+            };
+            let json = serde_json::to_value(document).unwrap_or_default();
+            let mut observation = crate::app::asset_history::event(
+                state,
+                asset,
+                Facet::Guard,
+                outcome,
+                state.clock.now(),
+                json.clone(),
+            );
+            observation.signed_document = Some(json);
+            if outcome == Outcome::Miss {
+                observation.miss_reason = Some("read_incomplete".into());
+            }
+            crate::app::asset_history::record(state, observation).await;
+        }
+        Err(
+            GuardError::DeadlineExceeded
+            | GuardError::ReaderUnavailable
+            | GuardError::DailyBudgetExceeded,
+        ) => {
+            crate::app::asset_history::miss(
+                state,
+                asset,
+                Facet::Guard,
+                if matches!(result, Err(GuardError::DailyBudgetExceeded)) {
+                    "budget_rejection"
+                } else {
+                    "timeout_or_read_failure"
+                },
+            )
+            .await;
+        }
+        _ => {}
+    }
+}
+
+async fn cached_guard_document(
+    state: &Context,
+    cache_key: &GuardCacheKey,
+) -> Option<GuardDocument> {
+    let cached = state.guard_cache.get(cache_key).await?;
+    let age = state.clock.now().signed_duration_since(cached.cached_at);
+    let max_age = chrono::Duration::from_std(GUARD_CACHE_TTL).unwrap_or(chrono::Duration::zero());
+    if age >= chrono::Duration::zero() && age < max_age {
+        Some(cached.document)
+    } else {
+        state.guard_cache.invalidate(cache_key).await;
+        None
+    }
+}
+
+fn cacheable_guard_document(document: &GuardDocument) -> bool {
+    document.verdict != GuardVerdict::Unknown
+        && document.powers.as_ref().is_some_and(|powers| powers.unavailable.is_empty())
+        && !document.reasons.iter().any(|reason| {
+            matches!(
+                reason.code.as_str(),
+                "pool_unavailable"
+                    | "publisher_metadata_unavailable"
+                    | "powers_unavailable"
+                    | "powers_incomplete"
+            )
+        })
 }
 
 async fn create_inner(
@@ -100,6 +327,28 @@ async fn create_inner(
         .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
     let known_pools = state.pool_index.known_pools(&attestations).await;
 
+    let indexed_pool = known_pools.iter().any(|pool| {
+        pool.chain == chain
+            && (same_address(chain, &pool.pool, address)
+                || same_address(chain, &pool.token_address, address))
+    });
+    if chain != Chain::Solana
+        && registry::lookup(&registry, chain, address).is_none()
+        && !indexed_pool
+    {
+        match powers::confirmed_no_contract(state, chain, address).await {
+            Ok(Some(evidence)) => {
+                return sign_no_contract_document(state, chain, address, wallet, evidence);
+            }
+            Ok(None) => {}
+            Err(error) if error.is_daily_budget_exceeded() => {
+                return Err(GuardError::DailyBudgetExceeded);
+            }
+            Err(_) if rpc_crawler_blocked() => return Err(GuardError::CrawlerCacheMiss),
+            Err(_) => {}
+        }
+    }
+
     let (subject, metadata, pools, subject_type, pool_unavailable, mut read_log) = resolve_subject(
         reader.as_ref(),
         state.clock.as_ref(),
@@ -109,16 +358,21 @@ async fn create_inner(
         &known_pools,
     )
     .await;
-    let ((publisher_metadata, publisher_metadata_unavailable), publisher_metadata_log) =
-        capture_reads(load_publisher_metadata(
-            state,
-            chain,
-            &subject,
-            metadata.as_ref(),
-            std::sync::Arc::clone(&registry),
-            cache_published_metadata,
-        ))
-        .await;
+    let publisher_metadata_future = capture_reads(load_publisher_metadata(
+        state,
+        chain,
+        &subject,
+        metadata.as_ref(),
+        std::sync::Arc::clone(&registry),
+        cache_published_metadata,
+    ));
+    let powers_future = async {
+        if subject.is_empty() { None } else { powers::inspect(state, chain, &subject).await.ok() }
+    };
+    let (
+        ((publisher_metadata, publisher_metadata_unavailable), publisher_metadata_log),
+        power_record,
+    ) = tokio::join!(publisher_metadata_future, powers_future);
     append_read_log(&mut read_log, publisher_metadata_log);
     let complete_publishers = state
         .publisher_catalog_complete
@@ -133,8 +387,6 @@ async fn create_inner(
         &publisher_metadata,
         &complete_publishers,
     );
-    let power_record =
-        if subject.is_empty() { None } else { powers::inspect(state, chain, &subject).await.ok() };
     let (source, provider) = source_status(chain, power_record.as_ref());
 
     let (wallet_check, wallet_log) = if let Some(wallet_address) = wallet {
@@ -227,14 +479,78 @@ async fn create_inner(
         signature: String::new(),
         dev: state.dev_signer,
     };
+    sign_guard_document(state, &mut document)?;
+    Ok(document)
+}
+
+fn sign_guard_document(state: &Context, document: &mut GuardDocument) -> Result<(), GuardError> {
+    if rpc_reads_rejected() {
+        return Err(if rpc_budget_rejected() {
+            GuardError::DailyBudgetExceeded
+        } else {
+            GuardError::CrawlerCacheMiss
+        });
+    }
     let payload =
-        crate::domain::guard::canonical_payload_json(&document).map_err(|_| GuardError::Signing)?;
+        crate::domain::guard::canonical_payload_json(document).map_err(|_| GuardError::Signing)?;
     if payload.len() > MAX_ATTESTATION_BYTES.saturating_sub(1024) {
         return Err(GuardError::Signing);
     }
     (document.id, document.signature) =
         crate::app::attestation::sign_document_payload(state, &payload)
             .map_err(|_| GuardError::Signing)?;
+    Ok(())
+}
+
+fn sign_no_contract_document(
+    state: &Context,
+    chain: Chain,
+    address: &str,
+    wallet: Option<&str>,
+    evidence: CachedNoContract,
+) -> Result<GuardDocument, GuardError> {
+    let mut document = GuardDocument {
+        id: String::new(),
+        kind: "guard".to_owned(),
+        chain,
+        address: address.to_owned(),
+        subject_type: crate::domain::guard::GuardSubjectType::Token,
+        subject_address: None,
+        wallet: wallet.map(str::to_owned),
+        wallet_check: wallet.map(|_| GuardWalletCheck {
+            status: WalletCheckStatus::Unavailable,
+            restrictions: Vec::new(),
+        }),
+        identity: crate::domain::guard::GuardIdentity {
+            publisher: None,
+            matched_contract: None,
+            ticker: None,
+            status: IdentityStatus::NoPublisher,
+            candidate: None,
+            unpublished_product_detail: None,
+            observed_symbol: None,
+            observed_name: None,
+            deployments: Vec::new(),
+        },
+        powers: None,
+        source: GuardSource {
+            status: SourceStatus::Unavailable,
+            provider: "unavailable".to_owned(),
+        },
+        pools: Vec::new(),
+        verdict: GuardVerdict::Unknown,
+        reasons: vec![GuardReason {
+            code: "no_contract_at_address".to_owned(),
+            detail: "No contract bytecode was found at this address.".to_owned(),
+        }],
+        observed_at: evidence.observed_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        reads: evidence.read_log.reads,
+        reads_truncated: evidence.read_log.reads_truncated,
+        public_key: state.signer.public_key(),
+        signature: String::new(),
+        dev: state.dev_signer,
+    };
+    sign_guard_document(state, &mut document)?;
     Ok(document)
 }
 async fn load_publisher_metadata(
@@ -355,8 +671,8 @@ pub(crate) async fn publisher_metadata_for_observation(
     target: &str,
     observed: &TokenMeta,
     entries: std::sync::Arc<Vec<Entry>>,
-) -> std::collections::HashMap<String, TokenMeta> {
-    load_publisher_metadata(context, chain, target, Some(observed), entries, true).await.0
+) -> (std::collections::HashMap<String, TokenMeta>, bool) {
+    load_publisher_metadata(context, chain, target, Some(observed), entries, true).await
 }
 
 fn append_read_log(target: &mut ReadLog, additional: ReadLog) {
@@ -608,10 +924,10 @@ fn source_status(chain: Chain, powers: Option<&PowersRecord>) -> (SourceStatus, 
 }
 
 fn canonical_input(address: &str, chain: Chain) -> Result<String, GuardError> {
+    let address = address.trim();
     if address.len() > MAX_GUARD_ADDRESS_CHARS {
         return Err(GuardError::InvalidAddress);
     }
-    let address = address.trim();
     if Chain::is_v4_pool_id(address) {
         return (chain != Chain::Solana)
             .then(|| address.to_ascii_lowercase())
@@ -621,10 +937,10 @@ fn canonical_input(address: &str, chain: Chain) -> Result<String, GuardError> {
 }
 
 fn canonical_wallet(wallet: &str, chain: Chain) -> Result<String, GuardError> {
+    let wallet = wallet.trim();
     if wallet.len() > Chain::MAX_SOLANA_ADDRESS_CHARS {
         return Err(GuardError::InvalidWallet);
     }
-    let wallet = wallet.trim();
     match chain {
         Chain::Solana => Chain::decode_solana_address(wallet)
             .map(|bytes| bs58::encode(bytes).into_string())
@@ -724,7 +1040,11 @@ mod tests {
             &self,
             _address: &str,
         ) -> Result<crate::domain::powers::PowerFacts, PoolError> {
-            Ok(PowerFacts::default())
+            Ok(PowerFacts {
+                source_target: (self.chain == Chain::Solana)
+                    .then(|| "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb".to_owned()),
+                ..PowerFacts::default()
+            })
         }
 
         async fn wallet_restrictions(
@@ -738,6 +1058,66 @@ mod tests {
                 complete: true,
                 applicable: self.wallet_applicable,
             })
+        }
+    }
+
+    struct UnreliablePowerReader {
+        incomplete: bool,
+        token_meta_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ChainReader for UnreliablePowerReader {
+        fn chain(&self) -> Chain {
+            Chain::Base
+        }
+
+        async fn read_pool(&self, _address: &str) -> Result<PoolInfo, PoolError> {
+            Err(PoolError::Unknown("not a pool".to_owned()))
+        }
+
+        async fn token_meta(&self, _address: &str) -> Result<TokenMeta, PoolError> {
+            self.token_meta_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(PoolError::Reader("token metadata unavailable".to_owned()))
+        }
+
+        async fn power_facts(&self, _address: &str) -> Result<PowerFacts, PoolError> {
+            if self.incomplete {
+                Ok(PowerFacts {
+                    unavailable: vec![Reason::new("rpc_timeout", "RPC timed out.")],
+                    ..PowerFacts::default()
+                })
+            } else {
+                Err(PoolError::Reader("power facts unavailable".to_owned()))
+            }
+        }
+    }
+
+    struct EmptyCodeReader {
+        code_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ChainReader for EmptyCodeReader {
+        fn chain(&self) -> Chain {
+            Chain::Base
+        }
+
+        async fn read_pool(&self, _address: &str) -> Result<PoolInfo, PoolError> {
+            Err(PoolError::Unknown("not a pool".to_owned()))
+        }
+
+        async fn code_at(&self, address: &str) -> Result<Vec<u8>, PoolError> {
+            self.code_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::ports::record_read(
+                "eth_getCode",
+                serde_json::json!([address, "latest"]),
+                &serde_json::json!("0x"),
+                true,
+                None,
+                None,
+            );
+            Ok(Vec::new())
         }
     }
 
@@ -798,6 +1178,59 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn empty_evm_code_is_signed_as_no_contract_and_reuses_the_code_read() {
+        let address = "0x0000000000000000000000000000000000000099";
+        let code_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = test_support::build(
+            vec![Box::new(EmptyCodeReader { code_reads: std::sync::Arc::clone(&code_reads) })],
+            Vec::new(),
+            false,
+        );
+
+        let first = create(&state, address, Chain::Base, None).await.expect("first EOA Guard");
+        assert_eq!(first.verdict, GuardVerdict::Unknown);
+        assert_eq!(first.reasons[0].code, "no_contract_at_address");
+        assert_eq!(first.reads[0].method, "eth_getCode");
+        crate::domain::guard::verify(&first).expect("signed EOA Guard verifies");
+
+        state.test_clock.advance(chrono::Duration::minutes(1));
+        let second = create(&state, address, Chain::Base, None).await.expect("cached code result");
+        assert_eq!(second.reasons[0].code, "no_contract_at_address");
+        assert_eq!(second.observed_at, first.observed_at);
+        assert_eq!(code_reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn guard_cache_lock_wait_is_bounded_by_its_deadline() {
+        let address = "0x0000000000000000000000000000000000000099";
+        let state = fixture(None, Vec::new());
+        let cache_key = (
+            Chain::Base,
+            address.to_ascii_lowercase(),
+            state.registry_version.load(std::sync::atomic::Ordering::Acquire),
+        );
+        let lock = state
+            .guard_locks
+            .get_or_insert(cache_key, std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .await;
+        let _held = lock.lock_owned().await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            create_with_metadata_cache(
+                &state,
+                address,
+                Chain::Base,
+                None,
+                false,
+                std::time::Duration::from_millis(5),
+            ),
+        )
+        .await;
+        assert!(matches!(result, Ok(Err(GuardError::DeadlineExceeded))));
+    }
+
     fn token_side(address: &str, symbol: &str) -> TokenSide {
         TokenSide {
             address: address.to_owned(),
@@ -805,6 +1238,190 @@ mod tests {
             decimals: Some(18),
             balance: Some("100".to_owned()),
         }
+    }
+
+    #[tokio::test]
+    async fn cache_reuses_signed_guard_within_ttl_and_recomputes_after_one_hour() {
+        let address = format!("0x{}ab", "0".repeat(38));
+        let mixed_case_address = format!("0x{}", address[2..].to_ascii_uppercase());
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let metadata = HashMap::from([(address.clone(), meta(&address, "NVDA", "NVIDIA"))]);
+        let mut registered = entry();
+        registered.contract = address.clone();
+        registered.official_deployments[0].address = address.clone();
+        let built = test_support::build(
+            vec![Box::new(GuardReader {
+                chain: Chain::Base,
+                pool: None,
+                metadata,
+                restrictions: Vec::new(),
+                wallet_applicable: true,
+                token_meta_reads: Some(std::sync::Arc::clone(&reads)),
+            })],
+            vec![registered],
+            false,
+        );
+        let state = test_support::with_verified_sources(&built);
+        let first = create(&state, &address, Chain::Base, None).await.expect("first signed Guard");
+        assert_eq!(first.verdict, GuardVerdict::Allow);
+        let reads_after_first = reads.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(reads_after_first > 0);
+
+        let mixed_case = create(&state, &mixed_case_address, Chain::Base, None)
+            .await
+            .expect("case-insensitive cache hit");
+        assert_eq!(mixed_case, first);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), reads_after_first);
+
+        let wallet =
+            create(&state, &address, Chain::Base, Some(WALLET)).await.expect("wallet Guard");
+        assert_eq!(wallet.wallet.as_deref(), Some(WALLET));
+        let reads_after_wallet = reads.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(reads_after_wallet > reads_after_first);
+        assert_eq!(create(&state, &address, Chain::Base, None).await.expect("cached Guard"), first);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), reads_after_wallet);
+
+        state.registry_version.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        create(&state, &address, Chain::Base, None).await.expect("new registry version Guard");
+        let reads_after_registry_change = reads.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(reads_after_registry_change > reads_after_wallet);
+
+        built.test_clock.advance(chrono::Duration::from_std(GUARD_CACHE_TTL).expect("TTL"));
+        let refreshed =
+            create(&state, &address, Chain::Base, None).await.expect("expired signed Guard");
+        assert_ne!(refreshed.id, first.id);
+        assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > reads_after_registry_change);
+        let reads_before_retry = reads.load(std::sync::atomic::Ordering::Relaxed);
+        built.test_clock.advance(chrono::Duration::minutes(1));
+        let asset = crate::domain::asset_history::AssetKey::new(
+            Chain::Base,
+            crate::domain::asset_history::SubjectKind::Token,
+            &address,
+        )
+        .unwrap();
+        crate::ports::with_rpc_request_context(
+            crate::ports::RpcRequestContext::new(false, false),
+            crate::app::asset_history::retry(
+                &state,
+                asset,
+                crate::domain::asset_history::Facet::Guard,
+                false,
+            ),
+        )
+        .await;
+        let retried = create(&state, &address, Chain::Base, None).await.unwrap();
+        assert_ne!(retried.id, refreshed.id, "scheduled retry cannot return cached allow");
+        assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > reads_before_retry);
+    }
+
+    #[tokio::test]
+    async fn guard_retries_unavailable_and_incomplete_power_results() {
+        for incomplete in [false, true] {
+            let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let state = test_support::build(
+                vec![Box::new(UnreliablePowerReader {
+                    incomplete,
+                    token_meta_reads: std::sync::Arc::clone(&reads),
+                })],
+                vec![entry()],
+                false,
+            );
+            let first = create(&state, TOKEN, Chain::Base, None).await.expect("first Guard");
+            if incomplete {
+                assert!(first.powers.as_ref().is_some_and(|powers| !powers.unavailable.is_empty()));
+                assert!(first.reasons.iter().any(|reason| reason.code == "powers_incomplete"));
+            } else {
+                assert!(first.powers.is_none());
+                assert!(first.reasons.iter().any(|reason| reason.code == "powers_unavailable"));
+            }
+            let reads_after_first = reads.load(std::sync::atomic::Ordering::Relaxed);
+
+            create(&state, TOKEN, Chain::Base, None).await.expect("retried Guard");
+            assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > reads_after_first);
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_recomputes_unknown_verdicts_instead_of_caching_them() {
+        let address = "0x00000000000000000000000000000000000000aa";
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let metadata = HashMap::from([(address.to_owned(), meta(address, "NVDA", "NVIDIA"))]);
+        let state = test_support::build(
+            vec![Box::new(GuardReader {
+                chain: Chain::Base,
+                pool: None,
+                metadata,
+                restrictions: Vec::new(),
+                wallet_applicable: true,
+                token_meta_reads: Some(std::sync::Arc::clone(&reads)),
+            })],
+            Vec::new(),
+            false,
+        );
+        let first = create(&state, address, Chain::Base, None).await.expect("first Guard");
+        assert_eq!(first.verdict, GuardVerdict::Unknown);
+        let reads_after_first = reads.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(reads_after_first > 0);
+
+        create(&state, address, Chain::Base, None).await.expect("recomputed Guard");
+        assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > reads_after_first);
+    }
+
+    #[tokio::test]
+    async fn solana_guard_cache_keeps_address_case_distinct() {
+        let address = bs58::encode([21u8; 32]).into_string();
+        let case_variant = address
+            .char_indices()
+            .find_map(|(index, character)| {
+                let replacement = if character.is_ascii_lowercase() {
+                    character.to_ascii_uppercase()
+                } else if character.is_ascii_uppercase() {
+                    character.to_ascii_lowercase()
+                } else {
+                    return None;
+                };
+                let mut candidate = address.clone();
+                candidate
+                    .replace_range(index..index + character.len_utf8(), &replacement.to_string());
+                (Chain::decode_solana_address(&candidate).is_some()).then_some(candidate)
+            })
+            .expect("a valid base58 case variant");
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let metadata = HashMap::from([(address.clone(), meta(&address, "NVDA", "NVIDIA"))]);
+        let mut registered = entry();
+        registered.chain = Chain::Solana;
+        registered.contract = address.clone();
+        registered.official_deployments[0].network = "Solana".to_owned();
+        registered.official_deployments[0].address = address.clone();
+        let built = test_support::build(
+            vec![Box::new(GuardReader {
+                chain: Chain::Solana,
+                pool: None,
+                metadata,
+                restrictions: Vec::new(),
+                wallet_applicable: true,
+                token_meta_reads: Some(std::sync::Arc::clone(&reads)),
+            })],
+            vec![registered],
+            false,
+        );
+        let state = test_support::with_verified_sources(&built);
+
+        let first =
+            create(&state, &address, Chain::Solana, None).await.expect("first Solana Guard");
+        assert_eq!(first.verdict, GuardVerdict::Allow);
+        let reads_after_first = reads.load(std::sync::atomic::Ordering::Relaxed);
+        let distinct = create(&state, &case_variant, Chain::Solana, None)
+            .await
+            .expect("case-distinct Solana Guard");
+        assert_ne!(distinct.address, first.address);
+        assert!(reads.load(std::sync::atomic::Ordering::Relaxed) > reads_after_first);
+        let reads_after_distinct = reads.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            create(&state, &address, Chain::Solana, None).await.expect("cached Solana Guard"),
+            first
+        );
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), reads_after_distinct);
     }
 
     #[tokio::test]
@@ -990,10 +1607,17 @@ mod tests {
         );
         crate::domain::guard::verify(&first).expect("fresh publisher read is signed");
 
-        let second = create(&state, CLONE, Chain::Base, None).await.expect("second Guard");
+        let second = create(&state, CLONE, Chain::Base, None).await.expect("cached second Guard");
+        assert_eq!(second, first);
         assert_eq!(second.identity.status, IdentityStatus::Mismatch);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        state.test_clock.advance(chrono::Duration::from_std(GUARD_CACHE_TTL).expect("TTL"));
+        let refreshed =
+            create(&state, CLONE, Chain::Base, None).await.expect("fresh publisher metadata");
+        assert_eq!(refreshed.identity.status, IdentityStatus::Mismatch);
+        assert_ne!(refreshed.id, first.id);
         assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 4);
-        assert_eq!(second.reads.iter().filter(|read| read.method == "token_meta").count(), 2);
     }
 
     #[tokio::test]

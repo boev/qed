@@ -13,7 +13,6 @@ use crate::{
 use chrono::Utc;
 use std::{
     collections::{BTreeMap, HashSet},
-    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 use tokio::sync::Notify;
@@ -21,8 +20,10 @@ use tracing::info;
 pub(crate) const HOT_POOLS: usize = 50;
 pub(crate) const HOT_TICKERS: usize = 25;
 pub(crate) const COLD_EVERY_N_PASSES: u32 = 4;
-pub(crate) const POWERS_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
-pub(crate) const POWERS_WARM_INTERVAL: Duration = Duration::from_secs(100 * 60);
+/// Longer than the daily cold refresh plus pass jitter, so a warm pass replaces each record
+/// before it expires.
+pub(crate) const POWERS_CACHE_TTL: Duration = Duration::from_secs(32 * 60 * 60);
+pub(crate) const POWERS_WARM_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const POWERS_CACHE_REFRESH_AGE: Duration = POWERS_WARM_INTERVAL;
 pub(crate) const POWERS_WARM_MAX_CONTRACTS: usize = 160;
 const COLD_WARM_REFRESH_AGE: Duration =
@@ -136,7 +137,6 @@ async fn current_warm_targets(state: &Context) -> WarmTargetSelection {
     let ticker_keys =
         tickers.iter().map(|ticker| ticker.trim().to_ascii_uppercase()).collect::<HashSet<_>>();
     let now = state.clock.now();
-    let version = state.registry_version.load(Ordering::Acquire);
     let mut cold_tickers = HashSet::new();
     for entry in registry.iter().filter(|entry| {
         registry::matchable(entry) && ticker_keys.contains(&entry.ticker.to_ascii_uppercase())
@@ -144,7 +144,7 @@ async fn current_warm_targets(state: &Context) -> WarmTargetSelection {
         let Ok(contract) = canonical_contract(entry.chain, &entry.contract) else {
             continue;
         };
-        let key = (entry.chain, contract, version);
+        let key = (entry.chain, contract);
         let cold_due = state.powers_cache.get(&key).await.is_none_or(|record| {
             cold_refresh_is_due(Some(&record.observed_at), &now, COLD_WARM_REFRESH_AGE)
         });
@@ -221,7 +221,9 @@ fn transient_pool_error_code(error: &PoolError) -> &'static str {
         PoolError::BudgetExceeded(_) => "budget_exceeded",
         PoolError::UnsupportedVenue(_) => "unsupported_venue",
         PoolError::RpcLimit(_) => "rpc_limit",
+        PoolError::Reader(_) if error.is_daily_budget_exceeded() => "daily_rpc_budget",
         PoolError::Reader(_) => "rpc_unavailable",
+        PoolError::DailyBudgetExceeded => "daily_rpc_budget",
     }
 }
 
@@ -235,9 +237,11 @@ pub(crate) async fn warm_current_pool_powers(state: &Context) -> WarmPassSummary
         cap_hit: selection.cap_hit,
         ..WarmPassSummary::default()
     };
-    let version = state.registry_version.load(Ordering::Acquire);
     for (chain, contract) in selection.targets {
-        warm_target(state, chain, contract, version, &mut summary).await;
+        warm_target(state, chain, contract, &mut summary).await;
+        if crate::ports::rpc_reads_rejected() {
+            break;
+        }
     }
 
     log_summary(&summary, started.elapsed());
@@ -248,10 +252,9 @@ async fn warm_target(
     state: &Context,
     chain: Chain,
     contract: String,
-    version: u64,
     summary: &mut WarmPassSummary,
 ) {
-    let key = (chain, contract.clone(), version);
+    let key = (chain, contract.clone());
     let cached_record = state.powers_cache.get(&key).await;
     let refresh_cached = cached_record
         .as_ref()
@@ -283,15 +286,13 @@ async fn warm_target(
     }
     match inspect_for_warm_refresh(state, chain, &contract).await {
         Ok(record) => {
-            let current_key = (chain, contract, state.registry_version.load(Ordering::Acquire));
+            let current_key = (chain, contract);
             if let Some(record) = state.powers_retry_cache.get(&current_key).await {
                 record_transient_record(summary, chain, &record);
             } else if let Some(record) = state.powers_cache.get(&current_key).await {
                 record_warm_success(summary, chain, &record);
             } else {
-                let reason = if state.registry_version.load(Ordering::Acquire) != version {
-                    "registry_changed"
-                } else if record.source_verified == SourceVerified::Unavailable
+                let reason = if record.source_verified == SourceVerified::Unavailable
                     || record.source_verified_proxy == Some(SourceVerified::Unavailable)
                 {
                     "source_unavailable"
@@ -413,7 +414,7 @@ mod tests {
     #[test]
     fn cold_warm_refresh_is_due_after_four_warm_intervals() {
         let now = Utc::now();
-        let cold_interval = Duration::from_secs(400 * 60);
+        let cold_interval = Duration::from_secs(24 * 60 * 60);
         assert_eq!(COLD_WARM_REFRESH_AGE, cold_interval);
         let just_before = (now - chrono::Duration::seconds(cold_interval.as_secs() as i64 - 1))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -463,5 +464,11 @@ mod tests {
             "unsupported_venue"
         );
         assert_eq!(transient_pool_error_code(&PoolError::RpcLimit("bounded logs")), "rpc_limit");
+        assert_eq!(
+            transient_pool_error_code(&PoolError::Reader(
+                "QED_DAILY_RPC_BUDGET_REACHED".to_owned()
+            )),
+            "daily_rpc_budget"
+        );
     }
 }

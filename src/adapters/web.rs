@@ -1,6 +1,7 @@
 use crate::{
     adapters::state::{AdminAuth, AppState},
     domain::{chain::Chain, registry},
+    ports::{RpcRequestContext, RpcRequestOutcome, with_rpc_request_context},
 };
 use axum::{
     Router,
@@ -15,6 +16,7 @@ use std::net::{IpAddr, SocketAddr};
 use tower_http::{compression::CompressionLayer, services::ServeDir};
 
 mod api;
+mod asset;
 mod docs;
 mod mcp;
 mod pages;
@@ -22,18 +24,18 @@ mod views;
 pub(crate) use api::{
     admin_stats, api_attestation, api_check, api_featured, api_guard, api_guard_post,
     api_leaderboard, api_powers, api_prices, api_registry, api_statement, api_statement_get,
-    api_stats, api_status, api_wallet, healthz, refresh_stats_snapshot, stats_snapshot_csv,
-    stats_snapshot_json, verify_attestation, well_known,
+    api_stats, api_status, api_wallet, healthz, refresh_stats_snapshot, restore_stats_snapshot,
+    stats_snapshot_csv, stats_snapshot_json, verify_attestation, well_known,
 };
 pub(crate) use docs::{api_docs, imprint, llms, llms_full, privacy, terms, validated_feed};
 pub(crate) use pages::{
-    certificate, chain_page, featured, glossary_page, guide_verify_page, index,
+    certificate, chain_page, copies_page, featured, glossary_page, guide_verify_page, index,
     recheck_certificate, registry_page, registry_table, stats_page, token_lookup, token_page,
     validated, validated_detail,
 };
 pub(crate) fn wallet_error_status(error: crate::app::wallet::WalletError) -> StatusCode {
     match error {
-        crate::app::wallet::WalletError::InvalidAddress => StatusCode::NOT_FOUND,
+        crate::app::wallet::WalletError::InvalidAddress => StatusCode::BAD_REQUEST,
         crate::app::wallet::WalletError::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
         crate::app::wallet::WalletError::BudgetExceeded => StatusCode::SERVICE_UNAVAILABLE,
         crate::app::wallet::WalletError::ReaderUnavailable => StatusCode::BAD_GATEWAY,
@@ -45,6 +47,8 @@ pub(crate) fn guard_error_status(error: &crate::app::guard::GuardError) -> Statu
         | crate::app::guard::GuardError::InvalidWallet => StatusCode::BAD_REQUEST,
         crate::app::guard::GuardError::ReaderUnavailable => StatusCode::BAD_GATEWAY,
         crate::app::guard::GuardError::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
+        crate::app::guard::GuardError::DailyBudgetExceeded => StatusCode::SERVICE_UNAVAILABLE,
+        crate::app::guard::GuardError::CrawlerCacheMiss => StatusCode::FORBIDDEN,
         crate::app::guard::GuardError::Signing => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -76,6 +80,7 @@ const fn asset_version() -> u64 {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/copies", get(copies_page))
         .route("/stats", get(stats_page))
         .route("/stats.json", get(stats_snapshot_json))
         .route("/stats.csv", get(stats_snapshot_csv))
@@ -86,6 +91,10 @@ pub fn router(state: AppState) -> Router {
         .route("/registry/table", get(registry_table))
         .route("/tokens", get(token_lookup))
         .route("/tokens/{ticker}", get(token_page))
+        .route("/assets/{chain}/{kind}/{address}", get(asset::page))
+        .route("/assets/{chain}/{kind}/{address}/history.json", get(asset::export_json))
+        .route("/assets/{chain}/{kind}/{address}/history.csv", get(asset::export_csv))
+        .route("/assets/{chain}/{kind}/{address}/observations/{id}", get(asset::observation))
         .route("/chains/{chain_name}", get(chain_page))
         .route("/glossary", get(glossary_page))
         .route("/docs", get(pages::docs_page))
@@ -292,7 +301,9 @@ async fn rate_limit(
         || path.starts_with("/api/guard/")
         || path == "/verify"
         || (request.method() == Method::GET
-            && (path.starts_with("/validated/") || path.starts_with("/v/")))
+            && (path.starts_with("/tokens/")
+                || path.starts_with("/validated/")
+                || path.starts_with("/v/")))
         || (request.method() == Method::POST
             && (path.starts_with("/v/") || path.starts_with("/statements/"))
             && path.ends_with("/recheck"))
@@ -307,45 +318,191 @@ async fn rate_limit(
     let is_read_limited = path.starts_with("/api/attest/")
         || path == "/.well-known/qed.json"
         || path == "/admin/stats"
-        || is_registry_api;
-    if is_wallet || is_expensive || is_read_limited {
+        || is_registry_api
+        || (request.method() == Method::GET && path.starts_with("/assets/"));
+    let is_on_demand = is_on_demand_rpc_request(request.method(), path);
+    let crawler = request
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_automated_crawler);
+    let global_on_demand =
+        is_global_on_demand_request(request.method(), path, crawler, is_on_demand);
+
+    if is_wallet || is_expensive || is_read_limited || is_on_demand {
         let ip = trusted_client_ip(&request);
         if !state.rate_limiter.allow(ip) {
             return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded. Try again later.\n")
                 .into_response();
         }
-        if is_wallet {
-            let Ok(_permit) = state.wallet_concurrency.clone().try_acquire_owned() else {
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "A wallet scan is already in progress. Try again later.\n",
-                )
-                    .into_response();
-            };
-            return next.run(request).await;
-        }
-        if is_registry_api {
-            let Ok(_permit) = state.registry_api_concurrency.clone().try_acquire_owned() else {
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "The registry endpoint is busy. Try again later.\n",
-                )
-                    .into_response();
-            };
-            return next.run(request).await;
-        }
-        if is_expensive {
-            let Ok(_permit) = state.expensive_concurrency.clone().try_acquire_owned() else {
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "Too many checks in progress. Try again later.\n",
-                )
-                    .into_response();
-            };
-            return next.run(request).await;
-        }
     }
-    next.run(request).await
+    if global_on_demand && !state.rate_limiter.allow_on_demand_request() {
+        return (StatusCode::TOO_MANY_REQUESTS, "QED is busy — try again in a minute")
+            .into_response();
+    }
+    if is_wallet {
+        let Ok(_permit) = state.wallet_concurrency.clone().try_acquire_owned() else {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "A wallet scan is already in progress. Try again later.\n",
+            )
+                .into_response();
+        };
+        return run_with_rpc_context(&state, request, next, is_on_demand, crawler).await;
+    }
+    if is_registry_api {
+        let Ok(_permit) = state.registry_api_concurrency.clone().try_acquire_owned() else {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "The registry endpoint is busy. Try again later.\n",
+            )
+                .into_response();
+        };
+        return run_with_rpc_context(&state, request, next, is_on_demand, crawler).await;
+    }
+    if is_expensive {
+        let Ok(_permit) = state.expensive_concurrency.clone().try_acquire_owned() else {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many checks in progress. Try again later.\n",
+            )
+                .into_response();
+        };
+        return run_with_rpc_context(&state, request, next, is_on_demand, crawler).await;
+    }
+    run_with_rpc_context(&state, request, next, is_on_demand, crawler).await
+}
+
+fn is_on_demand_rpc_request(method: &Method, path: &str) -> bool {
+    (method == Method::GET
+        && (path.starts_with("/api/check/")
+            || path.starts_with("/api/powers/")
+            || path.starts_with("/api/guard/")
+            || path.starts_with("/guard/")
+            || path.starts_with("/tokens/")))
+        || (method == Method::POST
+            && (path == "/mcp"
+                || path == "/guard"
+                || path == "/api/guard"
+                || path == "/api/wallet"
+                || path == "/api/statement"
+                || path == "/statements"
+                || (path.starts_with("/v/") && path.ends_with("/recheck"))
+                || (path.starts_with("/statements/") && path.ends_with("/recheck"))))
+}
+
+fn is_global_on_demand_request(
+    method: &Method,
+    path: &str,
+    crawler: bool,
+    is_on_demand: bool,
+) -> bool {
+    is_on_demand
+        && !(method == Method::POST && path == "/mcp")
+        && !(crawler && method == Method::GET && path.starts_with("/tokens/"))
+}
+
+fn is_automated_crawler(user_agent: &str) -> bool {
+    let user_agent = user_agent.to_ascii_lowercase();
+    [
+        "crawler/",
+        "crawl/",
+        "spider/",
+        "slurp",
+        "googlebot",
+        "bingbot",
+        "duckduckbot",
+        "yandexbot",
+        "baiduspider",
+        "applebot",
+        "gptbot",
+        "claudebot",
+        "ccbot",
+        "perplexitybot",
+        "bytespider",
+        "amazonbot",
+        "facebookexternalhit",
+        "twitterbot",
+        "linkedinbot",
+        "petalbot",
+        "semrushbot",
+        "ahrefsbot",
+        "mj12bot",
+    ]
+    .iter()
+    .any(|marker| user_agent.contains(marker))
+}
+
+async fn run_with_rpc_context(
+    state: &AppState,
+    request: axum::extract::Request,
+    next: Next,
+    on_demand: bool,
+    crawler: bool,
+) -> Response {
+    if !on_demand {
+        return next.run(request).await;
+    }
+    let path = request.uri().path().to_owned();
+    let (response, outcome): (Response, RpcRequestOutcome) =
+        with_rpc_request_context(RpcRequestContext::new(true, crawler), next.run(request)).await;
+    if path == "/mcp" || path.starts_with("/tokens/") {
+        return response;
+    }
+    if outcome.crawler_blocked() || (crawler && response.status() == StatusCode::FORBIDDEN) {
+        return crawler_block_response(state, &path);
+    }
+    if outcome.budget_rejected() {
+        return daily_budget_response(state, &path);
+    }
+    response
+}
+
+const DAILY_RPC_BUDGET_MESSAGE: &str =
+    "QED daily read budget reached - cached results still served; try again after 00:00 UTC";
+
+fn crawler_block_response(state: &AppState, path: &str) -> Response {
+    const MESSAGE: &str = "Automated crawlers get cached results only.";
+    if path == "/guard" || path.starts_with("/guard/") {
+        return pages::guard_error_response(state, path, StatusCode::FORBIDDEN, MESSAGE)
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    if is_statement_form_or_recheck(path) {
+        return pages::statement_error_response(state, StatusCode::FORBIDDEN, MESSAGE)
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({"error": MESSAGE}))).into_response()
+}
+
+fn daily_budget_response(state: &AppState, path: &str) -> Response {
+    if path == "/guard" || path.starts_with("/guard/") {
+        return pages::guard_error_response(
+            state,
+            path,
+            StatusCode::SERVICE_UNAVAILABLE,
+            DAILY_RPC_BUDGET_MESSAGE,
+        )
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    if is_statement_form_or_recheck(path) {
+        return pages::statement_error_response(
+            state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            DAILY_RPC_BUDGET_MESSAGE,
+        )
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(serde_json::json!({"error": DAILY_RPC_BUDGET_MESSAGE})),
+    )
+        .into_response()
+}
+
+fn is_statement_form_or_recheck(path: &str) -> bool {
+    path == "/statements"
+        || (path.starts_with("/statements/") && path.ends_with("/recheck"))
+        || (path.starts_with("/v/") && path.ends_with("/recheck"))
 }
 
 fn trusted_client_ip(request: &axum::extract::Request) -> IpAddr {
@@ -572,7 +729,7 @@ async fn robots(State(state): State<AppState>) -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         format!(
-            "User-agent: *\nAllow: /\nDisallow: /v/*/recheck\nDisallow: /verify\n\nUser-agent: GPTBot\nAllow: /\nDisallow: /v/*/recheck\nDisallow: /verify\n\nUser-agent: ClaudeBot\nAllow: /\nDisallow: /v/*/recheck\nDisallow: /verify\n\nUser-agent: PerplexityBot\nAllow: /\nDisallow: /v/*/recheck\nDisallow: /verify\n\nUser-agent: Google-Extended\nAllow: /\nDisallow: /v/*/recheck\nDisallow: /verify\n\nUser-agent: CCBot\nAllow: /\nDisallow: /v/*/recheck\nDisallow: /verify\n\nSitemap: {}/sitemap.xml\n",
+            "User-agent: *\nAllow: /\nDisallow: /guard/\nDisallow: /api/\nDisallow: /mcp\nDisallow: /validated/\nDisallow: /v/*/recheck\nDisallow: /verify\nDisallow: /statements/\n\nSitemap: {}/sitemap.xml\n",
             state.public_url
         ),
     )
@@ -594,6 +751,7 @@ async fn sitemap(State(state): State<AppState>) -> Response {
         ("/changelog".to_owned(), now.clone()),
         ("/blog".to_owned(), now.clone()),
         ("/statements".to_owned(), now.clone()),
+        ("/copies".to_owned(), now.clone()),
         ("/guide/verify-a-stock-token".to_owned(), now.clone()),
         ("/imprint".to_owned(), now.clone()),
         ("/privacy".to_owned(), now.clone()),
@@ -646,13 +804,23 @@ async fn sitemap(State(state): State<AppState>) -> Response {
         ));
     }
     drop(registry);
-    for attestation in views::verified_attestations(&state.app).await {
+    let mut assets = std::collections::BTreeMap::new();
+    for (key, _, projection) in state.app.history.states() {
+        if let Some(latest) = projection.latest {
+            assets
+                .entry(key.path())
+                .and_modify(|time: &mut chrono::DateTime<chrono::Utc>| {
+                    *time = (*time).max(latest.observed_at)
+                })
+                .or_insert(latest.observed_at);
+        }
+    }
+    for (path, time) in assets {
         urls.push(format!(
-            "<url><loc>{}/validated/{}/{}</loc><lastmod>{}</lastmod></url>",
+            "<url><loc>{}{}</loc><lastmod>{}</lastmod></url>",
             xml_escape(&state.public_url),
-            views::chain_slug(attestation.chain),
-            xml_escape(&attestation.subject),
-            xml_escape(&attestation.checked_at),
+            xml_escape(&path),
+            time.to_rfc3339()
         ));
     }
     (
@@ -677,6 +845,7 @@ fn xml_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::state::RateLimiter;
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
@@ -712,6 +881,49 @@ mod tests {
         > {
             self.started.notify_one();
             self.release.notified().await;
+            Ok((
+                Vec::new(),
+                crate::domain::statement::StatementPosition {
+                    chain: crate::domain::chain::Chain::Solana,
+                    wallet: owner.to_owned(),
+                    block,
+                    min_slot: None,
+                    max_slot: None,
+                },
+            ))
+        }
+    }
+    struct RejectedStatementReader;
+    #[async_trait::async_trait]
+    impl crate::ports::ChainReader for RejectedStatementReader {
+        fn chain(&self) -> crate::domain::chain::Chain {
+            crate::domain::chain::Chain::Solana
+        }
+        async fn read_pool(
+            &self,
+            _address: &str,
+        ) -> Result<crate::domain::pool::PoolInfo, crate::domain::pool::PoolError> {
+            Err(crate::domain::pool::PoolError::Reader("unused".to_owned()))
+        }
+        async fn statement_holdings(
+            &self,
+            owner: &str,
+            _entries: &[crate::domain::registry::Entry],
+            block: Option<u64>,
+        ) -> Result<
+            (
+                Vec<crate::domain::statement::StatementHolding>,
+                crate::domain::statement::StatementPosition,
+            ),
+            crate::domain::pool::PoolError,
+        > {
+            let context = crate::ports::current_rpc_request_context()
+                .expect("statement request has RPC context");
+            context.mark(if context.crawler {
+                crate::ports::RPC_CRAWLER_BLOCKED
+            } else {
+                crate::ports::RPC_BUDGET_REJECTED
+            });
             Ok((
                 Vec::new(),
                 crate::domain::statement::StatementPosition {
@@ -806,6 +1018,13 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(trusted_client_ip(&request), IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    }
+
+    #[test]
+    fn crawler_detection_avoids_unrelated_product_names() {
+        assert!(!is_automated_crawler("CUBOT/1.0"));
+        assert!(is_automated_crawler("Googlebot/2.1"));
+        assert!(is_automated_crawler("GenericCrawler/1.0"));
     }
 
     #[tokio::test]
@@ -906,6 +1125,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_on_demand_limit_rejects_requests_across_client_ips() {
+        let mut state = AppState::for_tests(Vec::new(), Vec::new(), false);
+        state.rate_limiter =
+            std::sync::Arc::new(RateLimiter::with_rpc_limits(4, 8, 10_000, 10_000, 1));
+        let check_request = |client_ip: &str| {
+            Request::get("/api/check/0x0000000000000000000000000000000000000001")
+                .header("x-forwarded-for", client_ip)
+                .body(Body::empty())
+                .expect("API check request")
+        };
+
+        let first = router(state.clone())
+            .oneshot(check_request("198.51.100.10"))
+            .await
+            .expect("first check response");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = router(state)
+            .oneshot(check_request("203.0.113.20"))
+            .await
+            .expect("second check response");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+    #[tokio::test]
+    async fn crawler_token_cache_hit_does_not_consume_global_on_demand_admission() {
+        use crate::domain::{
+            chain::Chain,
+            powers::{PowersRecord, SourceVerified, SourceVerifiedSubject},
+            registry::Entry,
+        };
+        use std::sync::Arc;
+        let address = "11111111111111111111111111111111";
+        let mut state = AppState::for_tests(
+            vec![Entry {
+                issuer: "Fixture issuer".to_owned(),
+                ticker: "NVDA".to_owned(),
+                name: "Fixture NVDA".to_owned(),
+                chain: Chain::Solana,
+                contract: address.to_owned(),
+                decimals: Some(9),
+                source: "fixture".to_owned(),
+                source_url: "https://example.invalid/registry".to_owned(),
+                last_checked: "2026-10-17T00:00:00Z".to_owned(),
+                removed_at: None,
+                stale_since: None,
+                official_deployments: Vec::new(),
+            }],
+            Vec::new(),
+            false,
+        );
+        state
+            .app
+            .powers_cache
+            .insert(
+                (Chain::Solana, address.to_owned()),
+                PowersRecord {
+                    chain: Chain::Solana,
+                    contract: address.to_owned(),
+                    can_seize: Vec::new(),
+                    can_block: Vec::new(),
+                    can_change_rules: Vec::new(),
+                    token_paused: None,
+                    sanctions_list: None,
+                    unavailable: Vec::new(),
+                    source_verified_subject: SourceVerifiedSubject::TokenProgram,
+                    source_verified: SourceVerified::Unavailable,
+                    source_verified_proxy: None,
+                    observed_at: chrono::Utc::now().to_rfc3339(),
+                    block: None,
+                    slot: None,
+                    reads: Vec::new(),
+                },
+            )
+            .await;
+        state.rate_limiter = Arc::new(RateLimiter::with_rpc_limits(4, 8, 10_000, 10_000, 1));
+        let page = router(state.clone())
+            .oneshot(
+                Request::get("/tokens/NVDA")
+                    .header(header::USER_AGENT, "Googlebot/2.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        let check = router(state)
+            .oneshot(
+                Request::get("/api/check/0x0000000000000000000000000000000000000001")
+                    .header("x-forwarded-for", "198.51.100.45")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(check.status(), StatusCode::OK);
+    }
+    #[tokio::test]
+    async fn statement_form_and_recheck_rejections_use_the_page_frame() {
+        let state = AppState::for_tests(Vec::new(), Vec::new(), false);
+        for path in ["/statements", "/statements/example/recheck", "/v/example/recheck"] {
+            for (response, status) in [
+                (crawler_block_response(&state, path), StatusCode::FORBIDDEN),
+                (daily_budget_response(&state, path), StatusCode::SERVICE_UNAVAILABLE),
+            ] {
+                assert_eq!(response.status(), status, "{path}");
+                assert!(
+                    response
+                        .headers()
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|v| v.starts_with("text/html"))
+                );
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let html = std::str::from_utf8(&body).unwrap();
+                assert!(html.starts_with("<!doctype html>"));
+                assert_eq!(html.matches("<main ").count(), 1);
+                assert!(html.contains("<nav class=\"site-nav\""));
+                assert!(html.trim_end().ends_with("</html>"));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn statement_form_budget_and_crawler_rejections_render_the_page_frame() {
+        for (crawler, status) in
+            [(false, StatusCode::SERVICE_UNAVAILABLE), (true, StatusCode::FORBIDDEN)]
+        {
+            let state =
+                AppState::for_tests(Vec::new(), vec![Box::new(RejectedStatementReader)], false);
+            let mut request = Request::post("/statements")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+            if crawler {
+                request = request.header(header::USER_AGENT, "Googlebot/2.1");
+            }
+            let response = router(state)
+                .oneshot(
+                    request
+                        .body(Body::from("wallets=11111111111111111111111111111111&chains=solana"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.starts_with("text/html"))
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let html = std::str::from_utf8(&body).unwrap();
+            assert!(html.starts_with("<!doctype html>"));
+            assert_eq!(html.matches("<main ").count(), 1);
+            assert!(html.contains("<nav class=\"site-nav\""));
+            assert!(html.trim_end().ends_with("</html>"));
+        }
+    }
+
+    #[tokio::test]
     async fn wallet_page_routes_are_removed_without_removing_wallet_api() {
         let app = router(AppState::for_tests(Vec::new(), Vec::new(), false));
         for request in [
@@ -955,6 +1333,7 @@ mod tests {
             ("/privacy", "QED | Privacy"),
             ("/terms", "QED | Terms"),
             ("/statements", "QED | Statement"),
+            ("/copies", "QED | Copied stock tokens"),
             ("/stats", "QED | Leaderboard statistics"),
             ("/guide/verify-a-stock-token", "QED | Contract-first verification guide"),
             ("/glossary", "QED | Glossary"),
@@ -1004,16 +1383,29 @@ mod tests {
             let top_level =
                 nav.split_once("<details class=\"docs-menu\">").expect("Docs dropdown").0;
             let mut previous = 0;
-            for path in ["/guard", "/registry", "/statements", "/stats"] {
+            for path in ["/guard", "/registry", "/statements", "/copies", "/stats"] {
                 let position = top_level.find(&format!("href=\"{path}\"")).expect("main nav link");
                 assert!(position >= previous, "{path}");
                 previous = position;
+            }
+            let mobile_nav = body
+                .split_once("<nav aria-label=\"Mobile navigation\"")
+                .expect("mobile navigation")
+                .1
+                .split("</nav>")
+                .next()
+                .expect("mobile navigation close");
+            let mut mobile_previous = 0;
+            for path in ["/statements", "/copies", "/stats"] {
+                let position =
+                    mobile_nav.find(&format!("href=\"{path}\"")).expect("mobile nav link");
+                assert!(position >= mobile_previous, "mobile {path}");
+                mobile_previous = position;
             }
             let docs_menu = nav.split_once("<details class=\"docs-menu\">").unwrap().1;
             for path in ["/docs", "/api", "/docs/llm", "/llms.txt", "/blog", "/changelog#"] {
                 assert!(docs_menu.contains(&format!("href=\"{path}")), "{path}");
             }
-            assert!(docs_menu.contains(&format!("New in {}", env!("CARGO_PKG_VERSION"))));
             assert!(!nav.contains("version-pill"), "version pill sits outside the centered nav");
             let actions = body
                 .split_once("<div class=\"header-actions\">")
@@ -1220,7 +1612,35 @@ mod tests {
         assert!(sitemap.contains("/docs/llm"));
         assert!(sitemap.contains("/docs/api-quick-start"));
         assert!(sitemap.contains("/statements"));
+        assert!(sitemap.contains("/copies"));
         assert!(!sitemap.contains("/blog/what-qed-powers-shows"));
+        assert!(!sitemap.contains("/validated/"));
+        let robots = app
+            .clone()
+            .oneshot(Request::get("/robots.txt").body(Body::empty()).expect("robots request"))
+            .await
+            .expect("robots response");
+        let robots = axum::body::to_bytes(robots.into_body(), usize::MAX).await.unwrap();
+        let robots = String::from_utf8(robots.to_vec()).unwrap();
+        assert!(robots.contains("Disallow: /guard/"));
+        assert!(robots.contains("Disallow: /api/"));
+        assert!(!robots.contains("Disallow: /tokens"));
+        let llms = app
+            .clone()
+            .oneshot(Request::get("/llms.txt").body(Body::empty()).expect("llms request"))
+            .await
+            .expect("llms response");
+        let llms = axum::body::to_bytes(llms.into_body(), usize::MAX).await.unwrap();
+        let llms = String::from_utf8(llms.to_vec()).unwrap();
+        assert!(llms.contains("http://localhost:3000/copies"));
+        let llms_full = app
+            .clone()
+            .oneshot(Request::get("/llms-full.txt").body(Body::empty()).expect("full llms request"))
+            .await
+            .expect("full llms response");
+        let llms_full = axum::body::to_bytes(llms_full.into_body(), usize::MAX).await.unwrap();
+        let llms_full = String::from_utf8(llms_full.to_vec()).unwrap();
+        assert!(llms_full.contains("GET /copies"));
         assert!(!sitemap.contains("/blog/what-a-qed-statement-is"));
 
         for path in [
@@ -1460,6 +1880,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("See all copies by chain → /copies"));
         assert_eq!(body.matches("<article class=\"stats-number-card").count(), 4);
         assert!(body.contains("0 of 0"));
         assert!(

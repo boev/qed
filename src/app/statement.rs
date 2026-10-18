@@ -9,19 +9,21 @@ use crate::{
             StatementWallet,
         },
     },
-    ports::capture_reads,
+    ports::{capture_reads, rpc_budget_rejected, rpc_crawler_blocked, rpc_reads_rejected},
 };
 use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Duration;
-use std::{collections::HashSet, sync::atomic::Ordering};
 use thiserror::Error;
 
 const STATEMENT_DEADLINE: Duration = Duration::from_secs(15);
 
 const MAX_WALLETS: usize = 32;
+const MAX_LABEL_CHARS: usize = 80;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StatementRequest {
     #[serde(default)]
     pub label: String,
@@ -44,13 +46,27 @@ pub(crate) enum StatementError {
     DeadlineExceeded,
     #[error("statement signing failed")]
     Signing,
+    #[error("daily RPC read budget reached")]
+    DailyBudgetExceeded,
+    #[error("automated crawlers get cached results only")]
+    CrawlerCacheMiss,
 }
 pub(crate) async fn create(
     state: &Context,
     mut request: StatementRequest,
 ) -> Result<Statement, StatementError> {
+    if request.label.trim().chars().count() > MAX_LABEL_CHARS {
+        return Err(StatementError::InvalidRequest);
+    }
     let chains = parse_chains(&request.chains)?;
     request.wallets = normalize_wallets(&request.wallets)?;
+    if request
+        .wallets
+        .iter()
+        .any(|wallet| !chains.iter().any(|chain| address_matches_chain(wallet, *chain)))
+    {
+        return Err(StatementError::UnknownWallet);
+    }
     let (data, read_log) = tokio::time::timeout(
         STATEMENT_DEADLINE,
         capture_reads(async {
@@ -77,6 +93,15 @@ pub(crate) async fn create(
         signature: String::new(),
         dev: state.dev_signer,
     };
+    if rpc_reads_rejected() {
+        return Err(if rpc_budget_rejected() {
+            StatementError::DailyBudgetExceeded
+        } else if rpc_crawler_blocked() {
+            StatementError::CrawlerCacheMiss
+        } else {
+            StatementError::ReadFailed(chains[0])
+        });
+    }
     let payload = crate::domain::statement::canonical_payload_json(&statement)
         .map_err(|_| StatementError::Signing)?;
     let (id, signature) = crate::app::attestation::sign_document_payload(state, &payload)
@@ -174,10 +199,9 @@ async fn asset_row(
     decimals: u8,
 ) -> StatementAsset {
     let holding = statement_holding.holding;
-    let version = state.registry_version.load(Ordering::Acquire);
     let cached = crate::app::powers::canonical_contract(entry.chain, &entry.contract)
         .ok()
-        .map(|contract| (entry.chain, contract, version));
+        .map(|contract| (entry.chain, contract));
     let facts = match cached {
         Some(key) => state.powers_cache.get(&key).await,
         None => None,
@@ -247,13 +271,18 @@ fn normalize_wallets(wallets: &[String]) -> Result<Vec<String>, StatementError> 
     wallets
         .iter()
         .map(|wallet| {
-            if wallet.trim() != wallet || wallet.is_empty() || wallet.len() > 128 {
+            if wallet.trim() != wallet
+                || wallet.is_empty()
+                || wallet.len() > Chain::MAX_SOLANA_ADDRESS_CHARS
+            {
                 return Err(StatementError::InvalidRequest);
             }
             let normalized = if Chain::is_evm_address(wallet) {
                 wallet.to_ascii_lowercase()
-            } else {
+            } else if Chain::detect(wallet) == Some(Chain::Solana) {
                 wallet.clone()
+            } else {
+                return Err(StatementError::InvalidRequest);
             };
             if !seen.insert(normalized.clone()) {
                 return Err(StatementError::InvalidRequest);
@@ -411,6 +440,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_wallet_in_mixed_statement_request_is_rejected_before_reads() {
+        let (state, statement_reads, power_calls) = statement_context(Vec::new(), false);
+        let result = create(
+            &state,
+            request(vec![
+                "0x0000000000000000000000000000000000000001".to_owned(),
+                "not-an-address".to_owned(),
+            ]),
+        )
+        .await;
+
+        assert!(matches!(result, Err(StatementError::InvalidRequest)));
+        assert_eq!(statement_reads.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(power_calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn statement_signs_registry_holdings_and_marks_uncached_powers_unobserved() {
         let token = "0x0000000000000000000000000000000000000011";
         let (state, _, power_calls) = statement_context(vec![entry(token, "NVDA")], false);
@@ -457,9 +503,26 @@ mod tests {
             Err(StatementError::InvalidRequest)
         ));
         assert_eq!(statement_reads.load(AtomicOrdering::SeqCst), 1);
+        let solana = bs58::encode([21u8; 32]).into_string();
+        let solana_case_variant = solana
+            .char_indices()
+            .find_map(|(index, character)| {
+                let replacement = if character.is_ascii_lowercase() {
+                    character.to_ascii_uppercase()
+                } else if character.is_ascii_uppercase() {
+                    character.to_ascii_lowercase()
+                } else {
+                    return None;
+                };
+                let mut candidate = solana.clone();
+                candidate
+                    .replace_range(index..index + character.len_utf8(), &replacement.to_string());
+                (Chain::detect(&candidate) == Some(Chain::Solana)).then_some(candidate)
+            })
+            .expect("a valid case-distinct Solana address");
         assert_eq!(
-            normalize_wallets(&["SoLaNaCase".to_owned(), "solanacase".to_owned()]).unwrap(),
-            ["SoLaNaCase", "solanacase"]
+            normalize_wallets(&[solana.clone(), solana_case_variant.clone()]).unwrap(),
+            [solana, solana_case_variant]
         );
     }
 
@@ -470,7 +533,7 @@ mod tests {
         state
             .powers_cache
             .insert(
-                (Chain::Base, token.to_owned(), 0),
+                (Chain::Base, token.to_owned()),
                 PowersRecord {
                     chain: Chain::Base,
                     contract: token.to_owned(),

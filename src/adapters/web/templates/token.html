@@ -1,24 +1,46 @@
 {% extends "layout.html" %}
 {% block title %}QED | {{ title }}{% endblock %}
-{% block meta_description %}QED issuer contracts and currently listed pools for tokenized {{ ticker }} across every supported chain.{% endblock %}
+{% block meta_description %}Public asset facts, issuer controls and observation history. Operational history is not a signed attestation.{% endblock %}
 {% block og_title %}QED | {{ title }}{% endblock %}
-{% block og_description %}The issuer registry contracts and current pool contract verdicts for tokenized {{ ticker }}.{% endblock %}
+{% block og_description %}Public asset facts, issuer controls and observation history.{% endblock %}
 {% block twitter_title %}QED | {{ title }}{% endblock %}
-{% block twitter_description %}The issuer registry contracts and current pool contract verdicts for tokenized {{ ticker }}.{% endblock %}
-{% block canonical_url %}{{ public_url }}/tokens/{{ ticker }}{% endblock %}
-{% block canonical_link %}{{ public_url }}/tokens/{{ ticker }}{% endblock %}
+{% block twitter_description %}Public asset facts, issuer controls and observation history.{% endblock %}
+{% block canonical_url %}{{ public_url }}{{ history.path }}{% endblock %}
+{% block canonical_link %}{{ public_url }}{{ history.path }}{% endblock %}
 {% block content %}
-<script type="application/ld+json">{{ json_ld|safe }}</script>
 <section class="page-intro directory-intro">
-  <p class="eyebrow">Token registry</p>
-  <h1 class="page-title">Which contracts did each issuer publish for {{ ticker }}?</h1>
-  <p>These are the registry addresses QED compares against; a ticker alone is not evidence of a contract match.</p>
+  <p class="eyebrow">{% if history.exact %}Asset{% else %}Token{% endif %}</p>
+  <h1 class="page-title">{{ title }}</h1>
+  {% if name.len() > 0 %}<p class="asset-name">{{ name }}</p>{% endif %}
+  {% if issuers.len() > 0 %}<p class="muted">Publishers · {{ issuers }}</p>{% endif %}
 </section>
+{% if history.exact %}
+{% for asset in history.assets %}
+<section class="guard-card guard-card--{{ asset.tone }} asset-verdict" aria-label="Last-confirmed asset status">
+  <div class="guard-card-head"><h2 class="guard-verdict"><span class="guard-badge">{{ asset.label }}</span></h2><span class="miss-dots" aria-label="{{ asset.misses }} consecutive misses"><span {% if asset.misses > 0 %}class="miss-dot filled"{% else %}class="miss-dot"{% endif %}></span><span {% if asset.misses > 1 %}class="miss-dot filled"{% else %}class="miss-dot"{% endif %}></span><span {% if asset.misses > 2 %}class="miss-dot filled"{% else %}class="miss-dot"{% endif %}></span></span></div>
+  <p class="asset-confirmed">Last confirmed {{ asset.confirmed }}<span>Next check ~{{ asset.next_check }}</span></p>
+  <dl class="asset-facts">
+    {% for fact in asset.facts %}<div><dt>{{ fact.label }}</dt><dd>{{ fact.value }}{% if fact.matched %} <span class="registry-tick" title="Matches issuer registry" aria-label="Matches issuer registry">✓</span>{% endif %}{% if fact.address.len() > 0 %} <button class="copy-button" type="button" data-copy="{{ fact.address }}" aria-label="Copy {{ fact.label }} address">Copy</button>{% endif %}</dd></div>{% endfor %}
+    <div class="asset-address-fact"><dt>Address</dt><dd><code class="asset-full-address">{{ asset.address }}</code><code class="asset-short-address" title="{{ asset.address }}">{{ asset.short_address }}</code><button class="copy-button" type="button" data-copy="{{ asset.address }}" aria-label="Copy address">Copy</button></dd></div>
+  </dl>
+  <div class="history-actions"><a class="button primary-button" href="{{ asset.guard_url }}">Guard this address</a>{% if asset.proof_url.len() > 0 %}<a class="button secondary-button" href="{{ asset.proof_url }}">Verify latest record</a>{% else %}<button class="button secondary-button" type="button" disabled title="No signed record captured yet">Verify latest record</button>{% endif %}<a class="button secondary-button" href="{{ asset.path }}/history.csv">CSV</a><a class="button secondary-button" href="{{ asset.path }}/history.json">JSON</a></div>
+  <p class="lookup-note">Last-confirmed read status, not a safety rating. Next check is approximate; normal cadence is unchanged.</p>
+</section>
+{% endfor %}
+{% else %}
+<div class="asset-chain-chips" aria-label="Per-chain read status">{% for asset in history.assets %}{% if asset.kind == "token" %}<a class="count-badge" href="{{ asset.path }}">{{ asset.chain }} · {{ asset.label }}</a>{% endif %}{% endfor %}</div>
+{% endif %}
+{% include "asset_history.html" %}
+{% if !history.exact %}
+<section class="directory-section" aria-labelledby="asset-directory-title">
+  <h2 id="asset-directory-title">Contracts &amp; pools</h2>
+  <table class="asset-directory"><thead><tr><th>Chain</th><th>Type</th><th>Address</th><th>Status</th><th>Last confirmed</th><th>Controls</th><th>Details</th></tr></thead><tbody>{% for asset in history.assets %}<tr><td data-label="Chain">{{ asset.chain }}</td><td data-label="Type">{{ asset.kind }}</td><td data-label="Address"><code title="{{ asset.address }}">{{ asset.short_address }}</code><button class="copy-button" type="button" data-copy="{{ asset.address }}" aria-label="Copy {{ asset.chain }} {{ asset.kind }} address">Copy</button></td><td data-label="Status">{{ asset.label }}</td><td data-label="Last confirmed">{{ asset.confirmed }}</td><td data-label="Controls"><div class="powers-summary">{% for badge in asset.controls %}<span class="count-badge">{{ badge }}</span>{% endfor %}{% if asset.controls.len() == 0 %}—{% endif %}</div></td><td><a href="{{ asset.path }}">Asset page ↗</a></td></tr>{% endfor %}</tbody></table>
+</section>
+{% endif %}
+{% if history.exact %}
+{% if contracts.len() > 0 %}
 <section class="directory-section" aria-labelledby="contracts-title">
-  <div class="section-heading"><div><p class="eyebrow">Issuer contracts</p><h2 id="contracts-title">{{ ticker }} on every chain</h2></div></div>
-  {% if contracts.len() == 0 %}
-  <p class="muted">No issuer contract is currently in the registry.</p>
-  {% else %}
+  <div class="section-heading"><div><p class="eyebrow">Token facts</p><h2 id="contracts-title">Issuer contracts &amp; controls</h2></div></div>
   <div class="contract-directory" role="list">
     {% for contract in contracts %}
     <article class="contract-card" role="listitem">
@@ -39,16 +61,15 @@
       </div>
       <div class="contract-actions" aria-label="{{ contract.chain }} contract links">
         <a class="button secondary-button" href="{{ contract.explorer_url }}" target="_blank" rel="noopener noreferrer">Explorer <span aria-hidden="true">↗</span></a>
-        <a class="button secondary-button" href="{{ contract.source_url }}" target="_blank" rel="noopener noreferrer">Issuer source <span aria-hidden="true">↗</span></a>
+        {% if contract.source_url.len() > 0 %}<a class="button secondary-button" href="{{ contract.source_url }}" target="_blank" rel="noopener noreferrer">Issuer source <span aria-hidden="true">↗</span></a>{% endif %}
       </div>
       <div class="powers-summary" role="group" aria-label="Token control signals">
         {% for badge in contract.powers.summary_badges %}<span class="count-badge">{{ badge }}</span>{% endfor %}
         <span class="count-badge">{{ contract.powers.source_badge }}</span>
       </div>
       <p class="lookup-note">{{ contract.powers.summary_sentence }}</p>
-      <p class="lookup-note">Legend: control badges describe capabilities QED observed on this chain. “Source verified” means published source matched the observed contract; it is not a safety rating.</p>
       <details class="powers-panel">
-        <summary>Observed token-control signals</summary>
+        <summary>Details · latest controls attempt</summary>
         {% if contract.powers.available %}
         <dl>
           <dt>Seizure signals</dt>
@@ -59,24 +80,18 @@
           <dd>{% if contract.powers.can_change_rules.len() == 0 %}{% if contract.powers.unavailable.len() > 0 %}unavailable (transient){% else %}No evidence observed{% endif %}{% else %}<ul>{% for reason in contract.powers.can_change_rules %}<li>{{ reason }}</li>{% endfor %}</ul>{% endif %}</dd>
           {% if contract.powers.unavailable.len() > 0 %}<dt>Unavailable reads (transient)</dt><dd><ul>{% for reason in contract.powers.unavailable %}<li>{{ reason }}</li>{% endfor %}</ul></dd>{% endif %}
           <dt>{{ contract.powers.source_verified_subject }}</dt><dd>{{ contract.powers.source_verified }}{% if contract.powers.source_verified_proxy.len() > 0 %}; proxy: {{ contract.powers.source_verified_proxy }}{% endif %}</dd>
-          <dt>Observed at</dt><dd><time datetime="{{ contract.powers.observed_at }}">{{ contract.powers.observed_at }}</time></dd>
+          <dt>Observed at</dt><dd>{{ contract.powers.observed_at }}</dd>
         </dl>
         {% else %}
         <p>Power evidence is unavailable for this page request.</p>
         {% endif %}
         <p>Absence of observed signals is not proof that no authority exists. These observations do not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.</p>
       </details>
+      {% if contract.powers.last_confirmed_at.len() > 0 %}<details class="powers-panel"><summary>Prior confirmed controls · {{ contract.powers.last_confirmed_at }}</summary><p>{{ contract.powers.last_confirmed_signals }}</p></details>{% endif %}
     </article>
     {% endfor %}
   </div>
-  {% endif %}
 </section>
-<section class="directory-section" aria-labelledby="pools-title">
-  <div class="section-heading"><div><p class="eyebrow">Current listings</p><h2 id="pools-title">Pools QED can see now</h2></div></div>
-  <p class="directory-note">A stock-paired pool is only listed here when a venue reports the ticker. Its verdict says whether the observed quote contract matches the issuer registry.</p>
-  {% if pools.len() == 0 %}<p class="muted">No current leaderboard pool is tagged {{ ticker }}.</p>{% else %}
-  <div class="directory-pools">{% for pool in pools %}<article class="directory-pool {{ pool.verdict_class }}"><div><strong>{{ pool.pair }}</strong><span>{{ pool.chain }} · {{ pool.dex }}</span></div><span class="directory-verdict">{{ pool.verdict }}</span><div class="directory-actions"><a href="{{ pool.detail_url }}">Pool page ↗</a>{% if pool.trade_url.len() > 0 %}<span class="trade-link-item"><a href="{{ pool.trade_url }}" target="_blank" rel="noopener noreferrer">Market page ↗</a></span>{% endif %}</div></article>{% endfor %}</div>
-  <p class="contract-match-footnote">contract match only, not proof of backing or custody, price, or endorsement</p>
-  {% endif %}
-</section>
+{% endif %}
+{% endif %}
 {% endblock %}

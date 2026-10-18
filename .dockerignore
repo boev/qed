@@ -6,6 +6,7 @@ data/
 !.env.example
 *.log
 *.pem
+!rds-global-bundle.pem
 *.key
 *.p12
 *.pfx

@@ -2,7 +2,7 @@
 
 Operator and copyright owner: Web3 Energy Ltd., 49 Angel Voyvoda Street, Poduyane District, 1510 Sofia, Bulgaria. Contact: contact@web3-energy.com with subject "Legal".
 
-QED is operated as one Rust process in AWS ECS using Fargate behind an AWS Application Load Balancer in eu-central-1 (Frankfurt). The public service is reached directly through that load balancer.
+QED is operated as one Rust process in Amazon Web Services (eu-central-1, Frankfurt) behind an AWS Application Load Balancer.
 
 ## 1. What a QED record is
 

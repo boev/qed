@@ -12,22 +12,48 @@ use crate::domain::check::{
 };
 use crate::domain::pool::{PoolError, PoolInfo, TokenMeta, TokenSide};
 use crate::domain::registry::{Entry, Registry};
-use crate::ports::ChainReader;
+use crate::ports::{ChainReader, rpc_budget_rejected, rpc_crawler_blocked, rpc_reads_rejected};
 use chrono::{SecondsFormat, Utc};
 use std::sync::atomic::Ordering;
 pub(crate) async fn detect_evm_chain(
+    state: &Context,
     address: &str,
-    readers: &[&dyn ChainReader],
+    kind: crate::domain::asset_history::SubjectKind,
+    facet: crate::domain::asset_history::Facet,
 ) -> Result<Chain, PoolError> {
     if !Chain::is_evm_address(address) {
         return Err(PoolError::InvalidAddress);
     }
     for chain in [Chain::RobinhoodChain, Chain::Base, Chain::Ethereum, Chain::Bnb] {
-        for reader in readers.iter().filter(|reader| reader.chain() == chain) {
-            if let Ok(code) = reader.code_at(address).await
-                && !code.is_empty()
-            {
-                return Ok(chain);
+        for reader in state.readers.iter().filter(|reader| reader.chain() == chain) {
+            match reader.code_at(address).await {
+                Ok(code) if !code.is_empty() => return Ok(chain),
+                Err(error)
+                    if matches!(
+                        error,
+                        PoolError::Reader(_)
+                            | PoolError::RpcLimit(_)
+                            | PoolError::DailyBudgetExceeded
+                    ) =>
+                {
+                    if let Some(asset) =
+                        crate::domain::asset_history::AssetKey::new(chain, kind, address)
+                        && state.history.state(&asset, facet).is_some()
+                    {
+                        crate::app::asset_history::miss(
+                            state,
+                            asset,
+                            facet,
+                            if error.is_daily_budget_exceeded() {
+                                "budget_rejection"
+                            } else {
+                                "chain_probe_failed"
+                            },
+                        )
+                        .await;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -44,6 +70,7 @@ fn public_pool_error(error: &PoolError) -> &'static str {
         PoolError::RpcLimit(_) => "RPC query limit reached",
         PoolError::CodeLookupUnsupported => "contract lookup is unavailable",
         PoolError::BudgetExceeded(_) => "bounded pool discovery was exhausted",
+        PoolError::DailyBudgetExceeded => "QED daily RPC read budget reached",
         PoolError::Reader(_) => "RPC provider request failed",
     }
 }
@@ -62,7 +89,9 @@ impl CheckFailure {
         let issue = match &error {
             PoolError::UnsupportedVenue(_) => CheckReadIssue::UnsupportedVenue,
             PoolError::RpcLimit(_) | PoolError::BudgetExceeded(_) => CheckReadIssue::RpcLimit,
-            PoolError::Reader(_) | PoolError::CodeLookupUnsupported => CheckReadIssue::Transient,
+            PoolError::Reader(_)
+            | PoolError::DailyBudgetExceeded
+            | PoolError::CodeLookupUnsupported => CheckReadIssue::Transient,
             PoolError::InvalidAddress | PoolError::Unknown(_) => CheckReadIssue::Unsupported,
         };
         let reason = match error {
@@ -76,7 +105,9 @@ impl CheckFailure {
         let issue = match error {
             PoolError::UnsupportedVenue(_) => CheckReadIssue::UnsupportedVenue,
             PoolError::RpcLimit(_) | PoolError::BudgetExceeded(_) => CheckReadIssue::RpcLimit,
-            PoolError::Reader(_) | PoolError::CodeLookupUnsupported => CheckReadIssue::Transient,
+            PoolError::Reader(_)
+            | PoolError::DailyBudgetExceeded
+            | PoolError::CodeLookupUnsupported => CheckReadIssue::Transient,
             PoolError::InvalidAddress | PoolError::Unknown(_) => CheckReadIssue::Unsupported,
         };
         let reason = match error {
@@ -92,7 +123,32 @@ impl CheckFailure {
 /// addresses use a canonical lower-case key; Solana addresses remain
 /// case-sensitive.
 pub async fn check(state: &Context, address: &str) -> CheckResult {
-    let cache_key = cache_key(address);
+    check_internal(state, address, None).await
+}
+
+pub(crate) async fn check_on_chain(state: &Context, chain: Chain, address: &str) -> CheckResult {
+    check_internal(state, address, Some(chain)).await
+}
+
+async fn check_internal(state: &Context, address: &str, known_chain: Option<Chain>) -> CheckResult {
+    if let Some(chain) = known_chain
+        && let Some(asset) = crate::domain::asset_history::AssetKey::new(
+            chain,
+            crate::domain::asset_history::SubjectKind::Pool,
+            address,
+        )
+        && let Some(previous) = crate::app::asset_history::already_missed_slot(
+            state,
+            &asset,
+            crate::domain::asset_history::Facet::ContractMatch,
+        )
+        && let Ok(Some(observation)) = state.history.observation(&asset, &previous.event_id).await
+        && let Ok(result) = serde::Deserialize::deserialize(&observation.evidence)
+    {
+        return result;
+    }
+    let cache_key = known_chain
+        .map_or_else(|| cache_key(address), |chain| format!("{chain}:{}", cache_key(address)));
     let leader_sender = loop {
         let registry_version = state.registry_version.load(Ordering::Acquire);
         if let Some(cached) = state.check_cache.get(&cache_key).await
@@ -114,39 +170,75 @@ pub async fn check(state: &Context, address: &str) -> CheckResult {
         in_flight.insert(cache_key.clone(), std::sync::Arc::downgrade(&sender));
         break sender;
     };
-    let registry_version = state.registry_version.load(Ordering::Acquire);
+    let state = state.clone();
+    let address = address.to_owned();
+    crate::app::asset_history::finish_execution(async move {
+        let state = &state;
+        let address = address.as_str();
+        let registry_version = state.registry_version.load(Ordering::Acquire);
 
-    let registry = state.registry.snapshot().await;
-    let (mut result, read_log) =
-        crate::ports::capture_reads(check_uncached(state, address, &registry)).await;
-    if let Some(attestation) =
-        crate::app::attestation::create_for_check(state, &registry, &result, read_log).await
-    {
-        result.attestation_id = Some(attestation.id);
-    }
-    if let Some(pool) = result.pool.as_ref() {
-        let token_address = registered_token_address(pool, &registry).map(str::to_owned);
-        if let Some(token_address) = token_address {
-            result.powers =
-                crate::app::powers::inspect(state, result.chain, &token_address).await.ok();
+        let registry = state.registry.snapshot().await;
+        let mut resolved_chain = known_chain;
+        let (mut result, read_log) = crate::ports::capture_reads(check_uncached_on_chain(
+            state,
+            address,
+            &registry,
+            known_chain,
+            &mut resolved_chain,
+        ))
+        .await;
+        if !rpc_reads_rejected()
+            && let Some(pool) = result.pool.as_ref()
+        {
+            let token_address = registered_token_address(pool, &registry).map(str::to_owned);
+            if let Some(token_address) = token_address {
+                result.powers =
+                    crate::app::powers::inspect(state, result.chain, &token_address).await.ok();
+            }
         }
-    }
+        let request_rejected = rpc_reads_rejected();
+        if rpc_budget_rejected() {
+            result = unknown(
+                address,
+                result.chain,
+                "QED daily RPC read budget reached".to_owned(),
+                Vec::new(),
+            );
+        } else if rpc_crawler_blocked() {
+            result = unknown(
+                address,
+                result.chain,
+                "automated crawlers get cached results only".to_owned(),
+                Vec::new(),
+            );
+        }
+        // One completed logical observation; the clock port also determines its UTC retry slot.
+        result.checked_at = state.clock.now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        if !request_rejected
+            && let Some(attestation) =
+                crate::app::attestation::create_for_check(state, &registry, &result, read_log).await
+        {
+            result.attestation_id = Some(attestation.id);
+        }
 
-    // A refresh advances the version while holding the registry write lock.
-    // Do not repopulate the cache with a check that crossed that replacement.
-    if registry_version == state.registry_version.load(Ordering::Acquire) {
-        state
-            .check_cache
-            .insert(
-                cache_key.clone(),
-                CachedCheckResult { registry_version, result: result.clone() },
-            )
-            .await;
-    }
-    let _ = leader_sender.send(Some(result.clone()));
-    let mut in_flight = state.check_inflight.lock().await;
-    in_flight.remove(&cache_key);
-    result
+        crate::app::asset_history::check(state, &result, resolved_chain).await;
+        // A refresh advances the version while holding the registry write lock.
+        // Do not repopulate the cache with a check that crossed that replacement.
+        if !request_rejected && registry_version == state.registry_version.load(Ordering::Acquire) {
+            state
+                .check_cache
+                .insert(
+                    cache_key.clone(),
+                    CachedCheckResult { registry_version, result: result.clone() },
+                )
+                .await;
+        }
+        let _ = leader_sender.send(Some(result.clone()));
+        let mut in_flight = state.check_inflight.lock().await;
+        in_flight.remove(&cache_key);
+        result
+    })
+    .await
 }
 
 const MAX_INDEXED_POOL_CANDIDATES: usize = 16;
@@ -166,14 +258,50 @@ async fn indexed_pool_candidates(state: &Context, chain: Chain, token: &str) -> 
         .collect()
 }
 
+#[cfg(test)]
 async fn check_uncached(state: &Context, address: &str, registry: &Registry) -> CheckResult {
+    check_uncached_on_chain(state, address, registry, None, &mut None).await
+}
+
+async fn check_uncached_on_chain(
+    state: &Context,
+    address: &str,
+    registry: &Registry,
+    known_chain: Option<Chain>,
+    resolved_chain: &mut Option<Chain>,
+) -> CheckResult {
     let mut evidence = Vec::new();
-    let (chain, v4_pool) = match resolve_chain(state, address, &mut evidence).await {
+    let resolution = if let Some(chain) = known_chain {
+        if Chain::is_v4_pool_id(address) {
+            match state.readers.iter().find(|reader| reader.chain() == chain) {
+                Some(reader) => reader
+                    .read_v4_pool(address)
+                    .await
+                    .map(|(pool, facts)| {
+                        evidence.extend(facts);
+                        (chain, Some(pool))
+                    })
+                    .map_err(CheckFailure::from_pool_error),
+                None => Err(CheckFailure::unsupported("no reader configured")),
+            }
+        } else {
+            Ok((chain, None))
+        }
+    } else {
+        resolve_chain(state, address, &mut evidence).await
+    };
+    let (chain, v4_pool) = match resolution {
         Ok(resolved) => resolved,
         Err(failure) => {
-            return unknown_with_issue(address, Chain::RobinhoodChain, failure, evidence);
+            return unknown_with_issue(
+                address,
+                known_chain.unwrap_or(Chain::RobinhoodChain),
+                failure,
+                evidence,
+            );
         }
     };
+    *resolved_chain = Some(chain);
     let chain_entries =
         registry.iter().filter(|entry| entry.chain == chain).cloned().collect::<Vec<_>>();
     evidence.push(format!("Registry has {} entries for {chain}.", chain_entries.len()));
@@ -188,17 +316,20 @@ async fn check_uncached(state: &Context, address: &str, registry: &Registry) -> 
         evidence.push(format!("chain position read failed: {}.", failure.reason));
         return unknown_with_issue(address, chain, failure, evidence);
     }
-    let (pool, input_meta) = match resolve_pool(
-        state,
-        reader.as_ref(),
-        chain,
-        &chain_entries,
-        address,
-        v4_pool,
-        &mut evidence,
-    )
-    .await
-    {
+    let resolved_pool = if known_chain.is_some() {
+        match v4_pool {
+            Some(pool) => Ok((pool, None)),
+            None => reader
+                .read_pool(address)
+                .await
+                .map(|pool| (pool, None))
+                .map_err(CheckFailure::from_pool_error),
+        }
+    } else {
+        resolve_pool(state, reader.as_ref(), chain, &chain_entries, address, v4_pool, &mut evidence)
+            .await
+    };
+    let (pool, input_meta) = match resolved_pool {
         Ok(resolved) => resolved,
         Err(failure) => return unknown_with_issue(address, chain, failure, evidence),
     };
@@ -298,6 +429,32 @@ async fn resolve_chain(
                     break;
                 }
                 Err(error) => {
+                    if matches!(
+                        error,
+                        PoolError::Reader(_)
+                            | PoolError::RpcLimit(_)
+                            | PoolError::DailyBudgetExceeded
+                    ) && let Some(asset) = crate::domain::asset_history::AssetKey::new(
+                        reader.chain(),
+                        crate::domain::asset_history::SubjectKind::Pool,
+                        address,
+                    ) && state
+                        .history
+                        .state(&asset, crate::domain::asset_history::Facet::ContractMatch)
+                        .is_some()
+                    {
+                        crate::app::asset_history::miss(
+                            state,
+                            asset,
+                            crate::domain::asset_history::Facet::ContractMatch,
+                            if error.is_daily_budget_exceeded() {
+                                "budget_rejection"
+                            } else {
+                                "chain_probe_failed"
+                            },
+                        )
+                        .await;
+                    }
                     let important_issue = match &error {
                         PoolError::RpcLimit(_) => {
                             Some((3, CheckFailure::from_pool_error_ref(&error)))
@@ -343,12 +500,14 @@ async fn resolve_chain(
             Ok((chain, None))
         }
         None if Chain::is_evm_address(address) => {
-            let readers = state
-                .readers
-                .iter()
-                .map(|reader| reader.as_ref() as &dyn ChainReader)
-                .collect::<Vec<_>>();
-            match detect_evm_chain(address, &readers).await {
+            match detect_evm_chain(
+                state,
+                address,
+                crate::domain::asset_history::SubjectKind::Pool,
+                crate::domain::asset_history::Facet::ContractMatch,
+            )
+            .await
+            {
                 Ok(chain) => {
                     evidence.push(format!("Detected {chain} from contract bytecode."));
                     Ok((chain, None))
@@ -553,6 +712,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_consumers_and_cache_hits_journal_one_executed_check() {
+        struct Reader;
+        #[async_trait::async_trait]
+        impl ChainReader for Reader {
+            fn chain(&self) -> Chain {
+                Chain::RobinhoodChain
+            }
+            async fn read_pool(&self, _: &str) -> Result<PoolInfo, PoolError> {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                Ok(pool(
+                    "0x0000000000000000000000000000000000000011",
+                    "NVDA",
+                    "0x0000000000000000000000000000000000000012",
+                ))
+            }
+            async fn token_meta(&self, address: &str) -> Result<TokenMeta, PoolError> {
+                Ok(TokenMeta {
+                    address: address.into(),
+                    symbol: Some(if address.ends_with("11") { "NVDA" } else { "USDG" }.into()),
+                    name: Some("test".into()),
+                    decimals: Some(6),
+                    total_supply: Some("1000".into()),
+                })
+            }
+            async fn code_at(&self, _: &str) -> Result<Vec<u8>, PoolError> {
+                Ok(vec![1])
+            }
+        }
+        let state = test_state_with(
+            vec![Box::new(Reader)],
+            vec![entry("NVDA", "0x0000000000000000000000000000000000000011")],
+        );
+        let address = "0x00000000000000000000000000000000000000ff";
+        let (leaderboard, featured) = tokio::join!(
+            check_on_chain(&state, Chain::RobinhoodChain, address),
+            check_on_chain(&state, Chain::RobinhoodChain, address)
+        );
+        assert_eq!(leaderboard.verdict, featured.verdict);
+        assert!(matches!(leaderboard.verdict, Verdict::Verified { .. }));
+        let cached = check_on_chain(&state, Chain::RobinhoodChain, address).await;
+        assert_eq!(cached.checked_at, leaderboard.checked_at);
+        let key = crate::domain::asset_history::AssetKey::new(
+            Chain::RobinhoodChain,
+            crate::domain::asset_history::SubjectKind::Pool,
+            address,
+        )
+        .unwrap();
+        let history = state
+            .history
+            .history(&[key], chrono::DateTime::<Utc>::MIN_UTC, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| event.facet == crate::domain::asset_history::Facet::ContractMatch)
+                .count(),
+            1
+        );
+    }
+    #[tokio::test]
     async fn mixed_case_burst_coalesces_chain_detection() {
         struct SlowReader(std::sync::Arc<std::sync::atomic::AtomicUsize>);
         #[async_trait::async_trait]
@@ -588,10 +808,10 @@ mod tests {
         assert!(state.check_inflight.lock().await.is_empty());
     }
     #[tokio::test]
-    async fn canceled_leader_releases_followers_and_flight_slot() {
+    async fn canceled_caller_keeps_owned_execution_and_followers_share_its_capture() {
         struct CancellableReader {
             started: std::sync::Arc<tokio::sync::Notify>,
-            second_started: std::sync::Arc<tokio::sync::Notify>,
+            release: std::sync::Arc<tokio::sync::Notify>,
             calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         }
         #[async_trait::async_trait]
@@ -601,13 +821,9 @@ mod tests {
             }
 
             async fn code_at(&self, _address: &str) -> Result<Vec<u8>, PoolError> {
-                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if call > 0 {
-                    self.second_started.notify_one();
-                } else {
-                    self.started.notify_one();
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.started.notify_one();
+                self.release.notified().await;
                 Ok(vec![1])
             }
 
@@ -617,14 +833,14 @@ mod tests {
         }
 
         let started = std::sync::Arc::new(tokio::sync::Notify::new());
-        let second_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut base_entry = entry("USDG", "0x0000000000000000000000000000000000000012");
         base_entry.chain = Chain::Base;
         let state = test_state_with(
             vec![Box::new(CancellableReader {
                 started: std::sync::Arc::clone(&started),
-                second_started: std::sync::Arc::clone(&second_started),
+                release: std::sync::Arc::clone(&release),
                 calls: std::sync::Arc::clone(&calls),
             })],
             vec![base_entry],
@@ -638,14 +854,24 @@ mod tests {
         tokio::task::yield_now().await;
         leader.abort();
         let _ = leader.await;
-        tokio::time::timeout(std::time::Duration::from_secs(1), second_started.notified())
-            .await
-            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        release.notify_one();
 
         let follower_result =
             tokio::time::timeout(std::time::Duration::from_secs(1), follower).await.unwrap();
         assert!(follower_result.is_ok());
         assert!(state.check_inflight.lock().await.is_empty());
+        let asset = crate::domain::asset_history::AssetKey::new(
+            Chain::Base,
+            crate::domain::asset_history::SubjectKind::Pool,
+            address,
+        )
+        .unwrap();
+        assert_eq!(
+            state.history.inventory(&asset).await.unwrap().1,
+            1,
+            "owned execution captures once after caller cancellation"
+        );
 
         let later =
             tokio::time::timeout(std::time::Duration::from_secs(1), check(&state, address)).await;

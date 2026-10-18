@@ -19,7 +19,7 @@
   <div class="hero-copy-stack">
     <p class="problem-copy">A ticker is not a contract. Compare the pool with the issuer's published stock-token contract.</p>
     <h1 id="home-title">QED checks whether a pool uses the <span class="nowrap">stock-token</span> contract published by its issuer.</h1>
-    <p class="problem-copy"><a href="/tokens/NVDA">QED also shows what the issuer can do to each token.</a></p>
+    <p class="problem-copy"><a href="/tokens/NVDA" rel="nofollow">QED also shows what the issuer can do to each token.</a></p>
   </div>
 </section>
 <section class="integration-band" aria-labelledby="integration-title">
@@ -98,8 +98,8 @@
               </a>
             </td>
             <td class="chain-cell" data-label="Chain"><span class="chain-label"><svg aria-hidden="true"><use href="/static/icons.svg#{{ row.chain_icon }}"></use></svg><span>{{ row.chain_label }}</span></span></td>
-            <td class="venue-cell" data-label="Venue">{{ row.dex }}</td>
-            <td data-label="Verdict" title="{{ row.checked_at_title }}"><span class="seal-label is-{{ row.verdict }}"><svg class="seal-icon" aria-hidden="true"><use href="/static/icons.svg#{{ row.seal_icon }}"></use></svg><span>{{ row.verdict_label }}</span>{% if row.checked_at_stale %}<span aria-label="Check is stale"> · stale</span>{% endif %}</span></td>
+            <td class="venue-cell" data-label="Venue" title="{{ row.dex }}"><span class="venue-label">{{ row.dex }}</span></td>
+            <td data-label="Verdict" title="{{ row.checked_at_title }}"><span class="seal-label is-{{ row.verdict }}"><svg class="seal-icon" aria-hidden="true"><use href="/static/icons.svg#{{ row.seal_icon }}"></use></svg><span>{{ row.verdict_label }}</span></span>{% if row.display_note.len() > 0 %}<small class="history-retry">{{ row.display_note }}</small>{% endif %}</td>
             <td class="number-cell" data-label="Price">{{ row.price }}</td>
             <td class="number-cell change-cell {{ row.change_class }}" data-label="24h change">{{ row.change }}</td>
             <td class="number-cell" data-label="24h volume">{{ row.volume }}</td>

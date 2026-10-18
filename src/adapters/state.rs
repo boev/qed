@@ -10,7 +10,9 @@ use crate::{
     },
     app::context::Context,
     domain::{chain::Chain, check::CheckResult, registry::Registry},
-    ports::Cache as CachePort,
+    ports::{
+        Cache as CachePort, RPC_BUDGET_REJECTED, RPC_CRAWLER_BLOCKED, current_rpc_request_context,
+    },
 };
 
 #[cfg(test)]
@@ -23,9 +25,9 @@ use chrono::{SecondsFormat, Utc};
 use ed25519_dalek::SigningKey;
 use moka::future::Cache;
 use serde::Serialize;
-use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -35,6 +37,221 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock};
+
+const DEFAULT_RPC_DAILY_CU_LIMIT: u64 = 1_500_000;
+const DEFAULT_RPC_DAILY_CU_LIMIT_ON_DEMAND: u64 = 500_000;
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct RpcMethodUsage {
+    pub(crate) chain: String,
+    pub(crate) method: String,
+    pub(crate) calls: u64,
+    pub(crate) est_cu: u64,
+    pub(crate) on_demand_calls: u64,
+    pub(crate) on_demand_est_cu: u64,
+    pub(crate) background_calls: u64,
+    pub(crate) background_est_cu: u64,
+    pub(crate) budget_rejections: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RpcUsageSnapshot {
+    pub(crate) day: String,
+    pub(crate) total_limit_cu: u64,
+    pub(crate) on_demand_limit_cu: u64,
+    pub(crate) est_cu_total: u64,
+    pub(crate) on_demand: u64,
+    pub(crate) background: u64,
+    pub(crate) rejected: u64,
+    pub(crate) by_chain_method: Vec<RpcMethodUsage>,
+}
+
+#[derive(Default)]
+struct RpcMethodCounter {
+    calls: u64,
+    est_cu: u64,
+    on_demand_calls: u64,
+    on_demand_est_cu: u64,
+    background_calls: u64,
+    background_est_cu: u64,
+    budget_rejections: u64,
+}
+
+struct RpcBudgetState {
+    day: String,
+    est_cu_total: u64,
+    on_demand: u64,
+    background: u64,
+    rejected: u64,
+    warned_for_day: bool,
+    by_chain_method: BTreeMap<(String, String), RpcMethodCounter>,
+}
+
+pub struct RpcBudget {
+    total_limit_cu: u64,
+    on_demand_limit_cu: u64,
+    state: Mutex<RpcBudgetState>,
+}
+
+impl RpcBudget {
+    pub fn new(total_limit_cu: u64, on_demand_limit_cu: u64) -> Self {
+        Self {
+            total_limit_cu,
+            on_demand_limit_cu,
+            state: Mutex::new(RpcBudgetState {
+                day: Utc::now().date_naive().to_string(),
+                est_cu_total: 0,
+                on_demand: 0,
+                background: 0,
+                rejected: 0,
+                warned_for_day: false,
+                by_chain_method: BTreeMap::new(),
+            }),
+        }
+    }
+
+    pub fn debit_methods<'a, I>(&self, chain: Chain, methods: I) -> bool
+    where
+        I: Iterator<Item = &'a str> + Clone,
+    {
+        let context = current_rpc_request_context();
+        if let Some(context) = &context
+            && context.crawler
+        {
+            context.mark(RPC_CRAWLER_BLOCKED);
+            return false;
+        }
+        let on_demand = context.as_ref().is_some_and(|context| context.on_demand);
+        let estimated_cu = methods.clone().map(alchemy_cu_weight).sum::<u64>();
+        if estimated_cu == 0 {
+            return true;
+        }
+        let method_count = methods.clone().count() as u64;
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let day = Utc::now().date_naive().to_string();
+        if state.day != day {
+            *state = RpcBudgetState {
+                day,
+                est_cu_total: 0,
+                on_demand: 0,
+                background: 0,
+                rejected: 0,
+                warned_for_day: false,
+                by_chain_method: BTreeMap::new(),
+            };
+        }
+
+        let total_exceeded = state.est_cu_total.saturating_add(estimated_cu) > self.total_limit_cu;
+        let on_demand_exceeded =
+            on_demand && state.on_demand.saturating_add(estimated_cu) > self.on_demand_limit_cu;
+        if total_exceeded || on_demand_exceeded {
+            state.rejected = state.rejected.saturating_add(method_count);
+            for method in methods {
+                state
+                    .by_chain_method
+                    .entry((chain.to_string(), method.to_owned()))
+                    .or_default()
+                    .budget_rejections += 1;
+            }
+            if !on_demand && !state.warned_for_day {
+                state.warned_for_day = true;
+                tracing::warn!(
+                    day = %state.day,
+                    total_limit_cu = self.total_limit_cu,
+                    on_demand_limit_cu = self.on_demand_limit_cu,
+                    "daily RPC read budget exhausted; background reads are stopped for the day"
+                );
+            }
+            if let Some(context) = context {
+                context.mark(RPC_BUDGET_REJECTED);
+            }
+            return false;
+        }
+
+        state.est_cu_total = state.est_cu_total.saturating_add(estimated_cu);
+        if on_demand {
+            state.on_demand = state.on_demand.saturating_add(estimated_cu);
+        } else {
+            state.background = state.background.saturating_add(estimated_cu);
+        }
+        for method in methods {
+            let cost = alchemy_cu_weight(method);
+            let counter =
+                state.by_chain_method.entry((chain.to_string(), method.to_owned())).or_default();
+            counter.calls += 1;
+            counter.est_cu = counter.est_cu.saturating_add(cost);
+            if on_demand {
+                counter.on_demand_calls += 1;
+                counter.on_demand_est_cu = counter.on_demand_est_cu.saturating_add(cost);
+            } else {
+                counter.background_calls += 1;
+                counter.background_est_cu = counter.background_est_cu.saturating_add(cost);
+            }
+        }
+        true
+    }
+
+    pub(crate) fn snapshot(&self) -> RpcUsageSnapshot {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let day = Utc::now().date_naive().to_string();
+        if state.day != day {
+            *state = RpcBudgetState {
+                day,
+                est_cu_total: 0,
+                on_demand: 0,
+                background: 0,
+                rejected: 0,
+                warned_for_day: false,
+                by_chain_method: BTreeMap::new(),
+            };
+        }
+        RpcUsageSnapshot {
+            day: state.day.clone(),
+            total_limit_cu: self.total_limit_cu,
+            on_demand_limit_cu: self.on_demand_limit_cu,
+            est_cu_total: state.est_cu_total,
+            on_demand: state.on_demand,
+            background: state.background,
+            rejected: state.rejected,
+            by_chain_method: state
+                .by_chain_method
+                .iter()
+                .map(|((chain, method), counts)| RpcMethodUsage {
+                    chain: chain.clone(),
+                    method: method.clone(),
+                    calls: counts.calls,
+                    est_cu: counts.est_cu,
+                    on_demand_calls: counts.on_demand_calls,
+                    on_demand_est_cu: counts.on_demand_est_cu,
+                    background_calls: counts.background_calls,
+                    background_est_cu: counts.background_est_cu,
+                    budget_rejections: counts.budget_rejections,
+                })
+                .collect(),
+        }
+    }
+}
+
+pub(crate) fn alchemy_cu_weight(method: &str) -> u64 {
+    match method {
+        "eth_call" => 26,
+        "eth_getLogs" => 60,
+        "eth_getCode" | "eth_getStorageAt" => 20,
+        "eth_blockNumber" | "eth_chainId" => 10,
+        "getAccountInfo" => 10,
+        "getMultipleAccounts"
+        | "getProgramAccounts"
+        | "getTokenSupply"
+        | "getTokenLargestAccounts" => 20,
+        "getTokenAccountsByOwner" => 10,
+        "getSignaturesForAddress" => 40,
+        _ => 26,
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("QED_DAILY_RPC_BUDGET_REACHED")]
+pub(crate) struct RpcDailyBudgetExceeded;
 
 pub struct AdminAuth {
     configured: bool,
@@ -219,16 +436,40 @@ impl UsageStats {
     }
 }
 
-#[derive(Debug)]
 pub struct RpcRateLimiter {
     rate: f64,
     state: Mutex<(Instant, f64)>,
+    chain: Chain,
+    budget: Arc<RpcBudget>,
 }
 
 impl RpcRateLimiter {
+    #[cfg(test)]
     pub fn new(requests_per_second: u32) -> Self {
+        Self::new_with_budget(
+            requests_per_second,
+            Chain::Base,
+            Arc::new(RpcBudget::new(
+                DEFAULT_RPC_DAILY_CU_LIMIT,
+                DEFAULT_RPC_DAILY_CU_LIMIT_ON_DEMAND,
+            )),
+        )
+    }
+
+    fn new_with_budget(requests_per_second: u32, chain: Chain, budget: Arc<RpcBudget>) -> Self {
         let rate = f64::from(requests_per_second.max(1));
-        Self { rate, state: Mutex::new((Instant::now(), 1.0)) }
+        Self { rate, state: Mutex::new((Instant::now(), 1.0)), chain, budget }
+    }
+
+    pub fn debit(&self, method: &str) -> bool {
+        self.debit_methods(std::iter::once(method))
+    }
+
+    pub fn debit_methods<'a, I>(&self, methods: I) -> bool
+    where
+        I: Iterator<Item = &'a str> + Clone,
+    {
+        self.budget.debit_methods(self.chain, methods)
     }
 
     pub async fn acquire(&self) {
@@ -265,13 +506,29 @@ pub struct RpcBuckets {
 }
 
 impl RpcBuckets {
-    pub fn new(solana_rps: u32, evm_rps: u32) -> Self {
+    pub fn new(solana_rps: u32, evm_rps: u32, budget: Arc<RpcBudget>) -> Self {
         Self {
-            solana: Arc::new(RpcRateLimiter::new(solana_rps)),
-            robinhood: Arc::new(RpcRateLimiter::new(evm_rps)),
-            base: Arc::new(RpcRateLimiter::new(evm_rps)),
-            ethereum: Arc::new(RpcRateLimiter::new(evm_rps)),
-            bnb: Arc::new(RpcRateLimiter::new(evm_rps)),
+            solana: Arc::new(RpcRateLimiter::new_with_budget(
+                solana_rps,
+                Chain::Solana,
+                Arc::clone(&budget),
+            )),
+            robinhood: Arc::new(RpcRateLimiter::new_with_budget(
+                evm_rps,
+                Chain::RobinhoodChain,
+                Arc::clone(&budget),
+            )),
+            base: Arc::new(RpcRateLimiter::new_with_budget(
+                evm_rps,
+                Chain::Base,
+                Arc::clone(&budget),
+            )),
+            ethereum: Arc::new(RpcRateLimiter::new_with_budget(
+                evm_rps,
+                Chain::Ethereum,
+                Arc::clone(&budget),
+            )),
+            bnb: Arc::new(RpcRateLimiter::new_with_budget(evm_rps, Chain::Bnb, budget)),
         }
     }
 }
@@ -353,6 +610,12 @@ impl AppState {
             .max_capacity(10_000)
             .time_to_live(crate::app::guard::PUBLISHER_METADATA_CACHE_TTL)
             .build();
+        let guard_cache = Cache::builder()
+            .max_capacity(256)
+            .time_to_live(crate::app::guard::GUARD_CACHE_TTL)
+            .build();
+        let guard_locks = Cache::builder().max_capacity(10_000).build();
+        let no_code_cache = Cache::builder().max_capacity(4_096).build();
         let powers_retry_cache = Cache::builder().max_capacity(10_000).build();
         let powers_failure_cache = Cache::builder().max_capacity(10_000).build();
         let powers_locks = Cache::builder().max_capacity(10_000).build();
@@ -377,14 +640,18 @@ impl AppState {
         let issuer_registry: Arc<dyn IssuerRegistry> = Arc::new(Arc::clone(&registry));
         let app = Arc::new(Context {
             registry: issuer_registry,
+            history: crate::adapters::history::HistoryStore::memory(),
             readers,
             check_cache: Arc::new(check_cache.clone()),
+            guard_cache: Arc::new(guard_cache.clone()),
             statement_cache: Arc::new(statement_cache.clone()),
             powers_cache: Arc::new(powers_cache.clone()),
             publisher_metadata_cache: Arc::new(publisher_metadata_cache.clone()),
             powers_retry_cache: Arc::new(powers_retry_cache.clone()),
             powers_failure_cache: Arc::new(powers_failure_cache.clone()),
             powers_locks: Arc::new(powers_locks.clone()),
+            guard_locks: Arc::new(guard_locks.clone()),
+            no_code_cache: Arc::new(no_code_cache.clone()),
             powers_prefetching,
             check_inflight,
             pool_index: Arc::new(DiscoveryPoolIndex::new(
@@ -442,27 +709,63 @@ const MAX_REQUEST_ENTRIES: usize = 10_000;
 
 pub struct RateLimiter {
     requests: Arc<Mutex<HashMap<IpAddr, (Instant, u32)>>>,
+    on_demand_requests: Mutex<(Instant, u32)>,
+    on_demand_request_limit: u32,
     rpc_buckets: Arc<RpcBuckets>,
+    rpc_budget: Arc<RpcBudget>,
     pruner_started: AtomicBool,
 }
 
 impl Default for RateLimiter {
     fn default() -> Self {
-        Self::with_rpc_rps(4, 8)
+        Self::with_rpc_limits(
+            4,
+            8,
+            DEFAULT_RPC_DAILY_CU_LIMIT,
+            DEFAULT_RPC_DAILY_CU_LIMIT_ON_DEMAND,
+            300,
+        )
     }
 }
 
 impl RateLimiter {
-    pub fn with_rpc_rps(solana_rps: u32, evm_rps: u32) -> Self {
+    pub fn with_rpc_limits(
+        solana_rps: u32,
+        evm_rps: u32,
+        daily_cu_limit: u64,
+        daily_cu_limit_on_demand: u64,
+        on_demand_request_limit: u32,
+    ) -> Self {
+        let rpc_budget = Arc::new(RpcBudget::new(daily_cu_limit, daily_cu_limit_on_demand));
         Self {
             requests: Arc::new(Mutex::new(HashMap::new())),
-            rpc_buckets: Arc::new(RpcBuckets::new(solana_rps, evm_rps)),
+            on_demand_requests: Mutex::new((Instant::now(), 0)),
+            on_demand_request_limit,
+            rpc_buckets: Arc::new(RpcBuckets::new(solana_rps, evm_rps, Arc::clone(&rpc_budget))),
+            rpc_budget,
             pruner_started: AtomicBool::new(false),
         }
     }
 
     pub fn rpc_buckets(&self) -> Arc<RpcBuckets> {
         Arc::clone(&self.rpc_buckets)
+    }
+
+    pub fn rpc_budget(&self) -> Arc<RpcBudget> {
+        Arc::clone(&self.rpc_budget)
+    }
+    pub fn allow_on_demand_request(&self) -> bool {
+        let now = Instant::now();
+        let mut window =
+            self.on_demand_requests.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if now.duration_since(window.0) >= REQUEST_WINDOW {
+            *window = (now, 0);
+        }
+        if window.1 >= self.on_demand_request_limit {
+            return false;
+        }
+        window.1 += 1;
+        true
     }
 
     fn start_pruner(&self) {
@@ -555,6 +858,70 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rpc_budget_caps_on_demand_reads_and_tracks_method_usage() {
+        let budget = RpcBudget::new(100, 50);
+        let (_, outcome) = crate::ports::with_rpc_request_context(
+            crate::ports::RpcRequestContext::new(true, false),
+            async {
+                assert!(budget.debit_methods(Chain::Base, ["eth_call"].into_iter()));
+                assert!(!budget.debit_methods(Chain::Base, ["eth_getLogs"].into_iter()));
+            },
+        )
+        .await;
+
+        assert!(outcome.budget_rejected());
+        let usage = budget.snapshot();
+        assert_eq!(usage.est_cu_total, 26);
+        assert_eq!(usage.on_demand, 26);
+        assert_eq!(usage.rejected, 1);
+        assert_eq!(usage.by_chain_method[0].method, "eth_call");
+        assert_eq!(usage.by_chain_method[1].method, "eth_getLogs");
+        assert_eq!(usage.by_chain_method[1].budget_rejections, 1);
+    }
+
+    #[tokio::test]
+    async fn on_demand_request_limit_is_admission_only_not_provider_cap() {
+        let limiter = RateLimiter::with_rpc_limits(4, 8, 10_000, 10_000, 1);
+        assert!(limiter.allow_on_demand_request());
+        assert!(!limiter.allow_on_demand_request());
+
+        let base = limiter.rpc_buckets().base.clone();
+        let (_, outcome) = crate::ports::with_rpc_request_context(
+            crate::ports::RpcRequestContext::new(true, false),
+            async {
+                assert!(base.debit("eth_call"));
+                assert!(base.debit("eth_call"));
+            },
+        )
+        .await;
+
+        assert!(!outcome.budget_rejected());
+        assert_eq!(limiter.rpc_budget().snapshot().est_cu_total, 52);
+    }
+
+    #[tokio::test]
+    async fn crawler_rpc_attempts_are_blocked_before_provider_budgeting() {
+        let limiter = RateLimiter::with_rpc_limits(4, 8, 10_000, 10_000, 1);
+        let base = limiter.rpc_buckets().base.clone();
+        let (_, outcome) = crate::ports::with_rpc_request_context(
+            crate::ports::RpcRequestContext::new(true, true),
+            async {
+                assert!(!base.debit("eth_call"));
+            },
+        )
+        .await;
+        assert!(outcome.crawler_blocked());
+        assert_eq!(limiter.rpc_budget().snapshot().est_cu_total, 0);
+
+        let (admitted, _) = crate::ports::with_rpc_request_context(
+            crate::ports::RpcRequestContext::new(true, false),
+            async { base.debit("eth_call") },
+        )
+        .await;
+        assert!(admitted);
+    }
     #[test]
     fn usage_stats_count_check_mcp_calls_as_checks() {
         let stats = UsageStats::new();

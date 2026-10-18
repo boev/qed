@@ -33,6 +33,7 @@ Contact: contact@web3-energy.com
 - [OpenAPI 3.1]({base}/openapi.json): API schemas and routes.
 - [Use QED with an LLM]({base}/docs/llm): MCP connection details and tool descriptions.
 - [Leaderboard statistics]({base}/stats): leaderboard read counts, issuer-registry coverage, publisher-catalog observations, scan method/time, counts last seen within the last 7 days, and entries first seen this UTC week. Signed snapshots are available as JSON at `{base}/stats.json` and CSV at `{base}/stats.csv`.
+- [Copied stock tokens]({base}/copies): confirmed publisher-watch copies by reported volume and chain.
 - GET `{base}/api/stats?page=N`: paginated machine-readable leaderboard and registry totals, plus the signed snapshot's reducer inputs. Summary counts distinguish unsupported venues from checks that have not run; pages contain up to 50 rows per input.
 - MCP endpoint: POST `{base}/mcp`; stateless Streamable HTTP with seven tools: `qed_check`, `qed_powers`, `qed_wallet`, `qed_statement`, `qed_registry_lookup`, `qed_verify`, and `qed_guard`. Use the [MCP guide]({base}/docs/llm) for setup.
 - Claude Code connection: `claude mcp add --transport http qed {base}/mcp`; Claude Desktop and Cursor HTTP settings are in the [MCP guide]({base}/docs/llm).
@@ -44,6 +45,8 @@ Contact: contact@web3-energy.com
 - [Guard API (POST)]({base}/api/guard): same signed review with an optional wallet in a JSON request body, keeping it out of the URL.
 - [Token powers API]({base}/api/powers/{{address}}): observed control signals for any supported-chain contract; optional `?chain=...` filters results.
 - [Issuer registry]({base}/registry): contracts QED compares against.
+- [Asset history]({base}/assets/{{chain}}/{{kind}}/{{address}}): cache/journal-only exact `pool` or `token` facts and an accessible SVG/table timeline; no chain reads or prefetch. Use Guard explicitly. `?days=1|7|30|90` (automatic smallest containing window). Scheduled failures/timeouts and budget-blocked due attempts advance status at most once per facet/UTC hour; three show Unverified. On-demand misses are journal-only; on-demand zero-provider rejections, registry changes and unsupported venues are not misses. Non-confirming on-demand outcomes for untracked assets create no public state. Real results apply immediately. Signed payloads/expiry are unchanged.
+- Public `/assets/{{chain}}/{{kind}}/{{address}}/history.csv` and `/history.json` exports are paginated operational metadata, **not a signed attestation**. Use `limit` (1–200), `before_time` and `before_id`; follow `Link: rel=next` (also JSON `next`). Only wallet-free public observations are included. All asset views/details/exports share the per-client read limiter. Database-unavailable reads return 503, not empty success; a capture-gap warning alone does not block healthy database reads, and JSON includes `recording_degraded_since`. `/observations/{{id}}` retrieves one full operational observation with recorded evidence/document.
 - [Validated directory]({base}/validated): current contract-match pages.
 - [Glossary]({base}/glossary): plain-language definitions.
 - [Verification guide]({base}/guide/verify-a-stock-token): contract-first manual checks.
@@ -241,7 +244,6 @@ mod openapi {
   "openapi": "3.1.0",
   "info": {
     "title": "QED verification API",
-    "version": "1.0.0",
     "description": "QED checks tokens that claim to be something against the contract their issuer publishes. Read-only pool checks, signed attestations, registry data, token-power observations, and verification metadata."
   },
   "paths": {
@@ -250,15 +252,27 @@ mod openapi {
         "summary": "Health",
         "responses": {
           "200": {
-            "description": "Service is healthy",
+            "description": "Listener is healthy; storage degradation is reported without blocking on the database",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "required": ["status"],
-                  "properties": { "status": { "const": "ok" } }
+                  "required": ["status", "storage", "history_degraded_since"],
+                  "properties": {
+                    "status": { "const": "ok" },
+                    "storage": {
+                      "type": "object",
+                      "required": ["primary", "degraded", "capture_gap"],
+                      "properties": {
+                        "primary": { "type": "string", "enum": ["postgres", "legacy"] },
+                        "degraded": { "type": "boolean" },
+                        "capture_gap": { "type": "boolean" }
+                      }
+                    },
+                    "history_degraded_since": { "type": ["string", "null"], "format": "date-time" }
+                  }
                 },
-                "example": { "status": "ok" }
+                "example": { "status": "ok", "storage": { "primary": "postgres", "degraded": false, "capture_gap": false }, "history_degraded_since": null }
               }
             }
           }
@@ -714,7 +728,7 @@ mod openapi {
           },
           "400": { "description": "Invalid address, chain, wallet, or request body" },
           "502": { "description": "Reader unavailable or upstream chain read failed" },
-          "504": { "description": "The 15-second Guard deadline expired" }
+          "504": { "description": "The 30-second Guard deadline expired" }
         }
       }
     },
@@ -765,7 +779,7 @@ mod openapi {
           },
           "400": { "description": "Invalid address, chain, or optional wallet" },
           "502": { "description": "Reader unavailable or upstream chain read failed" },
-          "504": { "description": "The 15-second Guard deadline expired" }
+          "504": { "description": "The 30-second Guard deadline expired" }
         }
       }
     },
@@ -852,7 +866,7 @@ mod openapi {
               }
             }
           },
-          "404": { "description": "Unsupported or invalid address" }
+          "400": { "description": "Unsupported or invalid address" }
         }
       }
     },
@@ -2026,7 +2040,7 @@ mod openapi {
         "properties": {
           "code": {
             "type": "string",
-            "enum": ["publisher_contract_match", "publisher_contract_mismatch", "claims_unpublished_publisher_product", "name_resembles_registry_entry", "publisher_metadata_unavailable", "no_publisher", "registry_stale", "registry_removed", "token_paused", "powers_incomplete", "powers_unavailable", "wallet_check_not_applicable", "wallet_check_unavailable", "wallet_frozen", "wallet_blocked", "wallet_sanctioned", "source_unverified", "source_unavailable", "pool_unavailable"]
+            "enum": ["publisher_contract_match", "publisher_contract_mismatch", "claims_unpublished_publisher_product", "name_resembles_registry_entry", "publisher_metadata_unavailable", "no_publisher", "registry_stale", "registry_removed", "token_paused", "powers_incomplete", "powers_unavailable", "wallet_check_not_applicable", "wallet_check_unavailable", "wallet_frozen", "wallet_blocked", "wallet_sanctioned", "source_unverified", "source_unavailable", "pool_unavailable", "no_contract_at_address"]
           },
           "detail": { "type": "string" }
         }
@@ -2322,6 +2336,37 @@ mod openapi {
     static DOCUMENT_VALUE: LazyLock<Value> = LazyLock::new(|| {
         let mut document: Value =
             serde_json::from_str(DOCUMENT).expect("the embedded OpenAPI document is valid JSON");
+        document["info"]["version"] = json!(env!("CARGO_PKG_VERSION"));
+        let asset_path = "/assets/{chain}/{kind}/{address}";
+        let mut parameters = vec![
+            json!({"name":"chain","in":"path","required":true,"schema":{"type":"string","enum":["solana","robinhood","base","ethereum","bnb"]}}),
+            json!({"name":"kind","in":"path","required":true,"schema":{"type":"string","enum":["pool","token"]}}),
+            json!({"name":"address","in":"path","required":true,"schema":{"type":"string"},"description":"Canonical exact identity. Solana base58 is case-sensitive."}),
+        ];
+        let mut history_parameters = parameters.clone();
+        history_parameters.extend([
+            json!({"name":"days","in":"query","schema":{"type":"integer","enum":[1,7,30,90]},"description":"Server-side window: 1 means 24 hours. Page default is the smallest window containing recorded data, capped at 90 days; export default 90."}),
+            json!({"name":"limit","in":"query","schema":{"type":"integer","minimum":1,"maximum":200,"default":200}}),
+            json!({"name":"before_time","in":"query","schema":{"type":"string","format":"date-time"},"description":"Exact timestamp from next-page cursor; preserve fractional seconds."}),
+            json!({"name":"before_id","in":"query","schema":{"type":"string"},"description":"Event ID paired with before_time for descending keyset pagination."}),
+        ]);
+        document["paths"][asset_path] = json!({"get":{"summary":"Exact public asset facts and observation timeline","parameters":history_parameters,"responses":{"200":{"description":"Server-rendered SVG and accessible table; operational history is not a signed attestation.","content":{"text/html":{"schema":{"type":"string"}}}},"404":{"description":"Invalid chain, kind or address."}}}});
+        for (extension, mime) in [("csv", "text/csv"), ("json", "application/json")] {
+            document["paths"][format!("{asset_path}/history.{extension}")] = json!({"get":{"summary":format!("Public {extension} observation metadata — not a signed attestation"),"description":"Wallet-free metadata only; evidence and signed_document are null. Retrieve full evidence/document through the exact observation detail route. Follow Link rel=next (also JSON next). Per-client read limits and three-second database deadlines apply. A capture-gap warning does not block healthy database reads; JSON includes recording_degraded_since. Signed documents and expiry are unchanged.","parameters":history_parameters,"responses":{"200":{"description":"At most 200 observation metadata rows.","headers":{"Link":{"description":"Next-page URL, when present.","schema":{"type":"string"}}},"content":{mime:{"schema":{"type":if extension=="csv" {"string"} else {"object"}}}}},"404":{"description":"Invalid asset identity."},"429":{"description":"Per-client read limit exceeded."},"503":{"description":"History database unavailable or request deadline exceeded."}}}});
+        }
+        parameters
+            .push(json!({"name":"id","in":"path","required":true,"schema":{"type":"string"}}));
+        document["paths"][format!("{asset_path}/observations/{{id}}")] = json!({"get":{"summary":"Retrieve one full public operational observation","parameters":parameters,"responses":{"200":{"description":"Recorded evidence/document with an explicit unsigned-history label. Database deadline: three seconds.","content":{"application/json":{"schema":{"type":"object"}}}},"404":{"description":"Observation not found for this exact asset identity."},"429":{"description":"Per-client read limit exceeded."},"503":{"description":"History database unavailable."}}}});
+        let observation = json!({
+            "event_id":"synthetic-example", "asset":{"chain":"base","kind":"pool","address":"0x0000000000000000000000000000000000000011"},
+            "facet":"contract_match","observed_at":"2026-10-17T12:00:00Z","outcome":"miss","miss_reason":"read_failure",
+            "attestation_id":null,"block":null,"slot":null,"source":"background","registry_hash":null,"ticker":null,
+            "evidence":null,"signed_document":null,"scheduled_slot":497844
+        });
+        document["paths"][format!("{asset_path}/history.json")]["get"]["responses"]["200"]["content"]
+            ["application/json"]["example"] = json!({"label":"Observation history — not a signed attestation","durable":true,"recording_degraded_since":null,"observations":[observation],"next":null});
+        document["paths"][format!("{asset_path}/observations/{{id}}")]["get"]["responses"]["200"]
+            ["content"]["application/json"]["example"] = json!({"label":"Operational observation — not a signed attestation","observation":observation});
         let tools = super::super::mcp::tool_table()
             .as_array()
             .into_iter()
@@ -2374,6 +2419,64 @@ mod openapi {
                             "error": "Bad request",
                             "detail": "The request is missing or contains invalid fields."
                         }
+                    }
+                }
+            });
+        }
+        for (path, method) in [
+            ("/api/check/{address}", "get"),
+            ("/api/guard", "post"),
+            ("/api/guard/{address}", "get"),
+            ("/api/powers/{address}", "get"),
+            ("/api/wallet", "post"),
+            ("/api/statement", "post"),
+            ("/mcp", "post"),
+        ] {
+            document["paths"][path][method]["responses"]["429"] = json!({
+                "description": "Per-client or process-wide on-demand HTTP request admission limit exceeded.",
+                "content": {
+                    "text/plain": {
+                        "schema": { "type": "string" },
+                        "example": "QED is busy — try again in a minute"
+                    }
+                }
+            });
+        }
+        for (path, method) in [
+            ("/api/check/{address}", "get"),
+            ("/api/guard", "post"),
+            ("/api/guard/{address}", "get"),
+            ("/api/powers/{address}", "get"),
+            ("/api/wallet", "post"),
+            ("/api/statement", "post"),
+        ] {
+            document["paths"][path][method]["responses"]["503"] = json!({
+                "description": "The process-local daily chain-read budget is exhausted until 00:00 UTC.",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["error"],
+                            "properties": { "error": { "type": "string" } }
+                        },
+                        "example": { "error": super::super::DAILY_RPC_BUDGET_MESSAGE }
+                    }
+                }
+            });
+        }
+        for (path, method) in [("/api/guard", "post"), ("/api/guard/{address}", "get")] {
+            document["paths"][path][method]["responses"]["403"] = json!({
+                "description": "Automated crawler has no cached Guard result.",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["error"],
+                            "properties": { "error": { "type": "string" } }
+                        },
+                        "example": { "error": "Automated crawlers get cached results only." }
                     }
                 }
             });
@@ -3012,6 +3115,33 @@ mod openapi {
                     "#/components/schemas/ApiError"
                 );
             }
+            for (path, method) in [
+                ("/api/check/{address}", "get"),
+                ("/api/guard", "post"),
+                ("/api/guard/{address}", "get"),
+                ("/api/powers/{address}", "get"),
+                ("/api/wallet", "post"),
+                ("/api/statement", "post"),
+            ] {
+                let responses = &paths[path][method]["responses"];
+                assert_eq!(responses["429"]["content"]["text/plain"]["schema"]["type"], "string");
+                assert_eq!(
+                    responses["503"]["content"]["application/json"]["example"]["error"],
+                    super::super::super::DAILY_RPC_BUDGET_MESSAGE
+                );
+            }
+            assert_eq!(
+                paths["/mcp"]["post"]["responses"]["429"]["content"]["text/plain"]["schema"]["type"],
+                "string"
+            );
+            for path in ["/api/guard", "/api/guard/{address}"] {
+                assert_eq!(
+                    paths[path][if path == "/api/guard" { "post" } else { "get" }]["responses"]["403"]
+                        ["content"]["application/json"]["example"]["error"],
+                    "Automated crawlers get cached results only."
+                );
+            }
+            assert!(paths["/api/wallet"]["post"]["responses"]["404"].is_null());
             assert_eq!(
                 stats_json_get["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
                 "#/components/schemas/StatsDocument"
@@ -3143,6 +3273,12 @@ mod openapi {
                     .as_array()
                     .unwrap()
                     .contains(&serde_json::json!("claims_unpublished_publisher_product"))
+            );
+            assert!(
+                document["components"]["schemas"]["GuardReason"]["properties"]["code"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("no_contract_at_address"))
             );
             assert_eq!(
                 document["components"]["schemas"]["GuardIdentity"]["properties"]["status"]["enum"],

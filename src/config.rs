@@ -19,6 +19,9 @@ pub struct Config {
     pub rpc_bnb: String,
     pub rpc_rps_solana: u32,
     pub rpc_rps_evm: u32,
+    pub rpc_daily_cu_limit: u64,
+    pub rpc_daily_cu_limit_on_demand: u64,
+    pub global_rpc_requests_per_minute: u32,
     pub registry_xstocks_url: String,
     pub registry_ondo_url: String,
     pub registry_ondo_api_key: Option<String>,
@@ -27,6 +30,9 @@ pub struct Config {
     pub registry_path: PathBuf,
     /// Writable runtime data directory for refreshed registry and attestations.
     pub data_dir: PathBuf,
+    /// Optional Postgres URL. Never log this credential-bearing value.
+    pub database_url: Option<String>,
+    pub db_blob_max_bytes: usize,
     pub public_url: String,
     pub attest_bucket: Option<String>,
     pub admin_username: Option<String>,
@@ -39,12 +45,17 @@ pub enum ConfigError {
     Bind(#[from] std::net::AddrParseError),
     #[error("{name} must be a positive integer, got {value:?}")]
     RpcRps { name: &'static str, value: String },
+    #[error("{name} must be a positive integer, got {value:?}")]
+    PositiveInteger { name: &'static str, value: String },
+    #[error(
+        "QED_RPC_DAILY_CU_LIMIT_ON_DEMAND ({on_demand}) must not exceed QED_RPC_DAILY_CU_LIMIT ({total})"
+    )]
+    DailyCuLimits { total: u64, on_demand: u64 },
     #[error("{name} must be configured to a non-public provider in production")]
     PublicRpc { name: &'static str },
     #[error("{name} must be an absolute HTTPS URL with a host in production")]
     InvalidRpcUrl { name: &'static str },
 }
-
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let data_dir = PathBuf::from(value("QED_DATA_DIR", "./data"));
@@ -73,6 +84,10 @@ impl Config {
             require_private_rpc("QED_RPC_ETHEREUM", &rpc_ethereum, DEFAULT_ETHEREUM_RPC)?;
             require_private_rpc("QED_RPC_BNB", &rpc_bnb, DEFAULT_BNB_RPC)?;
         }
+        let rpc_daily_cu_limit = positive_u64("QED_RPC_DAILY_CU_LIMIT", 1_500_000)?;
+        let rpc_daily_cu_limit_on_demand =
+            positive_u64("QED_RPC_DAILY_CU_LIMIT_ON_DEMAND", 500_000)?;
+        validate_daily_cu_limits(rpc_daily_cu_limit, rpc_daily_cu_limit_on_demand)?;
         Ok(Self {
             bind: value("QED_BIND", "127.0.0.1:3000").parse()?,
             rpc_solana,
@@ -82,12 +97,21 @@ impl Config {
             rpc_bnb,
             rpc_rps_solana: rps("QED_RPC_RPS_SOLANA", 4)?,
             rpc_rps_evm: rps("QED_RPC_RPS_EVM", 8)?,
+            rpc_daily_cu_limit,
+            rpc_daily_cu_limit_on_demand,
+            global_rpc_requests_per_minute: positive_u32("QED_ON_DEMAND_REQUESTS_PER_MINUTE", 300)?,
             registry_xstocks_url,
             registry_ondo_url,
             registry_ondo_api_key,
             registry_robinhood_url,
             registry_path: PathBuf::from(value("QED_REGISTRY_PATH", "registry/registry.json")),
             data_dir,
+            database_url: optional_secret("QED_DATABASE_URL"),
+            db_blob_max_bytes: usize::try_from(positive_u64("QED_DB_BLOB_MAX_BYTES", 1024 * 1024)?)
+                .map_err(|_| ConfigError::PositiveInteger {
+                    name: "QED_DB_BLOB_MAX_BYTES",
+                    value: "overflow".into(),
+                })?,
             public_url: value("QED_PUBLIC_URL", "http://localhost:3000")
                 .trim_end_matches('/')
                 .to_owned(),
@@ -112,7 +136,6 @@ fn require_private_rpc(
     }
     Ok(())
 }
-
 fn value(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_owned())
 }
@@ -120,16 +143,97 @@ fn optional_secret(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+fn positive_u64(name: &'static str, default: u64) -> Result<u64, ConfigError> {
+    parse_positive_u64(name, value(name, &default.to_string()))
+}
+
+fn parse_positive_u64(name: &'static str, value: String) -> Result<u64, ConfigError> {
+    if value.starts_with('+') {
+        return Err(ConfigError::PositiveInteger { name, value });
+    }
+    value
+        .parse()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or(ConfigError::PositiveInteger { name, value })
+}
+
+fn positive_u32(name: &'static str, default: u32) -> Result<u32, ConfigError> {
+    parse_positive_u32(name, value(name, &default.to_string()))
+}
+
+fn parse_positive_u32(name: &'static str, value: String) -> Result<u32, ConfigError> {
+    if value.starts_with('+') {
+        return Err(ConfigError::PositiveInteger { name, value });
+    }
+    value
+        .parse()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or(ConfigError::PositiveInteger { name, value })
+}
+
 fn rps(name: &'static str, default: u32) -> Result<u32, ConfigError> {
     let value = value(name, &default.to_string());
+    if value.starts_with('+') {
+        return Err(ConfigError::RpcRps { name, value });
+    }
     value.parse().ok().filter(|rps| *rps > 0).ok_or(ConfigError::RpcRps { name, value })
 }
+
+fn validate_daily_cu_limits(total: u64, on_demand: u64) -> Result<(), ConfigError> {
+    if on_demand > total {
+        return Err(ConfigError::DailyCuLimits { total, on_demand });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ConfigError, require_private_rpc};
+    use super::{
+        ConfigError, parse_positive_u32, parse_positive_u64, require_private_rpc,
+        validate_daily_cu_limits,
+    };
 
     const NAME: &str = "QED_RPC_BASE";
     const PUBLIC_DEFAULT: &str = "https://mainnet.base.org";
+
+    #[test]
+    fn rpc_budget_limits_reject_zero_malformed_and_overflow_values() {
+        assert!(matches!(
+            parse_positive_u64("QED_RPC_DAILY_CU_LIMIT", "0".to_owned()),
+            Err(ConfigError::PositiveInteger { .. })
+        ));
+        assert!(matches!(
+            parse_positive_u64("QED_RPC_DAILY_CU_LIMIT", "invalid".to_owned()),
+            Err(ConfigError::PositiveInteger { .. })
+        ));
+        assert!(matches!(
+            parse_positive_u64("QED_RPC_DAILY_CU_LIMIT", "+1500000".to_owned()),
+            Err(ConfigError::PositiveInteger { .. })
+        ));
+        assert!(matches!(
+            parse_positive_u32("QED_ON_DEMAND_REQUESTS_PER_MINUTE", "+300".to_owned()),
+            Err(ConfigError::PositiveInteger { .. })
+        ));
+        assert!(matches!(
+            parse_positive_u32("QED_ON_DEMAND_REQUESTS_PER_MINUTE", "4294967296".to_owned()),
+            Err(ConfigError::PositiveInteger { .. })
+        ));
+        assert_eq!(
+            parse_positive_u64("QED_RPC_DAILY_CU_LIMIT", "1500000".to_owned()).unwrap(),
+            1_500_000
+        );
+    }
+
+    #[test]
+    fn on_demand_rpc_ceiling_cannot_exceed_total_budget() {
+        assert!(matches!(
+            validate_daily_cu_limits(100, 101),
+            Err(ConfigError::DailyCuLimits { total: 100, on_demand: 101 })
+        ));
+        assert!(validate_daily_cu_limits(100, 100).is_ok());
+    }
 
     #[test]
     fn production_rpc_rejects_http() {

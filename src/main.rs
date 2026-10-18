@@ -9,7 +9,7 @@ use adapters::{discovery, registry};
 use adapters::{evm::EvmReader, solana::SolanaReader};
 use anyhow::{Context, Result};
 use app::{
-    context::{Context as AppContext, PowersCacheKey},
+    context::{CachedNoContract, Context as AppContext, GuardCacheKey, PowersCacheKey},
     warm,
 };
 use chrono::{Duration as ChronoDuration, Utc};
@@ -17,7 +17,7 @@ use clap::Parser;
 use config::Config;
 use domain::{chain::Chain, pool::TokenMeta, powers::PowersRecord};
 use moka::future::Cache;
-use ports::{AttestationStore, ChainReader, Clock};
+use ports::{AttestationStore, ChainReader, Clock, RpcRequestContext, with_rpc_request_context};
 use std::{
     sync::{Arc, RwLock as StdRwLock, atomic::AtomicU64},
     time::Duration,
@@ -39,6 +39,17 @@ struct Args {
     /// Refresh issuer registries once and exit instead of serving HTTP.
     #[arg(long)]
     refresh_once: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Import valid, trusted local historical attestations, including expired records.
+    HistoryBackfill {
+        #[arg(long)]
+        dir: std::path::PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -51,6 +62,9 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     let config = Config::from_env().context("reading QED configuration")?;
+    if args.command.is_some() && config.attest_bucket.is_some() {
+        anyhow::bail!("history-backfill is local-only; unset QED_ATTEST_BUCKET");
+    }
     let imprint_incomplete =
         include_str!("../release/legal/imprint.md").contains("[NOT PUBLISHED:");
     let imprint_override =
@@ -71,6 +85,31 @@ async fn main() -> Result<()> {
     }
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("creating data directory {}", config.data_dir.display()))?;
+    let durable = match config.database_url.as_deref() {
+        Some(url) => Some(
+            adapters::storage::DurableStore::open(
+                url,
+                &config.data_dir,
+                config.attest_bucket.clone(),
+                config.db_blob_max_bytes,
+            )
+            .await
+            .map_err(anyhow::Error::msg)?,
+        ),
+        None => None,
+    };
+    if let Some(store) = &durable
+        && !matches!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                store.restore_runtime_files(&config.data_dir)
+            )
+            .await,
+            Ok(Ok(()))
+        )
+    {
+        warn!("restoring database runtime snapshots failed; using local cache");
+    }
     let runtime_registry_path = config.data_dir.join("registry.json");
     let registry_source =
         if runtime_registry_path.exists() { &runtime_registry_path } else { &config.registry_path };
@@ -109,6 +148,7 @@ async fn main() -> Result<()> {
             &client,
             &runtime_registry_path,
             None,
+            durable.as_deref(),
         )
         .await;
         return Ok(());
@@ -130,6 +170,12 @@ async fn main() -> Result<()> {
     let registry_version = Arc::new(AtomicU64::new(0));
     let check_cache =
         Cache::builder().max_capacity(10_000).time_to_live(Duration::from_secs(30)).build();
+    let guard_cache: Cache<app::context::GuardCacheKey, app::context::CachedGuardDocument> =
+        Cache::builder().max_capacity(256).time_to_live(app::guard::GUARD_CACHE_TTL).build();
+    let guard_locks: Cache<GuardCacheKey, Arc<tokio::sync::Mutex<()>>> =
+        Cache::builder().max_capacity(10_000).time_to_live(Duration::from_secs(30 * 60)).build();
+    let no_code_cache: Cache<PowersCacheKey, CachedNoContract> =
+        Cache::builder().max_capacity(4_096).time_to_live(Duration::from_secs(10 * 60)).build();
     let statement_cache = Cache::builder()
         .max_capacity(10_000)
         .time_to_live(Duration::from_secs(24 * 60 * 60))
@@ -150,8 +196,13 @@ async fn main() -> Result<()> {
         config.admin_password.as_deref(),
     ));
     let usage_stats = Arc::new(adapters::state::UsageStats::new());
-    let rate_limiter =
-        Arc::new(RateLimiter::with_rpc_rps(config.rpc_rps_solana, config.rpc_rps_evm));
+    let rate_limiter = Arc::new(RateLimiter::with_rpc_limits(
+        config.rpc_rps_solana,
+        config.rpc_rps_evm,
+        config.rpc_daily_cu_limit,
+        config.rpc_daily_cu_limit_on_demand,
+        config.global_rpc_requests_per_minute,
+    ));
     let rpc_buckets = rate_limiter.rpc_buckets();
     let configured_readers: Vec<Box<dyn ChainReader>> = vec![
         Box::new(
@@ -190,7 +241,7 @@ async fn main() -> Result<()> {
     ];
 
     let attestations_dir = config.data_dir.join("attestations");
-    let attest_store: Arc<dyn AttestationStore> = match config.attest_bucket.clone() {
+    let legacy_attest_store: Arc<dyn AttestationStore> = match config.attest_bucket.clone() {
         Some(bucket) => {
             #[cfg(feature = "s3")]
             {
@@ -202,18 +253,48 @@ async fn main() -> Result<()> {
                 anyhow::bail!("QED_ATTEST_BUCKET requires the `s3` cargo feature");
             }
         }
-        None => Arc::new(adapters::attestation::FileAttestationStore::new(attestations_dir)),
+        None => {
+            Arc::new(adapters::attestation::FileAttestationStore::new(attestations_dir.clone()))
+        }
+    };
+    let mut trusted = config.trusted_signers.clone();
+    trusted.insert(bs58::encode(signing_key.verifying_key().as_bytes()).into_string());
+    let attest_store: Arc<dyn AttestationStore> = match &durable {
+        Some(store) => Arc::new(adapters::storage::PostgresAttestationStore {
+            durable: Arc::clone(store),
+            legacy: legacy_attest_store,
+            disk: adapters::attestation::FileAttestationStore::new(attestations_dir),
+            trusted: trusted.clone(),
+        }),
+        None => legacy_attest_store,
     };
     let loaded_attestations = std::collections::HashMap::new();
-    let board_store =
-        Arc::new(discovery::DurableBoardStore::new(config.attest_bucket.clone()).await);
-    let cached_leaderboard = match discovery::load_leaderboard(&config.data_dir) {
-        Some(leaderboard) => Some(leaderboard),
-        None => board_store.load_leaderboard().await,
+    let board_store = Arc::new(
+        discovery::DurableBoardStore::new(config.attest_bucket.clone(), durable.clone()).await,
+    );
+    let cached_leaderboard = if durable.is_some() {
+        tokio::time::timeout(Duration::from_secs(3), board_store.load_leaderboard())
+            .await
+            .ok()
+            .flatten()
+            .or_else(|| discovery::load_leaderboard(&config.data_dir))
+    } else {
+        match discovery::load_leaderboard(&config.data_dir) {
+            Some(board) => Some(board),
+            None => board_store.load_leaderboard().await,
+        }
     };
-    let cached_featured = match discovery::load_featured_snapshot(&config.data_dir) {
-        Some(snapshot) => Some(snapshot),
-        None => board_store.load_featured().await,
+    let cached_featured = if durable.is_some() {
+        tokio::time::timeout(Duration::from_secs(3), board_store.load_featured())
+            .await
+            .ok()
+            .flatten()
+            .or_else(|| discovery::load_featured_snapshot(&config.data_dir))
+    } else {
+        match discovery::load_featured_snapshot(&config.data_dir) {
+            Some(board) => Some(board),
+            None => board_store.load_featured().await,
+        }
     };
     let restore_now = Utc::now();
     let leaderboard_restore_delay = cached_leaderboard.as_ref().and_then(|leaderboard| {
@@ -285,16 +366,27 @@ async fn main() -> Result<()> {
     let attestations_store = Arc::clone(&attest_store);
     let issuer_registry: Arc<dyn ports::IssuerRegistry> = Arc::new(Arc::clone(&shared_registry));
     let signer = Arc::new(adapters::attestation::Ed25519Signer::new(Arc::clone(&signing_key)));
+    let history: Arc<dyn ports::AssetHistoryStore> = adapters::history::HistoryStore::open(
+        config.database_url.as_deref(),
+        &config.data_dir,
+        durable.clone(),
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
     let app_context = Arc::new(AppContext {
         registry: issuer_registry,
+        history: Arc::clone(&history),
         readers: Arc::clone(&readers),
         check_cache: Arc::new(check_cache.clone()),
+        guard_cache: Arc::new(guard_cache.clone()),
         statement_cache: Arc::new(statement_cache.clone()),
         powers_cache: Arc::new(powers_cache.clone()),
         publisher_metadata_cache: Arc::new(publisher_metadata_cache.clone()),
         powers_retry_cache: Arc::new(powers_retry_cache.clone()),
         powers_failure_cache: Arc::new(powers_failure_cache.clone()),
         powers_locks: Arc::new(powers_locks.clone()),
+        guard_locks: Arc::new(guard_locks.clone()),
+        no_code_cache: Arc::new(no_code_cache.clone()),
         powers_prefetching: Arc::clone(&powers_prefetching),
         check_inflight: Arc::clone(&check_inflight),
         pool_index: Arc::new(discovery::DiscoveryPoolIndex::new(
@@ -313,6 +405,10 @@ async fn main() -> Result<()> {
         clock: Arc::new(SystemClock),
         powers_prefetch_concurrency: Arc::clone(&powers_prefetch_concurrency),
     });
+    if let Some(Command::HistoryBackfill { dir }) = args.command {
+        adapters::history::backfill(&app_context, &dir).await.map_err(anyhow::Error::msg)?;
+        return Ok(());
+    }
     let state = AppState {
         app: app_context,
         registry: Arc::clone(&shared_registry),
@@ -338,14 +434,75 @@ async fn main() -> Result<()> {
         wallet_concurrency: Arc::new(tokio::sync::Semaphore::new(1)),
         registry_api_concurrency: Arc::new(tokio::sync::Semaphore::new(4)),
     };
+    if let Some(store) = durable {
+        let import_dir = config.data_dir.clone();
+        let import_store = Arc::clone(&store);
+        tokio::spawn(async move {
+            loop {
+                if import_store.import_legacy(&import_dir, &trusted).await.is_ok() {
+                    break;
+                }
+                warn!("legacy storage import paused; will resume in 60 seconds");
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let _ = store.flush().await;
+            }
+        });
+    }
+    let history_worker = Arc::clone(&history);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let _ = history_worker.flush().await;
+        }
+    });
+    let retry_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let _ = with_rpc_request_context(
+                RpcRequestContext::new(false, false),
+                adapters::history::retry_failed(&retry_state),
+            )
+            .await;
+        }
+    });
+    let rpc_budget = rate_limiter.rpc_budget();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+        loop {
+            interval.tick().await;
+            let usage = rpc_budget.snapshot();
+            info!(
+                "rpc usage day={} est_cu_total={} on_demand={} background={} rejected={}",
+                usage.day, usage.est_cu_total, usage.on_demand, usage.background, usage.rejected
+            );
+        }
+    });
 
     app::attestation::hydrate_attestations(&state.app)
         .await
         .context("loading recent persisted attestations")?;
-    adapters::web::refresh_stats_snapshot(&state)
-        .await
-        .map_err(anyhow::Error::msg)
-        .context("building initial statistics snapshot")?;
+    let initial_stats_state = state.clone();
+    tokio::spawn(async move {
+        if !adapters::web::restore_stats_snapshot(&initial_stats_state).await {
+            let (result, _) = with_rpc_request_context(
+                RpcRequestContext::new(false, false),
+                adapters::web::refresh_stats_snapshot(&initial_stats_state),
+            )
+            .await;
+            if result.is_err() {
+                warn!("building initial statistics snapshot failed");
+            }
+        }
+    });
 
     let warm_state = state.clone();
     let warm_notify = Arc::clone(&powers_warm_notify);
@@ -357,7 +514,11 @@ async fn main() -> Result<()> {
                 _ = interval.tick() => {}
                 _ = warm_notify.notified() => {}
             }
-            warm::warm_current_pool_powers(&warm_state.app).await;
+            let _ = with_rpc_request_context(
+                RpcRequestContext::new(false, false),
+                warm::warm_current_pool_powers(&warm_state.app),
+            )
+            .await;
         }
     });
     let listener =
@@ -366,7 +527,6 @@ async fn main() -> Result<()> {
     let prune_store = Arc::clone(&state.app.attest_store);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
-        interval.tick().await;
         loop {
             interval.tick().await;
             let cutoff = Utc::now() - ChronoDuration::days(30);
@@ -382,7 +542,11 @@ async fn main() -> Result<()> {
             tokio::time::interval(Duration::from_secs(discovery::REGISTRY_REFRESH_SECS));
         loop {
             interval.tick().await;
-            registry::refresh_registry(&refresh_state).await;
+            let _ = with_rpc_request_context(
+                RpcRequestContext::new(false, false),
+                registry::refresh_registry(&refresh_state),
+            )
+            .await;
         }
     });
 
@@ -395,18 +559,22 @@ async fn main() -> Result<()> {
         }
         let mut first_refresh = true;
         loop {
-            let retry_soon = discovery::refresh_discovery(
-                &discovery_state,
-                &discovery_dir,
-                first_refresh,
-                &discovery_warm_notify,
+            let (retry_soon, outcome) = with_rpc_request_context(
+                RpcRequestContext::new(false, false),
+                discovery::refresh_discovery(
+                    &discovery_state,
+                    &discovery_dir,
+                    first_refresh,
+                    &discovery_warm_notify,
+                ),
             )
             .await;
-            if !retry_soon {
+            let budget_rejected = outcome.budget_rejected();
+            if !retry_soon && !budget_rejected {
                 first_refresh = false;
             }
-            let wait = if retry_soon { 30 } else { discovery::DISCOVERY_REFRESH_SECS };
-            tokio::time::sleep(Duration::from_secs(wait)).await;
+            tokio::time::sleep(discovery_wait_duration(Utc::now(), retry_soon, budget_rejected))
+                .await;
         }
     });
     let price_state = state.clone();
@@ -429,4 +597,50 @@ async fn main() -> Result<()> {
     .await
     .context("serving HTTP")?;
     Ok(())
+}
+
+fn discovery_wait_duration(
+    now: chrono::DateTime<Utc>,
+    retry_soon: bool,
+    budget_rejected: bool,
+) -> Duration {
+    if budget_rejected {
+        let next_midnight = (now.date_naive() + ChronoDuration::days(1))
+            .and_hms_opt(0, 0, 0)
+            .expect("next UTC midnight is valid")
+            .and_utc();
+        return next_midnight
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or_default()
+            .min(Duration::from_secs(discovery::DISCOVERY_REFRESH_SECS));
+    }
+    if retry_soon {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(discovery::DISCOVERY_REFRESH_SECS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn utc(value: &str) -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339(value).unwrap().with_timezone(&Utc)
+    }
+    #[test]
+    fn discovery_budget_rejection_waits_until_utc_midnight_or_refresh_cap() {
+        assert_eq!(
+            discovery_wait_duration(utc("2026-10-17T23:30:00Z"), true, true),
+            Duration::from_secs(30 * 60)
+        );
+        assert_eq!(
+            discovery_wait_duration(utc("2026-10-17T10:00:00Z"), false, true),
+            Duration::from_secs(discovery::DISCOVERY_REFRESH_SECS)
+        );
+        assert_eq!(
+            discovery_wait_duration(utc("2026-10-17T10:00:00Z"), true, false),
+            Duration::from_secs(30)
+        );
+    }
 }

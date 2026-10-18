@@ -74,6 +74,9 @@ pub(crate) struct GuardResultTemplate {
     pub(crate) pools: Vec<GuardPoolView>,
     pub(crate) deployments: Vec<GuardDeploymentView>,
     pub(crate) document_json: String,
+    pub(crate) address_comparison: String,
+    pub(crate) identity_tone: &'static str,
+    pub(crate) source_tone: &'static str,
 }
 fn guard_identity_sentence(document: &crate::domain::guard::GuardDocument) -> String {
     use crate::domain::guard::{GuardSubjectType, IdentityStatus};
@@ -360,8 +363,42 @@ impl GuardResultTemplate {
                 })
                 .collect(),
             document_json: serde_json::to_string_pretty(document).unwrap_or_default(),
+            address_comparison: guard_address_comparison(document),
+            identity_tone: match document.identity.status {
+                IdentityStatus::Match => "good",
+                IdentityStatus::Mismatch | IdentityStatus::RegistryRemoved => "bad",
+                IdentityStatus::NoPublisher | IdentityStatus::RegistryStale => "neutral",
+            },
+            source_tone: match document.source.status {
+                SourceStatus::Verified => "good",
+                SourceStatus::Unverified => "bad",
+                SourceStatus::Unavailable => "neutral",
+            },
         }
     }
+}
+
+/// Issuer-published contract above the reviewed one, differing characters marked, when QED
+/// knows the published contract for this product on this chain. Empty otherwise.
+fn guard_address_comparison(document: &crate::domain::guard::GuardDocument) -> String {
+    use crate::domain::guard::IdentityStatus;
+    let Some(official) = document.identity.matched_contract.as_deref() else {
+        return String::new();
+    };
+    let reviewed = document.subject_address.as_deref().unwrap_or(&document.address);
+    let publisher = document.identity.publisher.as_deref().unwrap_or("the issuer");
+    let observed_label = match document.identity.status {
+        IdentityStatus::Match => "This token · matches".to_owned(),
+        IdentityStatus::Mismatch => "This token · not in the issuer's catalog".to_owned(),
+        _ => "This token".to_owned(),
+    };
+    super::pages::address_comparison_html(
+        reviewed,
+        official,
+        &format!("Published by {publisher}"),
+        &observed_label,
+        document.chain == Chain::Solana,
+    )
 }
 
 pub(crate) async fn verified_attestations(state: &Context) -> Vec<Attestation> {
@@ -594,6 +631,7 @@ pub(crate) struct LeaderboardRowView {
     pub(crate) quote_symbol: String,
     pub(crate) verdict: String,
     pub(crate) verdict_label: String,
+    pub(crate) display_note: String,
     pub(crate) seal_icon: String,
     pub(crate) price: String,
     pub(crate) change: String,
@@ -603,7 +641,6 @@ pub(crate) struct LeaderboardRowView {
     pub(crate) detail_url: String,
     pub(crate) trade_url: String,
     pub(crate) checked_at_title: String,
-    pub(crate) checked_at_stale: bool,
 }
 
 fn html_safe_json(value: &str) -> String {
@@ -662,7 +699,11 @@ impl LeaderboardPageView {
 
 impl LeaderboardRowView {
     fn from_value(value: &Value) -> Self {
-        let verdict = text(value, "verdict");
+        let verdict = value
+            .get("display_verdict")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| text(value, "verdict"));
         let read_status = text(value, "read_status");
         let chain = text(value, "chain");
         let pool = text(value, "pool");
@@ -685,7 +726,7 @@ impl LeaderboardRowView {
             })
             .unwrap_or_default();
         let detail_url = discovery::chain_from_dex_id(&chain)
-            .map(|chain| format!("/validated/{}/{}", discovery::chain_slug(chain), pool))
+            .map(|chain| format!("/assets/{}/pool/{}", discovery::chain_slug(chain), pool))
             .unwrap_or_default();
         let change_value = number(value, "change_24h_pct");
         let change_class = if change_value.is_some_and(|number| number > 0.0) {
@@ -702,14 +743,22 @@ impl LeaderboardRowView {
             &quote_symbol,
             value.get("issuer_on_base").and_then(Value::as_bool),
         );
-        let checked_at = chrono::DateTime::parse_from_rfc3339(&text(value, "checked_at")).ok();
-        let checked_at_title = checked_at
-            .as_ref()
-            .map(|parsed| format!("Checked {}", format_utc_timestamp(parsed)))
-            .unwrap_or_else(|| "Not checked".to_owned());
-        let checked_at_stale = checked_at.as_ref().is_some_and(|parsed| {
-            chrono::Utc::now() - parsed.with_timezone(&chrono::Utc) > chrono::Duration::hours(24)
-        });
+        let confirmation = text(value, "display_confirmed_at");
+        let latest_attempt = text(value, "checked_at");
+        let checked_at = chrono::DateTime::parse_from_rfc3339(if confirmation.is_empty() {
+            &latest_attempt
+        } else {
+            &confirmation
+        })
+        .ok();
+        let checked_at_title = if !text(value, "display_summary").is_empty() {
+            text(value, "display_summary")
+        } else {
+            checked_at
+                .as_ref()
+                .map(|parsed| format!("Last confirmed {}", format_utc_timestamp(parsed)))
+                .unwrap_or_else(|| "Not read yet".to_owned())
+        };
         Self {
             rank: text(value, "rank"),
             chain_icon,
@@ -718,7 +767,10 @@ impl LeaderboardRowView {
             base_symbol: base_symbol.to_owned(),
             quote_symbol: quote_symbol.to_owned(),
             verdict: verdict.clone(),
-            verdict_label: if read_status == "not_read_yet" && verdict == "unknown" {
+            display_note: text(value, "display_note"),
+            verdict_label: if !text(value, "display_label").is_empty() {
+                text(value, "display_label")
+            } else if read_status == "not_read_yet" && verdict == "unknown" {
                 "Not read yet".to_owned()
             } else {
                 match verdict.as_str() {
@@ -741,7 +793,6 @@ impl LeaderboardRowView {
             detail_url,
             trade_url,
             checked_at_title,
-            checked_at_stale,
         }
     }
 }
@@ -898,11 +949,11 @@ pub(crate) struct RegistryTemplate {
 pub(crate) struct TokenTemplate {
     pub(crate) asset_version: u64,
     pub(crate) public_url: String,
-    pub(crate) ticker: String,
     pub(crate) title: String,
     pub(crate) contracts: Vec<DirectoryContractView>,
-    pub(crate) pools: Vec<DirectoryPoolView>,
-    pub(crate) json_ld: String,
+    pub(crate) name: String,
+    pub(crate) issuers: String,
+    pub(crate) history: super::asset::HistoryView,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1058,12 +1109,16 @@ pub(crate) struct DirectoryPowersView {
     pub(crate) source_verified_proxy: String,
     pub(crate) source_badge: String,
     pub(crate) observed_at: String,
+    pub(crate) last_confirmed_at: String,
+    pub(crate) last_confirmed_signals: String,
 }
 
 impl DirectoryPowersView {
     pub(crate) fn unavailable() -> Self {
         Self {
             available: false,
+            last_confirmed_at: String::new(),
+            last_confirmed_signals: String::new(),
             can_seize: Vec::new(),
             can_block: Vec::new(),
             can_change_rules: Vec::new(),
@@ -1082,7 +1137,6 @@ impl DirectoryPowersView {
 
 #[derive(Debug)]
 pub(crate) struct DirectoryPoolView {
-    pub(crate) chain: String,
     pub(crate) dex: String,
     pub(crate) pair: String,
     pub(crate) verdict: String,
@@ -1220,6 +1274,7 @@ pub(crate) struct FeaturedView {
     pub(crate) volume: String,
     pub(crate) has_liquidity: bool,
     pub(crate) has_volume: bool,
+    pub(crate) status_summary: String,
     pub(crate) updated_at: String,
 }
 
@@ -1266,9 +1321,35 @@ impl FeaturedView {
             volume: pool.volume_24h_usd.map(format_usd).unwrap_or_default(),
             has_liquidity: pool.liquidity_usd.is_some(),
             has_volume: pool.volume_24h_usd.is_some(),
+            status_summary: String::new(),
             updated_at: pool.updated_at.clone(),
         }
     }
+}
+
+pub(crate) fn projected_featured(pool: &FeaturedPool, context: &Context) -> FeaturedView {
+    let mut view = FeaturedView::from_pool(pool);
+    if let Some(key) = crate::domain::asset_history::AssetKey::new(
+        pool.chain,
+        crate::domain::asset_history::SubjectKind::Pool,
+        &pool.pool,
+    ) && let Some(state) = crate::app::asset_history::projection(
+        context,
+        &key,
+        crate::domain::asset_history::Facet::ContractMatch,
+    ) {
+        view.verdict_label = state.label();
+        view.status_summary = state.summary();
+        (view.verdict_class, view.verdict_icon) = match state.label() {
+            "Verified" => ("is-verified", "qed-seal-verified"),
+            "Mismatch" | "No match" => ("is-mismatch", "qed-seal-broken"),
+            _ => ("is-unknown", "qed-seal-unknown"),
+        };
+        if let Some(confirmed) = state.last_confirmed {
+            view.updated_at = confirmed.observed_at.to_rfc3339();
+        }
+    }
+    view
 }
 #[derive(Debug, Template)]
 #[template(path = "featured.html")]

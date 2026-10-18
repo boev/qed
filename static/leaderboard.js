@@ -232,7 +232,9 @@
         const chainIcon = (chain) => chain === 'robinhoodchain' ? 'robinhood' : chain;
         const venueLabel = (venue) => {
           const normalized = String(venue || '').toLowerCase();
-          return venueLabels[normalized] || venue || '—';
+          if (venueLabels[normalized]) return venueLabels[normalized];
+          if (/^0x[0-9a-f]{40}$/.test(normalized)) return `${venue.slice(0, 6)}…${venue.slice(-4)}`;
+          return venue || '—';
         };
 
         const verdictLabel = (verdict) => {
@@ -299,16 +301,14 @@
           }, [h('span', { class: 'metric-value' }, numberLabel(value, prefix))]);
           const rows = entries.value.map((row) => {
             const change = numberValue(row.change_24h_pct);
-            const detailUrl = row.detail_url || `/validated/${row.chain}/${row.pool}`;
+            const detailUrl = `/assets/${row.chain}/pool/${row.pool}`;
             const tradeUrl = row.trade_url || '';
             const changeLabel = `${change !== null && change > 0 ? '↑ ' : change !== null && change < 0 ? '↓ ' : ''}${percentLabel(change)}`;
-            const checkedAt = typeof row.checked_at === 'string' ? row.checked_at : '';
+            const checkedAt = row.display_confirmed_at || row.checked_at || '';
             const checkedTime = Date.parse(checkedAt);
-            const checkIsStale = Number.isFinite(checkedTime)
-              && Date.now() - checkedTime > 86_400_000;
-            const checkedTitle = Number.isFinite(checkedTime)
-              ? `Checked ${formatUtcTimestamp(checkedAt)}`
-              : 'Not checked';
+            const checkedTitle = row.display_summary || (Number.isFinite(checkedTime)
+              ? `Last confirmed ${formatUtcTimestamp(checkedAt)}`
+              : 'Not read yet');
             return h('tr', {
               key: `${row.chain}:${row.pool}`,
               class: 'leaderboard-row',
@@ -344,16 +344,19 @@
                   h('span', {}, row.chain_label || row.chain),
                 ]),
               ]),
-              h('td', { class: 'venue-cell', 'data-label': 'Venue' }, venueLabel(row.dex)),
+              h('td', { class: 'venue-cell', 'data-label': 'Venue', title: row.dex || undefined }, [
+                h('span', { class: 'venue-label' }, venueLabel(row.dex)),
+              ]),
               h('td', { 'data-label': 'Verdict', title: checkedTitle }, [
                 h('span', {
-                  class: ['seal-label', `is-${row.verdict || 'unknown'}`],
+                  class: ['seal-label', `is-${row.display_verdict || row.verdict || 'unknown'}`],
                 }, [
                   h('svg', { class: 'seal-icon', 'aria-hidden': 'true' }, [
-                    h('use', { href: `/static/icons.svg#${sealIcon(row.verdict)}` }),
+                    h('use', { href: `/static/icons.svg#${sealIcon(row.display_verdict || row.verdict)}` }),
                   ]),
-                  h('span', {}, `${verdictLabel(row.verdict)}${checkIsStale ? ' · stale' : ''}`),
+                  h('span', {}, row.display_label || (row.read_status === 'not_read_yet' ? 'Not read yet' : verdictLabel(row.verdict))),
                 ]),
+                row.display_note ? h('small', { class: 'history-retry' }, row.display_note) : null,
               ]),
               metricCell(row, 'price_usd', 'Price', row.price_usd, '$'),
               h('td', {

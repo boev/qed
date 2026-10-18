@@ -1,20 +1,24 @@
 use crate::{
     domain::{
-        attestation::Attestation, chain::Chain, check::CheckResult, powers::PowersRecord,
-        statement::Statement,
+        attestation::Attestation, chain::Chain, check::CheckResult, guard::GuardDocument,
+        powers::PowersRecord, statement::Statement,
     },
     ports::{
-        AttestationStore, Cache, ChainReader, Clock, IssuerRegistry, PoolIndex, Signer,
+        AttestationStore, Cache, ChainReader, Clock, IssuerRegistry, PoolIndex, ReadLog, Signer,
         SourceVerifier,
     },
 };
+use chrono::{DateTime, Utc};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock, Weak, atomic::AtomicU64},
 };
 use tokio::sync::Semaphore;
 
-pub(crate) type PowersCacheKey = (Chain, String, u64);
+/// Token powers are chain facts per contract; they do not depend on the issuer registry, so
+/// registry changes never invalidate them.
+pub(crate) type PowersCacheKey = (Chain, String);
+pub(crate) type GuardCacheKey = (Chain, String, u64);
 pub(crate) type CheckFlight = Weak<tokio::sync::watch::Sender<Option<CheckResult>>>;
 pub(crate) type CheckInFlight = tokio::sync::Mutex<HashMap<String, CheckFlight>>;
 
@@ -25,10 +29,24 @@ pub(crate) struct CachedCheckResult {
 }
 
 #[derive(Clone)]
+pub(crate) struct CachedGuardDocument {
+    pub(crate) cached_at: DateTime<Utc>,
+    pub(crate) document: GuardDocument,
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedNoContract {
+    pub(crate) read_log: ReadLog,
+    pub(crate) observed_at: DateTime<Utc>,
+}
+
+#[derive(Clone)]
 pub(crate) struct Context {
     pub(crate) registry: Arc<dyn IssuerRegistry>,
+    pub(crate) history: Arc<dyn crate::ports::AssetHistoryStore>,
     pub(crate) readers: Arc<Vec<Box<dyn ChainReader>>>,
     pub(crate) check_cache: Arc<dyn Cache<String, CachedCheckResult>>,
+    pub(crate) guard_cache: Arc<dyn Cache<GuardCacheKey, CachedGuardDocument>>,
     pub(crate) statement_cache: Arc<dyn Cache<String, Statement>>,
     pub(crate) powers_cache: Arc<dyn Cache<PowersCacheKey, PowersRecord>>,
     pub(crate) publisher_metadata_cache:
@@ -36,6 +54,8 @@ pub(crate) struct Context {
     pub(crate) powers_retry_cache: Arc<dyn Cache<PowersCacheKey, PowersRecord>>,
     pub(crate) powers_failure_cache: Arc<dyn Cache<PowersCacheKey, ()>>,
     pub(crate) powers_locks: Arc<dyn Cache<PowersCacheKey, Arc<tokio::sync::Mutex<()>>>>,
+    pub(crate) guard_locks: Arc<dyn Cache<GuardCacheKey, Arc<tokio::sync::Mutex<()>>>>,
+    pub(crate) no_code_cache: Arc<dyn Cache<PowersCacheKey, CachedNoContract>>,
     pub(crate) powers_prefetching: Arc<tokio::sync::Mutex<HashSet<PowersCacheKey>>>,
     pub(crate) check_inflight: Arc<CheckInFlight>,
     pub(crate) pool_index: Arc<dyn PoolIndex>,
@@ -51,7 +71,6 @@ pub(crate) struct Context {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) powers_prefetch_concurrency: Arc<Semaphore>,
 }
-
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
@@ -79,6 +98,7 @@ pub(crate) mod test_support {
         context: Context,
         pub(crate) registry: Arc<tokio::sync::RwLock<Arc<Registry>>>,
         pub(crate) pool_index: Arc<MemoryPoolIndex>,
+        pub(crate) test_clock: Arc<TestClock>,
     }
 
     impl Deref for TestContext {
@@ -96,7 +116,6 @@ pub(crate) mod test_support {
     ) -> TestContext {
         build_with_signers(readers, entries, dev_signer, [7; 32], HashSet::new())
     }
-
     pub(crate) fn build_with_signers(
         readers: Vec<Box<dyn ChainReader>>,
         entries: Registry,
@@ -113,10 +132,13 @@ pub(crate) mod test_support {
         let pool_index = Arc::new(MemoryPoolIndex::default());
         let store = Arc::new(MemoryAttestationStore::default());
         let signer = Arc::new(TestSigner(SigningKey::from_bytes(&seed)));
+        let clock = Arc::new(TestClock::default());
         let context = Context {
             registry: Arc::new(TestRegistry(Arc::clone(&registry))),
+            history: crate::adapters::history::HistoryStore::memory(),
             readers: Arc::new(readers),
             check_cache: Arc::new(MemoryCache::<String, CachedCheckResult>::default()),
+            guard_cache: Arc::new(MemoryCache::<GuardCacheKey, CachedGuardDocument>::default()),
             statement_cache: Arc::new(MemoryCache::<String, Statement>::default()),
             powers_cache: Arc::new(MemoryCache::<PowersCacheKey, PowersRecord>::default()),
             publisher_metadata_cache: Arc::new(MemoryCache::<
@@ -128,6 +150,10 @@ pub(crate) mod test_support {
             powers_locks: Arc::new(
                 MemoryCache::<PowersCacheKey, Arc<tokio::sync::Mutex<()>>>::default(),
             ),
+            guard_locks: Arc::new(
+                MemoryCache::<GuardCacheKey, Arc<tokio::sync::Mutex<()>>>::default(),
+            ),
+            no_code_cache: Arc::new(MemoryCache::<PowersCacheKey, CachedNoContract>::default()),
             powers_prefetching: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             check_inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pool_index: pool_index.clone(),
@@ -140,10 +166,10 @@ pub(crate) mod test_support {
             publisher_catalog_complete: Arc::new(RwLock::new(publisher_catalog_complete)),
             registry_version: Arc::new(AtomicU64::new(0)),
             source_verifier: Arc::new(TestSourceVerifier),
-            clock: Arc::new(TestClock),
+            clock: clock.clone(),
             powers_prefetch_concurrency: Arc::new(Semaphore::new(2)),
         };
-        TestContext { context, registry, pool_index }
+        TestContext { context, registry, pool_index, test_clock: clock }
     }
 
     struct TestRegistry(Arc<tokio::sync::RwLock<Arc<Registry>>>);
@@ -248,9 +274,21 @@ pub(crate) mod test_support {
             lock(&self.0).insert(attestation.id.clone(), attestation.clone());
             Ok(())
         }
+        async fn import_raw(&self, id: &str, bytes: Vec<u8>) -> std::io::Result<()> {
+            let attestation = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+            lock(&self.0).entry(id.to_owned()).or_insert(attestation);
+            Ok(())
+        }
 
         async fn get(&self, id: &str) -> std::io::Result<Option<Attestation>> {
             Ok(lock(&self.0).get(id).cloned())
+        }
+
+        async fn raw_json(&self, id: &str) -> std::io::Result<Option<Vec<u8>>> {
+            self.get(id)
+                .await?
+                .map(|att| serde_json::to_vec(&att).map_err(std::io::Error::other))
+                .transpose()
         }
 
         async fn prune_expired(&self, older_than: DateTime<Utc>) -> std::io::Result<()> {
@@ -302,11 +340,23 @@ pub(crate) mod test_support {
         }
     }
 
-    struct TestClock;
+    pub(crate) struct TestClock(Mutex<DateTime<Utc>>);
+
+    impl Default for TestClock {
+        fn default() -> Self {
+            Self(Mutex::new(Utc::now()))
+        }
+    }
+
+    impl TestClock {
+        pub(crate) fn advance(&self, duration: chrono::Duration) {
+            *lock(&self.0) += duration;
+        }
+    }
 
     impl Clock for TestClock {
         fn now(&self) -> DateTime<Utc> {
-            Utc::now()
+            *lock(&self.0)
         }
     }
 
@@ -325,5 +375,30 @@ pub(crate) mod test_support {
         ) -> crate::domain::powers::SourceVerified {
             crate::domain::powers::SourceVerified::Unavailable
         }
+    }
+
+    pub(crate) struct VerifiedSourceVerifier;
+
+    #[async_trait]
+    impl SourceVerifier for VerifiedSourceVerifier {
+        async fn verify_solana(&self, _program_id: &str) -> crate::domain::powers::SourceVerified {
+            crate::domain::powers::SourceVerified::ExactMatch
+        }
+
+        async fn verify_evm(
+            &self,
+            _chain: Chain,
+            _contract: &str,
+        ) -> crate::domain::powers::SourceVerified {
+            crate::domain::powers::SourceVerified::ExactMatch
+        }
+    }
+
+    /// The same context with every published source reported as verified, so a matching
+    /// registry contract can reach a final `allow` verdict.
+    pub(crate) fn with_verified_sources(context: &Context) -> Context {
+        let mut context = context.clone();
+        context.source_verifier = Arc::new(VerifiedSourceVerifier);
+        context
     }
 }

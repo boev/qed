@@ -36,6 +36,7 @@
       </svg>
     </span>
     <span>{{ pool.verdict_label }}</span>
+    {% if pool.status_summary.len() > 0 %}<small>{{ pool.status_summary }}</small>{% endif %}
     {% if pool.issuer_ticker.len() > 0 %}
     <small>{{ pool.issuer_ticker }}</small>
     {% endif %}
@@ -68,7 +69,7 @@
   </dl>
   <div class="pool-card-footer">
       <time data-relative-time datetime="{{ pool.updated_at }}">{{ pool.updated_at }}</time>
-      <a class="check-pool" href="/guard/{{ pool.chain_slug }}/{{ pool.pool }}">Review with Guard <span aria-hidden="true">↗</span></a>
+      <a class="check-pool" href="/guard/{{ pool.chain_slug }}/{{ pool.pool }}" rel="nofollow">Review with Guard <span aria-hidden="true">↗</span></a>
   </div>
 </article>
 {% endfor %}

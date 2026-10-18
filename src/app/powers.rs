@@ -1,15 +1,17 @@
 use crate::{
-    app::context::Context,
+    app::context::{CachedNoContract, Context},
     domain::{
         chain::Chain,
         pool::PoolError,
         powers::{PowersRecord, SourceVerified, SourceVerifiedSubject},
         registry,
     },
-    ports::capture_reads,
+    ports::{
+        capture_reads, current_rpc_request_context, rpc_budget_rejected, rpc_crawler_blocked,
+        with_rpc_request_context,
+    },
 };
 use chrono::SecondsFormat;
-use std::sync::atomic::Ordering;
 
 const MAX_QUEUED_PREFETCHES: usize = 64;
 const POWERS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
@@ -20,6 +22,7 @@ pub enum LookupError {
     NotFound,
     ReadFailed,
     DeadlineExceeded,
+    DailyBudgetExceeded,
 }
 
 pub(crate) async fn for_any(
@@ -60,17 +63,24 @@ async fn for_any_inner(
         if Chain::detect(address) == Some(Chain::Solana) {
             chains.push(Chain::Solana);
         } else {
-            let readers = state
-                .readers
-                .iter()
-                .map(|reader| reader.as_ref() as &dyn crate::ports::ChainReader)
-                .collect::<Vec<_>>();
-            chains.push(crate::app::check::detect_evm_chain(address, &readers).await.map_err(
-                |error| match error {
-                    PoolError::InvalidAddress => LookupError::InvalidAddress,
-                    _ => LookupError::NotFound,
-                },
-            )?);
+            chains.push(
+                crate::app::check::detect_evm_chain(
+                    state,
+                    address,
+                    crate::domain::asset_history::SubjectKind::Token,
+                    crate::domain::asset_history::Facet::Powers,
+                )
+                .await
+                .map_err(|error| {
+                    if matches!(&error, PoolError::InvalidAddress) {
+                        LookupError::InvalidAddress
+                    } else if error.is_daily_budget_exceeded() {
+                        LookupError::DailyBudgetExceeded
+                    } else {
+                        LookupError::NotFound
+                    }
+                })?,
+            );
         }
     }
     let _permit = state
@@ -81,7 +91,13 @@ async fn for_any_inner(
         .map_err(|_| LookupError::ReadFailed)?;
     let mut records = Vec::with_capacity(chains.len());
     for chain in chains {
-        records.push(inspect(state, chain, address).await.map_err(|_| LookupError::ReadFailed)?);
+        records.push(inspect(state, chain, address).await.map_err(|error| {
+            if error.is_daily_budget_exceeded() || rpc_budget_rejected() {
+                LookupError::DailyBudgetExceeded
+            } else {
+                LookupError::ReadFailed
+            }
+        })?);
     }
     Ok(records)
 }
@@ -109,8 +125,20 @@ async fn inspect_with_refresh(
     refresh_stale: bool,
 ) -> Result<PowersRecord, PoolError> {
     let contract = canonical_contract(chain, contract)?;
-    let version = state.registry_version.load(Ordering::Acquire);
-    let cache_key = (chain, contract.clone(), version);
+    if let Some(asset) = crate::domain::asset_history::AssetKey::new(
+        chain,
+        crate::domain::asset_history::SubjectKind::Token,
+        &contract,
+    ) && crate::app::asset_history::already_missed_slot(
+        state,
+        &asset,
+        crate::domain::asset_history::Facet::Powers,
+    )
+    .is_some()
+    {
+        return Err(PoolError::Reader("scheduled retry already attempted this hour".into()));
+    }
+    let cache_key = (chain, contract.clone());
     if !refresh_stale {
         if let Some(record) = state.powers_cache.get(&cache_key).await {
             return Ok(record);
@@ -132,7 +160,7 @@ async fn inspect_with_refresh(
         .powers_locks
         .get_or_insert(cache_key.clone(), std::sync::Arc::new(tokio::sync::Mutex::new(())))
         .await;
-    let _guard = lock.lock().await;
+    let guard = lock.lock_owned().await;
     if !refresh_stale {
         if let Some(record) = state.powers_cache.get(&cache_key).await {
             return Ok(record);
@@ -150,69 +178,125 @@ async fn inspect_with_refresh(
     if state.powers_failure_cache.get(&cache_key).await.is_some() {
         return Err(PoolError::Reader("recent token-power reads are unavailable".to_owned()));
     }
-    let reader = state
-        .readers
-        .iter()
-        .find(|reader| reader.chain() == chain)
-        .ok_or_else(|| PoolError::Reader(format!("no reader configured for {chain}")))?;
-    let (result, read_log) = capture_reads(async {
-        let facts = reader.power_facts(&contract).await?;
-        let (source_verified, source_verified_proxy) = match chain {
-            Chain::Solana => {
-                let Some(program_id) = facts.source_target.as_deref() else {
-                    return Ok((facts, SourceVerified::Unavailable, None));
-                };
-                (state.source_verifier.verify_solana(program_id).await, None)
-            }
-            _ if facts.source_is_proxy => {
-                let implementation = match facts.source_target.as_deref() {
-                    Some(implementation) => {
-                        state.source_verifier.verify_evm(chain, implementation).await
+    let state = state.clone();
+    crate::app::asset_history::finish_execution(async move {
+        let _guard = guard;
+        let state = &state;
+        let reader = state
+            .readers
+            .iter()
+            .find(|reader| reader.chain() == chain)
+            .ok_or_else(|| PoolError::Reader(format!("no reader configured for {chain}")))?;
+        let (result, read_log) = tokio::time::timeout(
+            std::time::Duration::from_secs(14),
+            capture_reads(async {
+                let facts = reader.power_facts(&contract).await?;
+                let (source_verified, source_verified_proxy) = match chain {
+                    Chain::Solana => {
+                        let Some(program_id) = facts.source_target.as_deref() else {
+                            return Ok((facts, SourceVerified::Unavailable, None));
+                        };
+                        (state.source_verifier.verify_solana(program_id).await, None)
                     }
-                    None => SourceVerified::Unavailable,
+                    _ if facts.source_is_proxy => {
+                        let implementation = match facts.source_target.as_deref() {
+                            Some(implementation) => {
+                                state.source_verifier.verify_evm(chain, implementation).await
+                            }
+                            None => SourceVerified::Unavailable,
+                        };
+                        let proxy = state.source_verifier.verify_evm(chain, &contract).await;
+                        (implementation, Some(proxy))
+                    }
+                    _ => (state.source_verifier.verify_evm(chain, &contract).await, None),
                 };
-                let proxy = state.source_verifier.verify_evm(chain, &contract).await;
-                (implementation, Some(proxy))
+                Ok::<_, PoolError>((facts, source_verified, source_verified_proxy))
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            (
+                Err(PoolError::Reader("token controls execution timed out".into())),
+                crate::ports::ReadLog::default(),
+            )
+        });
+        let (facts, source_verified, source_verified_proxy) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                if !rpc_crawler_blocked()
+                    && let Some(asset) = crate::domain::asset_history::AssetKey::new(
+                        chain,
+                        crate::domain::asset_history::SubjectKind::Token,
+                        &contract,
+                    )
+                {
+                    crate::app::asset_history::miss(
+                        state,
+                        asset,
+                        crate::domain::asset_history::Facet::Powers,
+                        if error.is_daily_budget_exceeded() {
+                            "budget_rejection"
+                        } else {
+                            "read_failure"
+                        },
+                    )
+                    .await;
+                }
+                if !error.is_daily_budget_exceeded() && !rpc_crawler_blocked() {
+                    state.powers_failure_cache.insert(cache_key, ()).await;
+                }
+                return Err(error);
             }
-            _ => (state.source_verifier.verify_evm(chain, &contract).await, None),
         };
-        Ok::<_, PoolError>((facts, source_verified, source_verified_proxy))
-    })
-    .await;
-    let (facts, source_verified, source_verified_proxy) = match result {
-        Ok(value) => value,
-        Err(error) => {
-            state.powers_failure_cache.insert(cache_key, ()).await;
-            return Err(error);
+        if rpc_budget_rejected() {
+            if let Some(asset) = crate::domain::asset_history::AssetKey::new(
+                chain,
+                crate::domain::asset_history::SubjectKind::Token,
+                &contract,
+            ) {
+                crate::app::asset_history::miss(
+                    state,
+                    asset,
+                    crate::domain::asset_history::Facet::Powers,
+                    "budget_rejection",
+                )
+                .await;
+            }
+            return Err(PoolError::DailyBudgetExceeded);
         }
-    };
-    let cache_complete = facts.unavailable.is_empty() && !facts.transient_failure;
-    let record = PowersRecord {
-        chain,
-        contract,
-        can_seize: facts.can_seize,
-        can_block: facts.can_block,
-        can_change_rules: facts.can_change_rules,
-        token_paused: facts.token_paused,
-        sanctions_list: facts.sanctions_list,
-        unavailable: facts.unavailable,
-        source_verified_subject: source_verified_subject(chain, facts.source_is_proxy),
-        source_verified,
-        source_verified_proxy,
-        observed_at: state.clock.now().to_rfc3339_opts(SecondsFormat::Secs, true),
-        block: read_log.block,
-        slot: read_log.slot,
-        reads: read_log.reads,
-    };
+        if rpc_crawler_blocked() {
+            return Err(PoolError::Reader("crawler cache miss".to_owned()));
+        }
+        let cache_complete = facts.unavailable.is_empty() && !facts.transient_failure;
+        let record = PowersRecord {
+            chain,
+            contract,
+            can_seize: facts.can_seize,
+            can_block: facts.can_block,
+            can_change_rules: facts.can_change_rules,
+            token_paused: facts.token_paused,
+            sanctions_list: facts.sanctions_list,
+            unavailable: facts.unavailable,
+            source_verified_subject: source_verified_subject(chain, facts.source_is_proxy),
+            source_verified,
+            source_verified_proxy,
+            observed_at: state.clock.now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            block: read_log.block,
+            slot: read_log.slot,
+            reads: read_log.reads,
+        };
 
-    state.powers_failure_cache.invalidate(&cache_key).await;
-    if !cache_complete {
-        state.powers_retry_cache.insert(cache_key, record.clone()).await;
-    } else {
-        state.powers_retry_cache.invalidate(&cache_key).await;
-        state.powers_cache.insert(cache_key, record.clone()).await;
-    }
-    Ok(record)
+        crate::app::asset_history::powers(state, &record, cache_complete).await;
+        state.powers_failure_cache.invalidate(&cache_key).await;
+        if !cache_complete {
+            state.powers_retry_cache.insert(cache_key, record.clone()).await;
+        } else {
+            state.powers_retry_cache.invalidate(&cache_key).await;
+            state.powers_cache.insert(cache_key, record.clone()).await;
+        }
+        Ok(record)
+    })
+    .await
 }
 
 fn source_verified_subject(chain: Chain, is_proxy: bool) -> SourceVerifiedSubject {
@@ -233,11 +317,40 @@ pub(crate) async fn cached_record(
     contract: &str,
 ) -> Option<PowersRecord> {
     let contract = canonical_contract(chain, contract).ok()?;
-    let cache_key = (chain, contract, state.registry_version.load(Ordering::Acquire));
+    let cache_key = (chain, contract);
     if let Some(record) = state.powers_cache.get(&cache_key).await {
         return Some(record);
     }
     state.powers_retry_cache.get(&cache_key).await
+}
+
+pub(crate) async fn confirmed_no_contract(
+    state: &Context,
+    chain: Chain,
+    address: &str,
+) -> Result<Option<CachedNoContract>, PoolError> {
+    if chain == Chain::Solana {
+        return Ok(None);
+    }
+    let contract = canonical_contract(chain, address)?;
+    let key = (chain, contract.clone());
+    if let Some(cached) = state.no_code_cache.get(&key).await {
+        return Ok(Some(cached));
+    }
+    let reader = state
+        .readers
+        .iter()
+        .find(|reader| reader.chain() == chain)
+        .ok_or_else(|| PoolError::Reader(format!("no reader configured for {chain}")))?;
+    let (result, read_log) = capture_reads(reader.code_at(&contract)).await;
+    let code = result?;
+    if code.is_empty() {
+        let evidence = CachedNoContract { read_log, observed_at: state.clock.now() };
+        state.no_code_cache.insert(key, evidence.clone()).await;
+        Ok(Some(evidence))
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) async fn inspect_prefetched(
@@ -258,8 +371,7 @@ pub(crate) async fn schedule_prefetch(state: &Context, chain: Chain, address: &s
     let Ok(contract) = canonical_contract(chain, address) else {
         return;
     };
-    let version = state.registry_version.load(Ordering::Acquire);
-    let key = (chain, contract.clone(), version);
+    let key = (chain, contract.clone());
     if state.powers_cache.get(&key).await.is_some()
         || state.powers_retry_cache.get(&key).await.is_some()
         || state.powers_failure_cache.get(&key).await.is_some()
@@ -273,11 +385,17 @@ pub(crate) async fn schedule_prefetch(state: &Context, chain: Chain, address: &s
         }
         in_progress.insert(key.clone());
     }
+    let request_context = current_rpc_request_context();
     let state = state.clone();
-    tokio::spawn(async move {
+    let future = async move {
         let _ = inspect_prefetched(&state, chain, &contract).await;
         state.powers_prefetching.lock().await.remove(&key);
-    });
+    };
+    if let Some(context) = request_context {
+        tokio::spawn(async move { with_rpc_request_context(context, future).await });
+    } else {
+        tokio::spawn(future);
+    }
 }
 
 pub(crate) fn canonical_contract(chain: Chain, address: &str) -> Result<String, PoolError> {
@@ -334,5 +452,34 @@ mod tests {
             serde_json::to_value(SourceVerifiedSubject::Implementation).unwrap(),
             "implementation"
         );
+    }
+
+    #[tokio::test]
+    async fn cached_powers_survive_a_registry_change() {
+        let state = crate::app::context::test_support::build(Vec::new(), Vec::new(), false);
+        let contract = "0x00000000000000000000000000000000000000aa";
+        let record = PowersRecord {
+            chain: Chain::Base,
+            contract: contract.to_owned(),
+            can_seize: Vec::new(),
+            can_block: Vec::new(),
+            can_change_rules: Vec::new(),
+            token_paused: Some(false),
+            sanctions_list: None,
+            unavailable: Vec::new(),
+            source_verified_subject: SourceVerifiedSubject::Contract,
+            source_verified: SourceVerified::ExactMatch,
+            source_verified_proxy: None,
+            observed_at: "2026-10-15T00:00:00Z".to_owned(),
+            block: Some(1),
+            slot: None,
+            reads: Vec::new(),
+        };
+        state.powers_cache.insert((Chain::Base, contract.to_owned()), record.clone()).await;
+        state.registry_version.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
+        // No chain reader is configured: a cache miss would fail, so success proves reuse.
+        let reused = inspect(&state, Chain::Base, contract).await.expect("cached powers reused");
+        assert_eq!(reused, record);
     }
 }

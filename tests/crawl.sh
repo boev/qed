@@ -18,8 +18,8 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
-# Keep this crawl isolated from the captain's live data directory while still
-# exercising a real validated pool detail page.
+# Keep this crawl isolated from production data while still exercising a real
+# validated pool detail page.
 mkdir -p "$DATA_DIR/attestations"
 fixture_path="$DATA_DIR/attestations/generated.json"
 node "$ROOT/../qed-infra/tests/e2e/generate-attestation.js" \
