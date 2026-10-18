@@ -21,6 +21,49 @@
   margin: 6px auto 14px;
   text-align: center;
 }
+.home-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  width: min(900px, 100%);
+  margin: 0 auto 14px;
+  padding: 0 12px;
+}
+.home-stat-card {
+  display: grid;
+  min-width: 0;
+  justify-items: center;
+  gap: 3px;
+  padding: 12px 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  text-align: center;
+  text-decoration: none;
+}
+.home-stat-card:hover {
+  border-color: var(--content-accent);
+}
+.home-stat-card:focus-visible {
+  outline: 2px solid var(--content-accent);
+  outline-offset: 2px;
+}
+.home-stat-number {
+  font-size: clamp(1.35rem, 3.4vw, 1.9rem);
+  font-variant-numeric: tabular-nums;
+  font-weight: 900;
+  line-height: 1;
+}
+.home-stat-label {
+  font-size: .8rem;
+  font-weight: 800;
+}
+.home-stat-detail {
+  color: var(--text-muted);
+  font-size: .68rem;
+}
+
 .wordmark-stage {
   position: relative;
   display: grid;
@@ -566,5 +609,20 @@
     overflow: hidden;
     clip: rect(0 0 0 0);
     white-space: nowrap;
+  }
+}
+@media (max-width: 520px) {
+  .home-stat-grid {
+    gap: 7px;
+    padding-inline: 8px;
+  }
+  .home-stat-card {
+    padding: 10px 6px;
+  }
+  .home-stat-label {
+    font-size: .7rem;
+  }
+  .home-stat-detail {
+    font-size: .62rem;
   }
 }

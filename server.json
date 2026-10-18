@@ -3,7 +3,7 @@
   "name": "io.github.boev/qed",
   "title": "QED",
   "description": "Read-only issuer checks, observed token powers, wallet holdings and statements, registry lookup, document verification, and signed Guard reviews.",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "websiteUrl": "https://qed.web3-energy.com",
   "repository": {
     "url": "https://github.com/boev/qed",

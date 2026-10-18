@@ -19,7 +19,7 @@
     <span class="count-badge">{{ registry_count }} entries</span>
   </div>
   <p class="registry-status-line" title="{{ registry_status_tooltip }}">{{ registry_status_line }}</p>
-  <div id="registry-table" hx-get="/registry/table" hx-trigger="load" hx-swap="innerHTML" hx-push-url="false">
+  <div id="registry-table" hx-get="{{ registry_table_url }}" hx-trigger="load" hx-swap="innerHTML" hx-push-url="false">
     <p class="muted">Loading registry…</p>
   </div>
 </section>

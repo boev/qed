@@ -4,6 +4,7 @@
     <input id="registry-query" name="q" type="search" value="{{ query }}" placeholder="Ticker, issuer, chain, or contract" autocomplete="off">
     <button class="button secondary-button" type="submit">Filter</button>
   </div>
+{% if !issuer_filter.is_empty() %}<input type="hidden" name="issuer" value="{{ issuer_filter }}">{% endif %}
 </form>
 {% if entries.len() > 0 %}
 <div class="table-wrap">
@@ -39,11 +40,11 @@
 {% if has_previous || has_next %}
 <nav class="registry-pagination" aria-label="Registry pages">
   {% if has_previous %}
-  <a href="/registry/table?q={{ query }}&amp;page={{ previous_page }}" hx-get="/registry/table?q={{ query }}&amp;page={{ previous_page }}" hx-target="#registry-table" hx-swap="innerHTML">Previous</a>
+  <a href="/registry/table?q={{ query }}{% if !issuer_parameter.is_empty() %}&amp;{{ issuer_parameter }}{% endif %}&amp;page={{ previous_page }}" hx-get="/registry/table?q={{ query }}{% if !issuer_parameter.is_empty() %}&amp;{{ issuer_parameter }}{% endif %}&amp;page={{ previous_page }}" hx-target="#registry-table" hx-swap="innerHTML">Previous</a>
   {% endif %}
   <span>Page {{ page }} of {{ page_count }}</span>
   {% if has_next %}
-  <a href="/registry/table?q={{ query }}&amp;page={{ next_page }}" hx-get="/registry/table?q={{ query }}&amp;page={{ next_page }}" hx-target="#registry-table" hx-swap="innerHTML">Next</a>
+  <a href="/registry/table?q={{ query }}{% if !issuer_parameter.is_empty() %}&amp;{{ issuer_parameter }}{% endif %}&amp;page={{ next_page }}" hx-get="/registry/table?q={{ query }}{% if !issuer_parameter.is_empty() %}&amp;{{ issuer_parameter }}{% endif %}&amp;page={{ next_page }}" hx-target="#registry-table" hx-swap="innerHTML">Next</a>
   {% endif %}
 </nav>
 {% endif %}

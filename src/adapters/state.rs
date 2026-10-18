@@ -539,12 +539,20 @@ pub struct RegistryApiCache {
     pub body: Arc<Bytes>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HomepageStats {
+    pub pools_checked: usize,
+    pub issuer_matches: usize,
+    pub confirmed_copies: usize,
+}
+
 #[derive(Clone)]
 pub struct StatsSnapshotCache {
     pub html: Bytes,
     pub json: Bytes,
     pub csv: Bytes,
     pub api_pages: Vec<Bytes>,
+    pub homepage: HomepageStats,
 }
 
 #[derive(Clone)]

@@ -1,7 +1,7 @@
 use crate::{
     adapters::{
         discovery::{self, LeaderboardEntry},
-        state::{AppState, RegistryApiCache, StatsSnapshotCache},
+        state::{AppState, HomepageStats, RegistryApiCache, StatsSnapshotCache},
     },
     app::{attestation as attest, check},
     domain::{
@@ -526,9 +526,20 @@ fn stats_cache_from_document(
     registry: &Registry,
 ) -> Result<StatsSnapshotCache, String> {
     let recent = recent_catalog_entries(&board.impostors.entries, Utc::now().timestamp());
+    let homepage = HomepageStats {
+        pools_checked: document.stats.pools_checked,
+        issuer_matches: document.stats.issuer_matches,
+        confirmed_copies: recent
+            .iter()
+            .filter(|entry| {
+                entry.tier == Some(crate::domain::guard::PublisherProductTier::Confirmed)
+            })
+            .count(),
+    };
     let html = super::pages::render_stats_page(state, &document.stats, &recent, board, registry)
         .map_err(|status| format!("rendering stats page failed with {status}"))?;
     let csv = stats_csv(document).map_err(|error| error.to_string())?;
+
     let inputs = &document.reducer_inputs;
     let pages = inputs
         .leaderboard
@@ -573,7 +584,13 @@ fn stats_cache_from_document(
         };
         api_pages.push(Bytes::from(serde_json::to_vec(&page).map_err(|error| error.to_string())?));
     }
-    Ok(StatsSnapshotCache { html, json: Bytes::from(json), csv: Bytes::from(csv), api_pages })
+    Ok(StatsSnapshotCache {
+        html,
+        json: Bytes::from(json),
+        csv: Bytes::from(csv),
+        api_pages,
+        homepage,
+    })
 }
 
 pub(crate) async fn restore_stats_snapshot(state: &AppState) -> bool {
@@ -2544,6 +2561,24 @@ mod tests {
         let document: StatsDocument = serde_json::from_slice(&body).expect("strict stats document");
         document.verify().expect("signed stats document verifies");
         assert_signed_stats_recompute_from_inputs(&document);
+
+        let mut count_board = state.leaderboard.read().await.clone();
+        let mut recent_confirmed = count_board.impostors.entries[0].clone();
+        recent_confirmed.tier = Some(crate::domain::guard::PublisherProductTier::Confirmed);
+        recent_confirmed.last_seen_at = Utc::now().to_rfc3339();
+        let mut stale_confirmed = recent_confirmed.clone();
+        stale_confirmed.last_seen_at = (Utc::now() - chrono::Duration::days(8)).to_rfc3339();
+        count_board.impostors.entries = vec![recent_confirmed, stale_confirmed];
+        let registry = state.registry.read().await.clone();
+        let cache = stats_cache_from_document(
+            &state,
+            &document,
+            serde_json::to_vec(&document).unwrap(),
+            &count_board,
+            &registry,
+        )
+        .expect("homepage stats from the recent copy window");
+        assert_eq!(cache.homepage.confirmed_copies, 1);
         assert!(
             document
                 .reducer_inputs

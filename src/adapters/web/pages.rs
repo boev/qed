@@ -4,9 +4,10 @@ use super::views::{
     CertificateResultTemplate, CertificateTemplate, CertificateView, ChainTemplate,
     ContentPageTemplate, DirectoryContractView, DirectoryPoolView, DirectoryPowersView,
     DocsPageTemplate, FeaturedTemplate, GlossaryTemplate, GuardResultTemplate, GuardTemplate,
-    GuideVerifyTemplate, IndexTemplate, IntegrationChipView, RegistryTableQuery,
+    GuideVerifyTemplate, HomeStatCardView, IndexTemplate, IntegrationChipView, RegistryTableQuery,
     RegistryTableTemplate, RegistryTemplate, TokenTemplate, ValidatedCardView, ValidatedTemplate,
 };
+
 use super::{ASSET_VERSION, render_page, wants_fragment};
 #[cfg(test)]
 use crate::adapters::registry as registry_adapter;
@@ -44,6 +45,12 @@ pub(crate) async fn index(
     State(state): State<AppState>,
     _headers: HeaderMap,
 ) -> Result<Html<String>, StatusCode> {
+    let home_stats = state
+        .stats_snapshot
+        .try_read()
+        .ok()
+        .and_then(|snapshot| snapshot.as_ref().map(|snapshot| snapshot.homepage));
+
     let leaderboard = state.leaderboard.read().await.clone();
     let mut value =
         serde_json::to_value(&leaderboard).unwrap_or_else(|_| serde_json::json!({ "entries": [] }));
@@ -100,7 +107,7 @@ pub(crate) async fn index(
         IntegrationChipView {
             category: "Chain",
             name: "Solana",
-            href: "https://solana.com/",
+            href: "/chains/solana",
             mark: "",
             icon: "solana",
             logo_src: "",
@@ -111,7 +118,7 @@ pub(crate) async fn index(
         IntegrationChipView {
             category: "Chain",
             name: "Robinhood Chain",
-            href: "https://docs.robinhood.com/chain/connecting/",
+            href: "/chains/robinhood",
             mark: "",
             icon: "robinhood",
             logo_src: "",
@@ -122,7 +129,7 @@ pub(crate) async fn index(
         IntegrationChipView {
             category: "Chain",
             name: "Ethereum",
-            href: "https://ethereum.org/",
+            href: "/chains/ethereum",
             mark: "",
             icon: "ethereum",
             logo_src: "",
@@ -133,7 +140,7 @@ pub(crate) async fn index(
         IntegrationChipView {
             category: "Chain",
             name: "Base",
-            href: "https://base.org/",
+            href: "/chains/base",
             mark: "",
             icon: "base",
             logo_src: "",
@@ -144,7 +151,7 @@ pub(crate) async fn index(
         IntegrationChipView {
             category: "Chain",
             name: "BNB Chain",
-            href: "https://www.bnbchain.org/",
+            href: "/chains/bnb",
             mark: "",
             icon: "bnb",
             logo_src: "",
@@ -155,7 +162,7 @@ pub(crate) async fn index(
         IntegrationChipView {
             category: "Issuer",
             name: "Backed xStocks",
-            href: "https://xstocks.fi/",
+            href: "/registry?issuer=Backed%20xStocks",
             mark: "",
             icon: "xstocks",
             logo_src: "/static/brand/xstocks-mark.svg",
@@ -166,7 +173,7 @@ pub(crate) async fn index(
         IntegrationChipView {
             category: "Issuer",
             name: "Robinhood",
-            href: "https://robinhood.com/us/en/",
+            href: "/registry?issuer=Robinhood",
             mark: "",
             icon: "robinhood-logo",
             logo_src: "/static/brand/robinhood-mark.ico",
@@ -177,7 +184,7 @@ pub(crate) async fn index(
         IntegrationChipView {
             category: "Issuer",
             name: "Ondo",
-            href: "https://ondo.finance/",
+            href: "/registry?issuer=Ondo",
             mark: "",
             icon: "ondo",
             logo_src: "/static/brand/ondo-mark.svg",
@@ -188,7 +195,7 @@ pub(crate) async fn index(
         IntegrationChipView {
             category: "Source",
             name: "DexScreener",
-            href: "https://dexscreener.com/",
+            href: "https://dexscreener.com",
             mark: "",
             icon: "dexscreener",
             logo_src: "/static/brand/dexscreener-mark.ico",
@@ -201,7 +208,7 @@ pub(crate) async fn index(
         IntegrationChipView {
             category: "Source",
             name: "GeckoTerminal",
-            href: "https://www.geckoterminal.com/",
+            href: "https://www.geckoterminal.com",
             mark: "",
             icon: "geckoterminal",
             logo_src: "/static/brand/geckoterminal-mark.ico",
@@ -214,7 +221,7 @@ pub(crate) async fn index(
         IntegrationChipView {
             category: "Verifier",
             name: "Sourcify",
-            href: "https://sourcify.dev/",
+            href: "/guide/verify-a-stock-token#source-verification",
             mark: "",
             icon: "sourcify",
             logo_src: "/static/brand/sourcify-mark.png",
@@ -225,7 +232,7 @@ pub(crate) async fn index(
         IntegrationChipView {
             category: "Venue",
             name: "Uniswap",
-            href: "https://uniswap.org/",
+            href: "https://app.uniswap.org",
             mark: "",
             icon: "uniswap",
             logo_src: "/static/brand/uniswap-mark.ico",
@@ -234,6 +241,7 @@ pub(crate) async fn index(
             empty_unit: "trading venue",
         },
     ];
+
     if let Some(object) = value.as_object_mut() {
         object.remove("impostors");
         object.insert(
@@ -247,9 +255,64 @@ pub(crate) async fn index(
             public_url: state.public_url.to_string(),
             leaderboard: super::views::LeaderboardPageView::from_value(value),
             integration_chips: integrations,
+            home_stats: vec![
+                home_stat_card(
+                    home_stats.map(|stats| stats.pools_checked),
+                    "Pools checked",
+                    "",
+                    "pools checked",
+                    "/stats",
+                    "view stats",
+                ),
+                home_stat_card(
+                    home_stats.map(|stats| stats.issuer_matches),
+                    "Verified",
+                    "issuer matches",
+                    "verified issuer matches",
+                    "/stats",
+                    "view stats",
+                ),
+                home_stat_card(
+                    home_stats.map(|stats| stats.confirmed_copies),
+                    "Copies found",
+                    "confirmed",
+                    "confirmed copies found",
+                    "/copies",
+                    "view copies",
+                ),
+            ],
         },
         false,
     )
+}
+
+fn home_stat_card(
+    count: Option<usize>,
+    label: &'static str,
+    detail: &'static str,
+    accessible_value: &'static str,
+    href: &'static str,
+    action: &'static str,
+) -> HomeStatCardView {
+    let number = count.map(format_home_count).unwrap_or_else(|| "—".to_owned());
+    let accessible_name = if count.is_some() {
+        format!("{number} {accessible_value} — {action}")
+    } else {
+        format!("{} unavailable — {action}", label)
+    };
+    HomeStatCardView { number, label, detail, href, accessible_name }
+}
+
+fn format_home_count(count: usize) -> String {
+    let digits = count.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.bytes().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(char::from(digit));
+    }
+    formatted
 }
 pub(crate) async fn stats_page(State(state): State<AppState>) -> Result<Response, StatusCode> {
     if state.stats_snapshot.read().await.is_none() {
@@ -460,8 +523,9 @@ fn render_copy_hero(
             official,
             &format!("Real · published by {}", entry.publisher),
             "Copy · not in the issuer's catalog",
-            chain == Some(crate::domain::chain::Chain::Solana),
+            chain.unwrap_or(crate::domain::chain::Chain::Ethereum),
         ),
+
         None => format!(
             "<div class=\"addr-compare\"><div class=\"addr-row addr-row--copy\"><span class=\"addr-label\">Copy · not in the issuer's catalog</span><code>{address}</code></div></div>"
         ),
@@ -483,45 +547,94 @@ fn render_copy_hero(
     )
 }
 
-/// Two addresses stacked in the same type size: the issuer-published one first, then the
-/// reviewed one, with every character of the reviewed address that differs marked.
-/// EVM addresses compare case-insensitively; Solana base58 addresses compare exactly.
+/// Push one escaped address character without allocating a temporary string.
+fn push_escaped_char(output: &mut String, character: char) {
+    match character {
+        '&' => output.push_str("&amp;"),
+        '<' => output.push_str("&lt;"),
+        '>' => output.push_str("&gt;"),
+        '"' => output.push_str("&quot;"),
+        '\'' => output.push_str("&#39;"),
+        _ => output.push(character),
+    }
+}
+
+/// Two addresses stacked in the same type size; only shared beginning and ending runs
+/// are highlighted, using the chain's address comparison rules.
 pub(crate) fn address_comparison_html(
     observed: &str,
     official: &str,
     official_label: &str,
     observed_label: &str,
-    case_sensitive: bool,
+    chain: crate::domain::chain::Chain,
 ) -> String {
-    let same = |left: char, right: char| {
-        if case_sensitive { left == right } else { left.eq_ignore_ascii_case(&right) }
+    let similarity = crate::domain::address_similarity::compare(observed, official, chain);
+    let comparable_char_count = |address: &str| {
+        address.chars().count().saturating_sub(
+            usize::from(
+                chain != crate::domain::chain::Chain::Solana
+                    && (address.starts_with("0x") || address.starts_with("0X")),
+            ) * 2,
+        )
     };
-    let official_chars = official.chars().collect::<Vec<_>>();
-    let mut marked = String::with_capacity(observed.len() * 2);
-    let mut in_mark = false;
-    for (index, character) in observed.chars().enumerate() {
-        let differs = official_chars.get(index).is_none_or(|expected| !same(*expected, character));
-        if differs && !in_mark {
-            marked.push_str("<mark>");
-            in_mark = true;
-        } else if !differs && in_mark {
-            marked.push_str("</mark>");
-            in_mark = false;
+    let observed_len = comparable_char_count(observed);
+    let identical =
+        observed_len == comparable_char_count(official) && similarity.prefix_len == observed_len;
+    let prefix = !identical && similarity.prefix_len >= 3;
+    let suffix = !identical && similarity.suffix_len >= 3;
+    let prefix_len = if prefix { similarity.prefix_len } else { 0 };
+    let suffix_len = if suffix { similarity.suffix_len } else { 0 };
+    let format_address = |address: &str| {
+        let char_count = address.chars().count();
+        let prefix_start = usize::from(chain != crate::domain::chain::Chain::Solana)
+            * usize::from(address.starts_with("0x") || address.starts_with("0X"))
+            * 2;
+        let mut rendered = String::with_capacity(address.len() + 64);
+        let mut in_highlight = false;
+        for (index, character) in address.chars().enumerate() {
+            let highlighted = (index >= prefix_start && index < prefix_start + prefix_len)
+                || (index >= char_count.saturating_sub(suffix_len) && suffix_len > 0);
+            if highlighted != in_highlight {
+                rendered.push_str(if highlighted {
+                    "<span class=\"addr-lookalike\">"
+                } else {
+                    "</span>"
+                });
+                in_highlight = highlighted;
+            }
+            push_escaped_char(&mut rendered, character);
         }
-        marked.push_str(&html_escape(&character.to_string()));
-    }
-    if in_mark {
-        marked.push_str("</mark>");
-    }
-    let matches = observed.chars().count() == official_chars.len()
-        && observed.chars().zip(official_chars.iter()).all(|(left, right)| same(*right, left));
+        if in_highlight {
+            rendered.push_str("</span>");
+        }
+
+        rendered
+    };
+    let official_html = format_address(official);
+    let observed_html = format_address(observed);
+    let explanation = match (prefix, suffix) {
+        (true, true) => format!(
+            "<p class=\"addr-similarity\">Same first {} and last {} characters as the real address.</p>",
+            similarity.prefix_len, similarity.suffix_len
+        ),
+        (true, false) => format!(
+            "<p class=\"addr-similarity\">Same first {} characters as the real address.</p>",
+            similarity.prefix_len
+        ),
+        (false, true) => format!(
+            "<p class=\"addr-similarity\">Same last {} characters as the real address.</p>",
+            similarity.suffix_len
+        ),
+        (false, false) => String::new(),
+    };
     format!(
-        "<div class=\"addr-compare{}\"><div class=\"addr-row addr-row--real\"><span class=\"addr-label\">{}</span><code>{}</code></div><div class=\"addr-row addr-row--copy\"><span class=\"addr-label\">{}</span><code>{}</code></div></div>",
-        if matches { " addr-compare--match" } else { "" },
+        "<div class=\"addr-compare{}\"><div class=\"addr-row addr-row--real\"><span class=\"addr-label\">{}</span><code>{}</code></div><div class=\"addr-row addr-row--copy\"><span class=\"addr-label\">{}</span><code>{}</code></div>{}</div>",
+        if identical { " addr-compare--match" } else { "" },
         html_escape(official_label),
-        html_escape(official),
+        official_html,
         html_escape(observed_label),
-        marked,
+        observed_html,
+        explanation,
     )
 }
 
@@ -1041,8 +1154,9 @@ pub(crate) async fn token_lookup(
 
 pub(crate) async fn registry_page(
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    Query(query): Query<RegistryTableQuery>,
 ) -> Result<Html<String>, StatusCode> {
+    let registry_table_url = super::views::registry_table_url(query.issuer.as_deref());
     let registry = state.registry.read().await;
     let registry_status = state.registry_status.read().await.clone();
     let value = serde_json::json!({ "registry": registry_status });
@@ -1057,6 +1171,7 @@ pub(crate) async fn registry_page(
             ),
             registry_status_tooltip,
             public_url: state.public_url.to_string(),
+            registry_table_url,
         },
         false,
     )
@@ -1575,7 +1690,9 @@ pub(crate) async fn registry_table(
     State(state): State<AppState>,
     Query(query): Query<RegistryTableQuery>,
 ) -> Result<Html<String>, StatusCode> {
-    if query.q.as_deref().is_some_and(|query| query.len() > 64) {
+    if query.q.as_deref().is_some_and(|query| query.len() > 64)
+        || query.issuer.as_deref().is_some_and(|issuer| issuer.len() > 64)
+    {
         return Err(StatusCode::BAD_REQUEST);
     }
     let registry = state.registry.read().await.clone();
@@ -3919,6 +4036,28 @@ mod tests {
         assert!(!String::from_utf8_lossy(&body).contains("HOMEPAGE_WATCH_ROW_MUST_NOT_APPEAR"));
     }
 
+    #[tokio::test]
+    async fn homepage_returns_without_waiting_for_stats_snapshot_build() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let state = AppState::for_tests(Vec::new(), Vec::new(), true);
+        let _build_lock = state.stats_snapshot_refresh.lock().await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::adapters::web::router(state.clone())
+                .oneshot(Request::get("/").body(Body::empty()).unwrap()),
+        )
+        .await
+        .expect("homepage must not wait for stats snapshot build")
+        .expect("homepage response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body =
+            axum::body::to_bytes(response.into_body(), 1024 * 1024).await.expect("homepage body");
+        assert!(String::from_utf8_lossy(&body).contains("home-stat-number\">—"));
+        assert!(state.stats_snapshot.read().await.is_none());
+    }
+
     #[test]
     fn zero_statement_block_is_rendered_as_not_observed() {
         let position = crate::domain::statement::StatementPosition {
@@ -4355,10 +4494,129 @@ mod copies_page_tests {
     }
 
     #[test]
+    fn address_comparison_marks_shared_ends_and_explains_them() {
+        let html = address_comparison_html(
+            "0xd060f448de7bccb6e54b0cb8d5bc871c8d339eec",
+            "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+            "Real",
+            "Copy",
+            crate::domain::chain::Chain::RobinhoodChain,
+        );
+        assert_eq!(html.matches("class=\"addr-lookalike\"").count(), 4);
+        assert!(html.contains("Same first 4 and last 4 characters as the real address."));
+        assert!(html.contains("</span>f448de7bccb6e54b0cb8d5bc871c8d33<span"));
+        assert!(!html.contains("<mark>"));
+    }
+
+    #[test]
+    fn address_comparison_without_three_matching_characters_is_plain() {
+        let html = address_comparison_html(
+            "0x111222",
+            "0x333444",
+            "Real",
+            "Copy",
+            crate::domain::chain::Chain::Ethereum,
+        );
+        assert!(!html.contains("addr-lookalike"));
+        assert!(!html.contains("addr-similarity"));
+    }
+
+    #[test]
+    fn identical_addresses_render_as_matches_without_lookalike_warnings() {
+        for (observed, official, chain) in [
+            ("0xAbC123", "0xabc123", crate::domain::chain::Chain::Ethereum),
+            ("Abc123", "Abc123", crate::domain::chain::Chain::Solana),
+        ] {
+            let html = address_comparison_html(observed, official, "Real", "Copy", chain);
+            assert!(html.contains("addr-compare--match"));
+            assert!(!html.contains("addr-lookalike"));
+            assert!(!html.contains("addr-similarity"));
+        }
+    }
+
+    #[test]
+    fn address_comparison_mentions_only_matching_ends() {
+        let chain = crate::domain::chain::Chain::Solana;
+        let prefix = address_comparison_html("abc111", "abc222", "Real", "Copy", chain);
+        assert!(prefix.contains("Same first 3 characters as the real address."));
+        assert!(!prefix.contains("last"));
+        assert_eq!(prefix.matches("class=\"addr-lookalike\"").count(), 2);
+
+        let suffix = address_comparison_html("111abc", "222abc", "Real", "Copy", chain);
+        assert!(suffix.contains("Same last 3 characters as the real address."));
+        assert!(!suffix.contains("first"));
+        assert_eq!(suffix.matches("class=\"addr-lookalike\"").count(), 2);
+    }
+
+    #[test]
+    fn copies_hero_uses_shared_end_comparison_and_keeps_copy_disabled() {
+        let mut copy = entry("NVDA", "robinhood", Some(10.0), PublisherProductTier::Confirmed);
+        copy.address = "0xd060f448de7bccb6e54b0cb8d5bc871c8d339eec".to_owned();
+        let registry = [crate::domain::registry::Entry {
+            issuer: "Robinhood".to_owned(),
+            ticker: "NVDA".to_owned(),
+            name: "NVIDIA".to_owned(),
+            chain: crate::domain::chain::Chain::RobinhoodChain,
+            contract: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_owned(),
+            decimals: Some(18),
+            source: "test".to_owned(),
+            source_url: "https://issuer.example".to_owned(),
+            last_checked: "2026-10-18T00:00:00Z".to_owned(),
+            removed_at: None,
+            stale_since: None,
+            official_deployments: vec![crate::domain::registry::OfficialDeployment {
+                network: "Robinhood Chain".to_owned(),
+                address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_owned(),
+                wrapper_address: None,
+                wrapper_address_v2: None,
+            }],
+        }];
+        let html = render_copy_hero(&copy, &registry);
+        assert_eq!(html.matches("class=\"addr-lookalike\"").count(), 4);
+        assert!(html.contains("Same first 4 and last 4 characters as the real address."));
+        assert!(html.contains("aria-disabled=\"true\""));
+    }
+
+    #[test]
     fn copies_empty_state_links_back_to_stats() {
         let body = render(&[], None);
         assert!(body.contains("No copies currently flagged"));
         assert!(body.contains("<a href=\"/stats\">leaderboard statistics</a>"));
+    }
+}
+
+#[cfg(test)]
+mod home_stat_tests {
+    use super::home_stat_card;
+
+    #[test]
+    fn homepage_stat_cards_group_counts_and_explain_their_links() {
+        let matches = home_stat_card(
+            Some(1234),
+            "Verified",
+            "issuer matches",
+            "verified issuer matches",
+            "/stats",
+            "view stats",
+        );
+        assert_eq!(matches.number, "1,234");
+        assert_eq!(matches.accessible_name, "1,234 verified issuer matches — view stats");
+        assert_eq!(matches.href, "/stats");
+
+        let zero = home_stat_card(
+            Some(0),
+            "Copies found",
+            "confirmed",
+            "confirmed copies found",
+            "/copies",
+            "view copies",
+        );
+        assert_eq!(zero.number, "0");
+
+        let unavailable =
+            home_stat_card(None, "Pools checked", "", "pools checked", "/stats", "view stats");
+        assert_eq!(unavailable.number, "—");
+        assert_eq!(unavailable.accessible_name, "Pools checked unavailable — view stats");
     }
 }
 

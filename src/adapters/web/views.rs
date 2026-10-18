@@ -378,8 +378,8 @@ impl GuardResultTemplate {
     }
 }
 
-/// Issuer-published contract above the reviewed one, differing characters marked, when QED
-/// knows the published contract for this product on this chain. Empty otherwise.
+/// Issuer-published contract above the reviewed one, with shared end runs highlighted,
+/// when QED knows the published contract for this product on this chain. Empty otherwise.
 fn guard_address_comparison(document: &crate::domain::guard::GuardDocument) -> String {
     use crate::domain::guard::IdentityStatus;
     let Some(official) = document.identity.matched_contract.as_deref() else {
@@ -397,7 +397,7 @@ fn guard_address_comparison(document: &crate::domain::guard::GuardDocument) -> S
         official,
         &format!("Published by {publisher}"),
         &observed_label,
-        document.chain == Chain::Solana,
+        document.chain,
     )
 }
 
@@ -442,7 +442,23 @@ pub(crate) async fn verified_attestations(state: &Context) -> Vec<Attestation> {
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct RegistryTableQuery {
     pub(crate) q: Option<String>,
+    pub(crate) issuer: Option<String>,
     pub(crate) page: Option<usize>,
+}
+
+fn canonical_registry_issuer(issuer: &str) -> Option<&'static str> {
+    ["Backed xStocks", "Robinhood", "Ondo"]
+        .into_iter()
+        .find(|candidate| candidate.eq_ignore_ascii_case(issuer))
+}
+
+pub(crate) fn registry_table_url(issuer: Option<&str>) -> &'static str {
+    match issuer.and_then(canonical_registry_issuer) {
+        Some("Backed xStocks") => "/registry/table?issuer=Backed%20xStocks",
+        Some("Robinhood") => "/registry/table?issuer=Robinhood",
+        Some("Ondo") => "/registry/table?issuer=Ondo",
+        _ => "/registry/table",
+    }
 }
 
 fn registry_entry_matches(entry: &Entry, query: &str) -> bool {
@@ -619,6 +635,15 @@ pub(crate) struct IntegrationChipView {
     pub(crate) number: Option<String>,
     pub(crate) unit: &'static str,
     pub(crate) empty_unit: &'static str,
+}
+
+#[derive(Debug)]
+pub(crate) struct HomeStatCardView {
+    pub(crate) number: String,
+    pub(crate) label: &'static str,
+    pub(crate) detail: &'static str,
+    pub(crate) href: &'static str,
+    pub(crate) accessible_name: String,
 }
 
 #[derive(Debug)]
@@ -933,6 +958,7 @@ pub(crate) struct IndexTemplate {
     pub(crate) public_url: String,
     pub(crate) leaderboard: LeaderboardPageView,
     pub(crate) integration_chips: Vec<IntegrationChipView>,
+    pub(crate) home_stats: Vec<HomeStatCardView>,
 }
 
 #[derive(Debug, Template)]
@@ -943,6 +969,7 @@ pub(crate) struct RegistryTemplate {
     pub(crate) registry_status_line: String,
     pub(crate) registry_status_tooltip: String,
     pub(crate) public_url: String,
+    pub(crate) registry_table_url: &'static str,
 }
 #[derive(Debug, Template)]
 #[template(path = "token.html")]
@@ -1211,16 +1238,20 @@ pub(crate) struct RegistryTableTemplate {
     pub(crate) next_page: usize,
     pub(crate) has_previous: bool,
     pub(crate) has_next: bool,
+    pub(crate) issuer_filter: &'static str,
+    pub(crate) issuer_parameter: &'static str,
 }
 
 impl RegistryTableTemplate {
     pub(crate) fn from_registry(registry: &Registry, query: RegistryTableQuery) -> Self {
-        let RegistryTableQuery { q, page: requested_page } = query;
+        let RegistryTableQuery { q, issuer, page: requested_page } = query;
         let query = q.unwrap_or_default().trim().to_ascii_lowercase();
+        let issuer = issuer.as_deref().and_then(canonical_registry_issuer);
         let mut entries: Vec<_> = registry
             .iter()
             .filter(|entry| registry::matchable(entry))
             .filter(|entry| registry_entry_matches(entry, &query))
+            .filter(|entry| issuer.is_none_or(|issuer| entry.issuer.eq_ignore_ascii_case(issuer)))
             .map(RegistryEntryView::from)
             .collect();
         entries.sort_by(|left, right| {
@@ -1235,6 +1266,13 @@ impl RegistryTableTemplate {
         let page = requested_page.unwrap_or(1).max(1).min(page_count);
         let start = (page - 1) * REGISTRY_PAGE_SIZE;
         let entries = entries.into_iter().skip(start).take(REGISTRY_PAGE_SIZE).collect();
+        let issuer_filter = issuer.unwrap_or_default();
+        let issuer_parameter = match issuer_filter {
+            "Backed xStocks" => "issuer=Backed%20xStocks",
+            "Robinhood" => "issuer=Robinhood",
+            "Ondo" => "issuer=Ondo",
+            _ => "",
+        };
         let first_entry = if total_entries == 0 { 0 } else { start + 1 };
         let last_entry = (start + REGISTRY_PAGE_SIZE).min(total_entries);
         Self {
@@ -1244,6 +1282,8 @@ impl RegistryTableTemplate {
             page_count,
             first_entry,
             last_entry,
+            issuer_filter,
+            issuer_parameter,
             total_entries,
             previous_page: page.saturating_sub(1),
             next_page: (page + 1).min(page_count),
@@ -1811,9 +1851,9 @@ fn prettify_dex(dex: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuardResultTemplate, LeaderboardPageView, LeaderboardRowView, ValidatedCardView,
-        allowed_external_url, explorer_link, guard_identity_sentence, html_safe_json,
-        relative_text, trade_links,
+        GuardResultTemplate, LeaderboardPageView, LeaderboardRowView, RegistryTableQuery,
+        RegistryTableTemplate, ValidatedCardView, allowed_external_url, explorer_link,
+        guard_identity_sentence, html_safe_json, relative_text, trade_links,
     };
     use crate::adapters::discovery::LeaderboardEntry;
     use crate::domain::{
@@ -2145,5 +2185,33 @@ mod tests {
         assert_eq!(card.verdict_label, "Provisional");
         assert_eq!(card.share_label, "n/a");
         assert_eq!(card.detail_url, entry.detail_url);
+    }
+
+    #[test]
+    fn registry_issuer_filter_limits_the_table_to_the_requested_publisher() {
+        let entry = |issuer: &str, ticker: &str, address: &str| crate::domain::registry::Entry {
+            issuer: issuer.to_owned(),
+            ticker: ticker.to_owned(),
+            name: ticker.to_owned(),
+            chain: Chain::Ethereum,
+            contract: address.to_owned(),
+            decimals: Some(18),
+            source: "test".to_owned(),
+            source_url: "https://example.invalid".to_owned(),
+            last_checked: "2026-10-18T00:00:00Z".to_owned(),
+            removed_at: None,
+            stale_since: None,
+            official_deployments: Vec::new(),
+        };
+        let registry = vec![
+            entry("Robinhood", "NVDA", "0x0000000000000000000000000000000000000001"),
+            entry("Ondo", "AAPL", "0x0000000000000000000000000000000000000002"),
+        ];
+        let table = RegistryTableTemplate::from_registry(
+            &registry,
+            RegistryTableQuery { q: None, issuer: Some("robinhood".to_owned()), page: None },
+        );
+        assert_eq!(table.total_entries, 1);
+        assert_eq!(table.entries[0].issuer, "Robinhood");
     }
 }

@@ -3774,9 +3774,6 @@ pre.code-block code {
 .addr-row--copy {
   border-color: color-mix(in srgb, var(--coral) 50%, var(--ui-border));
 }
-.addr-compare--match .addr-row--copy {
-  border-color: color-mix(in srgb, var(--http-ok) 50%, var(--ui-border));
-}
 .addr-label {
   color: var(--text-muted);
   font-size: .72rem;
@@ -3787,21 +3784,31 @@ pre.code-block code {
 .addr-row--copy .addr-label {
   color: var(--coral);
 }
+.addr-compare--match .addr-row {
+  border-color: var(--http-ok);
+}
 .addr-compare--match .addr-row--copy .addr-label {
-  color: var(--http-ok-text);
+  color: var(--http-ok);
 }
 .addr-row code {
   font-size: clamp(.82rem, 1.9vw, 1.12rem);
   letter-spacing: .02em;
   overflow-wrap: anywhere;
 }
-.addr-row mark {
-  padding: 0 1px;
+.addr-lookalike {
+  border: 1px solid color-mix(in srgb, var(--coral) 72%, var(--ui-border));
   border-radius: 3px;
-  background: color-mix(in srgb, var(--coral) 24%, transparent);
   color: var(--coral);
-  font-weight: 800;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
 }
+.addr-similarity {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: .85rem;
+}
+
 .copy-disabled {
   display: inline-flex;
   cursor: not-allowed;

@@ -22,6 +22,16 @@
     <p class="problem-copy"><a href="/tokens/NVDA" rel="nofollow">QED also shows what the issuer can do to each token.</a></p>
   </div>
 </section>
+<section class="home-stat-grid" aria-label="QED overview">
+  {% for stat in home_stats %}
+  <a class="home-stat-card" href="{{ stat.href }}" aria-label="{{ stat.accessible_name }}">
+    <strong class="home-stat-number">{{ stat.number }}</strong>
+    <span class="home-stat-label">{{ stat.label }}</span>
+    {% if !stat.detail.is_empty() %}<small class="home-stat-detail">{{ stat.detail }}</small>{% endif %}
+  </a>
+  {% endfor %}
+</section>
+
 <section class="integration-band" aria-labelledby="integration-title">
   <p class="integration-title" id="integration-title">Integrated with</p>
   <div class="integration-viewport">
@@ -29,7 +39,7 @@
       <ul class="integration-set">
         {% for chip in integration_chips %}
         <li>
-          <a href="{{ chip.href }}" target="_blank" rel="noopener noreferrer" title="{{ chip.category }}" aria-label="{{ chip.category }}: {{ chip.name }}{% if chip.number.is_some() %}, {{ chip.number.as_ref().unwrap() }} {{ chip.unit }}{% else %}, {{ chip.empty_unit }}{% endif %}">
+          <a href="{{ chip.href }}" title="{{ chip.category }}" aria-label="{{ chip.category }}: {{ chip.name }}{% if chip.number.is_some() %}, {{ chip.number.as_ref().unwrap() }} {{ chip.unit }}{% else %}, {{ chip.empty_unit }}{% endif %}">
             {% if !chip.logo_src.is_empty() %}
             <span class="integration-mark-frame integration-mark-frame--{{ chip.icon }}"><img class="integration-logo" src="{{ chip.logo_src }}?v={{ asset_version }}" alt="" width="32" height="32"></span>
             {% else if !chip.icon.is_empty() %}
@@ -45,10 +55,10 @@
         </li>
         {% endfor %}
       </ul>
-      <ul class="integration-set integration-set--clone" aria-hidden="true" inert>
+      <ul class="integration-set integration-set--clone" aria-hidden="true">
         {% for chip in integration_chips %}
         <li>
-          <a href="{{ chip.href }}" target="_blank" rel="noopener noreferrer" tabindex="-1" title="{{ chip.category }}">
+          <a href="{{ chip.href }}" tabindex="-1" title="{{ chip.category }}">
             {% if !chip.logo_src.is_empty() %}
             <span class="integration-mark-frame integration-mark-frame--{{ chip.icon }}"><img class="integration-logo" src="{{ chip.logo_src }}?v={{ asset_version }}" alt="" width="32" height="32"></span>
             {% else if !chip.icon.is_empty() %}

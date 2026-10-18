@@ -2,6 +2,11 @@
 
 Notable QED changes, in reverse chronological order. Entries describe shipped releases and current unreleased work; QED does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.
 
+## [1.1.2] - 2026-10-18
+
+- **Copies** — Look-alike addresses now highlight the matching start and end.
+- **Homepage** — Overview counts use the prepared snapshot; integration links reach their destinations.
+
 ## [1.1.1] - 2026-10-18
 
 **Fix: copy tiers after the 1.1.0 import**
