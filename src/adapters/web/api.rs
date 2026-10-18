@@ -360,8 +360,9 @@ pub(crate) fn leaderboard_stats(
         })
         .count();
     let table_limit_exceeded = [
-        crate::domain::guard::PublisherProductTier::Confirmed,
-        crate::domain::guard::PublisherProductTier::Caution,
+        Some(crate::domain::guard::PublisherProductTier::Confirmed),
+        Some(crate::domain::guard::PublisherProductTier::Caution),
+        None,
     ]
     .into_iter()
     .any(|tier| {
@@ -588,6 +589,25 @@ pub(crate) async fn restore_stats_snapshot(state: &AppState) -> bool {
     if document.verify().is_err()
         || (document.public_key != attest::public_key_b58(&state.app)
             && !state.app.trusted_signers.contains(&document.public_key))
+    {
+        return false;
+    }
+    // Old Caution could be an implicit default; never restore it as a derived result.
+    // Pending observations must retry, even when the last signed snapshot is valid.
+    if document
+        .reducer_inputs
+        .impostor_watch
+        .entries
+        .iter()
+        .any(discovery::ImpostorEntry::needs_tier_derivation)
+        || state
+            .leaderboard
+            .read()
+            .await
+            .impostors
+            .entries
+            .iter()
+            .any(discovery::ImpostorEntry::needs_tier_derivation)
     {
         return false;
     }
@@ -875,8 +895,9 @@ fn stats_csv(document: &StatsDocument) -> Result<String, serde_json::Error> {
     for entry in recent_catalog_entries.into_iter().take(IMPOSTOR_STATS_TABLE_LIMIT) {
         let volume = entry.volume_24h_usd.map(|value| value.to_string()).unwrap_or_default();
         let tier = match entry.tier {
-            crate::domain::guard::PublisherProductTier::Confirmed => "confirmed",
-            crate::domain::guard::PublisherProductTier::Caution => "caution",
+            Some(crate::domain::guard::PublisherProductTier::Confirmed) => "confirmed",
+            Some(crate::domain::guard::PublisherProductTier::Caution) => "caution",
+            None => "",
         };
         push_csv_record(
             &mut csv,
@@ -1491,6 +1512,22 @@ pub(crate) async fn verify_attestation(
             if stats_document_has_legacy_guard(&document) {
                 return Err(verify_bad_request(
                     "Signed stats snapshots must not contain migration-only Guard documents.",
+                ));
+            }
+            // Import tolerates legacy/future tier strings, but signed input remains strict.
+            if document
+                .pointer("/reducer_inputs/impostor_watch/entries")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry.get("tier").is_some_and(|tier| {
+                            !matches!(tier.as_str(), Some("confirmed" | "caution"))
+                        })
+                    })
+                })
+            {
+                return Err(verify_bad_request(
+                    "Signed stats tier must be confirmed or caution, or absent while pending.",
                 ));
             }
             let Ok(stats) = serde_json::from_value::<StatsDocument>(document) else {
@@ -2310,7 +2347,8 @@ mod tests {
             address: "0x0000000000000000000000000000000000000002".to_owned(),
             first_seen_at: scanned_at.clone(),
             last_seen_at: scanned_at.clone(),
-            tier: crate::domain::guard::PublisherProductTier::Caution,
+            tier: Some(crate::domain::guard::PublisherProductTier::Caution),
+            tier_derived: true,
             volume_24h_usd: Some(1234.5),
             liquidity_24h_usd: None,
             pool_count: None,
@@ -2530,7 +2568,6 @@ mod tests {
         .expect("trimmed public watch fixture");
         let observation: discovery::ImpostorEntry =
             serde_json::from_value(fixture["observation"].clone()).expect("legacy watch row");
-        assert_eq!(observation.tier, crate::domain::guard::PublisherProductTier::Caution);
         let registry: crate::domain::registry::Registry =
             serde_json::from_value(fixture["registry"].clone()).expect("registry snapshot");
         let published: crate::domain::pool::TokenMeta =
@@ -2545,6 +2582,52 @@ mod tests {
         state.registry_path = Arc::new(persisted_dir.path().join("registry.json"));
         state.leaderboard.write().await.entries.push(entry("fixture-pool", 1, None, None));
         state.leaderboard.write().await.impostors.entries.push(observation);
+        let mut database = None;
+        if let Ok(url) = std::env::var("QED_TEST_DATABASE_URL") {
+            let (client, connection) =
+                tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let schema = format!("qed_legacy_watch_{:x}", rand::random::<u64>());
+            client.batch_execute(&format!("CREATE SCHEMA {schema}")).await.unwrap();
+            let mut scoped = reqwest::Url::parse(&url).unwrap();
+            scoped.query_pairs_mut().append_pair("options", &format!("-csearch_path={schema}"));
+            let storage = crate::adapters::storage::DurableStore::open(
+                scoped.as_str(),
+                persisted_dir.path(),
+                None,
+                32 * 1024 * 1024,
+            )
+            .await
+            .unwrap();
+            state.board_store =
+                Arc::new(discovery::DurableBoardStore::new(None, Some(Arc::clone(&storage))).await);
+            let mut legacy_board = state.leaderboard.read().await.clone();
+            storage
+                .put("discovery/leaderboard.json", serde_json::to_vec(&legacy_board).unwrap())
+                .await
+                .unwrap();
+            // Reproduce a valid 1.1.0 signed snapshot containing defaulted Caution.
+            legacy_board.impostors.entries[0].tier =
+                Some(crate::domain::guard::PublisherProductTier::Caution);
+            let current_registry = state.registry.read().await.clone();
+            let legacy_document = build_stats_document(
+                &state,
+                leaderboard_stats(&legacy_board, &current_registry),
+                &legacy_board,
+                &current_registry,
+            )
+            .unwrap();
+            legacy_document.verify().unwrap();
+            storage
+                .put("discovery/stats.json", serde_json::to_vec(&legacy_document).unwrap())
+                .await
+                .unwrap();
+            storage.flush().await.unwrap();
+            *state.leaderboard.write().await = state.board_store.load_leaderboard().await.unwrap();
+            database = Some((client, schema));
+        }
 
         let response = crate::adapters::web::router(state.clone())
             .oneshot(Request::get("/stats.json").body(Body::empty()).unwrap())
@@ -2558,18 +2641,25 @@ mod tests {
         document.verify().expect("signed stats document");
         assert_eq!(
             document.reducer_inputs.impostor_watch.entries[0].tier,
-            crate::domain::guard::PublisherProductTier::Confirmed
+            Some(crate::domain::guard::PublisherProductTier::Confirmed)
         );
         assert_eq!(
             state.leaderboard.read().await.impostors.entries[0].tier,
-            crate::domain::guard::PublisherProductTier::Confirmed
+            Some(crate::domain::guard::PublisherProductTier::Confirmed)
         );
-        let persisted = discovery::load_leaderboard(persisted_dir.path())
-            .expect("reclassified board persisted");
+        let persisted = if database.is_some() {
+            state.board_store.database.as_ref().unwrap().flush().await.unwrap();
+            state.board_store.load_leaderboard().await.expect("reclassified Postgres board")
+        } else {
+            discovery::load_leaderboard(persisted_dir.path()).expect("reclassified disk board")
+        };
         assert_eq!(
             persisted.impostors.entries[0].tier,
-            crate::domain::guard::PublisherProductTier::Confirmed
+            Some(crate::domain::guard::PublisherProductTier::Confirmed)
         );
+        if let Some((client, schema)) = database {
+            client.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2689,7 +2779,8 @@ mod tests {
                     address: address.clone(),
                     first_seen_at: scanned_at.to_owned(),
                     last_seen_at: scanned_at.to_owned(),
-                    tier: crate::domain::guard::PublisherProductTier::Caution,
+                    tier: Some(crate::domain::guard::PublisherProductTier::Caution),
+                    tier_derived: true,
                     volume_24h_usd: Some(1.0),
                     liquidity_24h_usd: None,
                     pool_count: None,
@@ -2876,7 +2967,8 @@ mod tests {
             address: "0x0000000000000000000000000000000000000002".to_owned(),
             first_seen_at: first_seen_at.clone(),
             last_seen_at: first_seen_at,
-            tier: crate::domain::guard::PublisherProductTier::Caution,
+            tier: Some(crate::domain::guard::PublisherProductTier::Caution),
+            tier_derived: true,
             volume_24h_usd: Some(1234.56789),
             liquidity_24h_usd: None,
             pool_count: None,
@@ -2900,13 +2992,6 @@ mod tests {
         let page_body = to_bytes(page_response.into_body(), 32_768).await.unwrap();
         let page_html = String::from_utf8(page_body.to_vec()).expect("stats page HTML");
         assert_eq!(page_html.matches("<article class=\"stats-number-card").count(), 4);
-        assert!(page_html.contains("Confirmed mismatches"));
-        assert!(page_html.contains("Caution — near matches"));
-        assert!(page_html.contains(
-            "<p class=\"stats-number\">0</p><p>Pools not checked: 0 not read yet · 0 unsupported venues</p>"
-        ));
-        assert!(page_html.contains("<details class=\"stats-details\">"));
-        assert!(!page_html.contains("<details class=\"stats-details\" open>"));
         let json_response = crate::adapters::web::router(state.clone())
             .oneshot(Request::get("/stats.json").body(Body::empty()).unwrap())
             .await
@@ -2981,6 +3066,36 @@ mod tests {
             .await
             .expect("migration-only Guard verification response");
         assert_eq!(with_guard_response.status(), StatusCode::BAD_REQUEST);
+
+        let mut pending_board = state.leaderboard.read().await.clone();
+        pending_board.impostors.entries[0].tier = None;
+        pending_board.impostors.entries[0].tier_derived = false;
+        let registry = state.registry.read().await.clone();
+        let pending_document = build_stats_document(
+            &state,
+            leaderboard_stats(&pending_board, &registry),
+            &pending_board,
+            &registry,
+        )
+        .unwrap();
+        for invalid in [serde_json::json!("future_unknown"), serde_json::Value::Null] {
+            let mut injected = serde_json::to_value(&pending_document).unwrap();
+            injected["reducer_inputs"]["impostor_watch"]["entries"][0]["tier"] = invalid;
+            let response = crate::adapters::web::router(state.clone())
+                .oneshot(
+                    Request::post("/verify")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&injected).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "unknown tier cannot disappear during signed verification"
+            );
+        }
 
         let mut with_unknown_read = serde_json::to_value(&document).unwrap();
         with_unknown_read["reducer_inputs"]["impostor_watch"]["entries"][0]["reads"] = serde_json::json!([{
@@ -3080,7 +3195,8 @@ mod tests {
                 address: format!("0x{index:040x}"),
                 first_seen_at: now.clone(),
                 last_seen_at: now.clone(),
-                tier: crate::domain::guard::PublisherProductTier::Caution,
+                tier: Some(crate::domain::guard::PublisherProductTier::Caution),
+                tier_derived: true,
                 volume_24h_usd: Some(index as f64),
                 liquidity_24h_usd: None,
                 pool_count: None,

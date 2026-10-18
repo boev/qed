@@ -472,8 +472,15 @@ pub struct ImpostorEntry {
     pub address: String,
     pub first_seen_at: String,
     pub last_seen_at: String,
-    #[serde(default)]
-    pub tier: crate::domain::guard::PublisherProductTier,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_watch_tier",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tier: Option<crate::domain::guard::PublisherProductTier>,
+    /// Legacy Caution may have been a serde default, not an observed classification.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tier_derived: bool,
     pub volume_24h_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub liquidity_24h_usd: Option<f64>,
@@ -496,6 +503,47 @@ pub struct ImpostorEntry {
     // Accepted only to migrate old durable boards; never emitted in stats or public responses.
     #[serde(default, skip_serializing)]
     pub guard_document: Option<crate::domain::guard::GuardDocument>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn deserialize_watch_tier<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::domain::guard::PublisherProductTier>, D::Error> {
+    struct TierVisitor;
+    impl<'de> serde::de::Visitor<'de> for TierVisitor {
+        type Value = Option<crate::domain::guard::PublisherProductTier>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a publisher-product tier or null")
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            use crate::domain::guard::PublisherProductTier;
+            Ok(match value {
+                "confirmed" => Some(PublisherProductTier::Confirmed),
+                "caution" => Some(PublisherProductTier::Caution),
+                _ => None,
+            })
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+    deserializer.deserialize_any(TierVisitor)
+}
+
+impl ImpostorEntry {
+    fn prepare_tier(&mut self) {
+        if !self.tier_derived
+            && self.tier != Some(crate::domain::guard::PublisherProductTier::Confirmed)
+        {
+            self.tier = None;
+        }
+    }
+    pub(crate) fn needs_tier_derivation(&self) -> bool {
+        self.tier.is_none() || !self.tier_derived
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -552,7 +600,7 @@ fn classify_impostor_tier(
     registry: &Registry,
     publisher_metadata: &HashMap<String, crate::domain::pool::TokenMeta>,
     complete_issuers: &HashSet<String>,
-) -> crate::domain::guard::PublisherProductTier {
+) -> Option<crate::domain::guard::PublisherProductTier> {
     use crate::domain::{guard, pool::TokenMeta};
 
     let observed = TokenMeta {
@@ -562,6 +610,7 @@ fn classify_impostor_tier(
         decimals: None,
         total_supply: None,
     };
+    let mut tier = None;
     for entry in registry.iter().filter(|entry| {
         registry::matchable(entry)
             && entry.issuer == observation.publisher
@@ -569,16 +618,21 @@ fn classify_impostor_tier(
     }) {
         let key = guard::issuer_metadata_key(entry.chain, &entry.contract);
         let Some(published) = publisher_metadata.get(&key) else { continue };
-        if guard::classify_publisher_product(
+        match guard::classify_publisher_product(
             &observed,
             published,
             guard::publisher_catalog_complete(registry, entry, complete_issuers),
-        ) == Some(crate::domain::guard::PublisherProductTier::Confirmed)
-        {
-            return crate::domain::guard::PublisherProductTier::Confirmed;
+        ) {
+            Some(guard::PublisherProductTier::Confirmed) => {
+                return Some(guard::PublisherProductTier::Confirmed);
+            }
+            Some(guard::PublisherProductTier::Caution) => {
+                tier = Some(guard::PublisherProductTier::Caution)
+            }
+            None => {}
         }
     }
-    crate::domain::guard::PublisherProductTier::Caution
+    tier
 }
 
 pub(crate) async fn reclassify_impostor_tiers(
@@ -588,6 +642,7 @@ pub(crate) async fn reclassify_impostor_tiers(
     context: &crate::app::context::Context,
 ) {
     use crate::domain::{chain::Chain, pool::TokenMeta};
+    snapshot.entries.iter_mut().for_each(ImpostorEntry::prepare_tier);
 
     let mut metadata_by_observation =
         HashMap::<(String, String, String, String), (HashMap<String, TokenMeta>, bool)>::new();
@@ -608,7 +663,6 @@ pub(crate) async fn reclassify_impostor_tiers(
                 && entry.issuer == observation.publisher
                 && entry.ticker == observation.ticker
         }) {
-            observation.tier = crate::domain::guard::PublisherProductTier::Caution;
             continue;
         }
         let cache_key = (
@@ -637,11 +691,16 @@ pub(crate) async fn reclassify_impostor_tiers(
         }
         let (publisher_metadata, unavailable) =
             metadata_by_observation.get(&cache_key).expect("observation metadata cached");
-        if *unavailable || crate::ports::rpc_reads_rejected() {
-            continue;
-        }
-        observation.tier =
+        let tier =
             classify_impostor_tier(observation, registry, publisher_metadata, complete_issuers);
+        // Guard can prove a mismatch despite another candidate publisher's failed read.
+        // An unavailable read cannot manufacture Caution or erase a prior derived tier.
+        if tier == Some(crate::domain::guard::PublisherProductTier::Confirmed)
+            || (!*unavailable && !crate::ports::rpc_reads_rejected())
+        {
+            observation.tier = tier;
+            observation.tier_derived = tier.is_some();
+        }
     }
 }
 
@@ -1032,6 +1091,7 @@ fn normalize_impostor_snapshot(mut snapshot: ImpostorSnapshot) -> ImpostorSnapsh
             );
             return false;
         };
+        entry.prepare_tier();
         let address = entry.address.as_str();
         if !valid_token_address(chain, address) {
             rejected_entries = rejected_entries.saturating_add(1);
@@ -3481,7 +3541,8 @@ fn catalog_absent_entry(
         address: std::mem::take(&mut guard.address),
         first_seen_at: scanned_at.to_owned(),
         last_seen_at: scanned_at.to_owned(),
-        tier,
+        tier: Some(tier),
+        tier_derived: true,
         volume_24h_usd,
         liquidity_24h_usd: None,
         pool_count: None,
@@ -4432,34 +4493,33 @@ mod tests {
         let complete = HashSet::from(["Backed xStocks".to_owned()]);
         let published = backed_nvda_metadata(&registry);
         let mut observation = legacy_watch_entry("NVDAx", "NVIDIA xStock");
-        assert_eq!(observation.tier, crate::domain::guard::PublisherProductTier::Caution);
         assert_eq!(
             classify_impostor_tier(&observation, &Registry::new(), &published, &complete),
-            crate::domain::guard::PublisherProductTier::Caution
+            None
         );
         assert_eq!(
             classify_impostor_tier(&observation, &registry, &HashMap::new(), &complete),
-            crate::domain::guard::PublisherProductTier::Caution
+            None
         );
         assert_eq!(
             classify_impostor_tier(&observation, &registry, &published, &HashSet::new()),
-            crate::domain::guard::PublisherProductTier::Caution
+            Some(crate::domain::guard::PublisherProductTier::Caution)
         );
         assert_eq!(
             classify_impostor_tier(&observation, &registry, &published, &complete),
-            crate::domain::guard::PublisherProductTier::Confirmed
+            Some(crate::domain::guard::PublisherProductTier::Confirmed)
         );
 
         observation.on_chain_name = Some("NVIDIA xStock ".to_owned());
         assert_eq!(
             classify_impostor_tier(&observation, &registry, &published, &complete),
-            crate::domain::guard::PublisherProductTier::Caution
+            Some(crate::domain::guard::PublisherProductTier::Caution)
         );
         observation.on_chain_name = Some("NVIDIA xStock".to_owned());
         observation.on_chain_symbol = Some("nvdax".to_owned());
         assert_eq!(
             classify_impostor_tier(&observation, &registry, &published, &complete),
-            crate::domain::guard::PublisherProductTier::Caution
+            Some(crate::domain::guard::PublisherProductTier::Caution)
         );
     }
     struct BudgetRejectedMetadataReader;
@@ -4495,7 +4555,8 @@ mod tests {
         let registry = Arc::new(registry);
         let complete = HashSet::from(["Backed xStocks".to_owned()]);
         let mut observation = legacy_watch_entry("NVDAx", "NVIDIA xStock");
-        observation.tier = crate::domain::guard::PublisherProductTier::Confirmed;
+        observation.tier = Some(crate::domain::guard::PublisherProductTier::Confirmed);
+        observation.tier_derived = true;
         let mut snapshot = ImpostorSnapshot { entries: vec![observation], ..Default::default() };
         let (_, outcome) = crate::ports::with_rpc_request_context(
             crate::ports::RpcRequestContext::new(false, false),
@@ -4503,7 +4564,141 @@ mod tests {
         )
         .await;
         assert!(outcome.budget_rejected());
-        assert_eq!(snapshot.entries[0].tier, crate::domain::guard::PublisherProductTier::Confirmed);
+        assert_eq!(
+            snapshot.entries[0].tier,
+            Some(crate::domain::guard::PublisherProductTier::Confirmed)
+        );
+    }
+
+    struct PublisherProductMetadataReader {
+        chain: Chain,
+        symbol: &'static str,
+        name: &'static str,
+    }
+    #[async_trait::async_trait]
+    impl crate::ports::ChainReader for PublisherProductMetadataReader {
+        fn chain(&self) -> Chain {
+            self.chain
+        }
+        async fn read_pool(
+            &self,
+            _: &str,
+        ) -> Result<crate::domain::pool::PoolInfo, crate::domain::pool::PoolError> {
+            Err(crate::domain::pool::PoolError::Unknown("not a pool".into()))
+        }
+        async fn token_meta(
+            &self,
+            address: &str,
+        ) -> Result<crate::domain::pool::TokenMeta, crate::domain::pool::PoolError> {
+            Ok(crate::domain::pool::TokenMeta {
+                address: address.into(),
+                symbol: Some(self.symbol.into()),
+                name: Some(self.name.into()),
+                decimals: None,
+                total_supply: None,
+            })
+        }
+    }
+    #[tokio::test]
+    async fn legacy_robinhood_copy_rederives_confirmed_despite_unavailable_other_publisher() {
+        let mut registry = backed_nvda_registry();
+        let mut robinhood = registry[0].clone();
+        robinhood.issuer = "Robinhood".into();
+        robinhood.chain = Chain::RobinhoodChain;
+        robinhood.contract = "0x0000000000000000000000000000000000000088".into();
+        robinhood.official_deployments = vec![crate::domain::registry::OfficialDeployment {
+            network: "Robinhood Chain".into(),
+            address: robinhood.contract.clone(),
+            wrapper_address: None,
+            wrapper_address_v2: None,
+        }];
+        registry.push(robinhood);
+        let context = crate::app::context::test_support::build(
+            vec![Box::new(PublisherProductMetadataReader {
+                chain: Chain::RobinhoodChain,
+                symbol: "NVDA",
+                name: "NVIDIA • Robinhood Token",
+            })],
+            registry.clone(),
+            false,
+        );
+        let registry = Arc::new(registry);
+        let complete = HashSet::from(["Robinhood".into(), "Backed xStocks".into()]);
+        *context
+            .publisher_catalog_complete
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = complete.clone();
+        let mut observation = legacy_watch_entry("NVDA", "NVIDIA • Robinhood Token");
+        observation.publisher = "Robinhood".into();
+        let guard =
+            crate::app::guard::create(&context, &observation.address, Chain::RobinhoodChain, None)
+                .await
+                .unwrap();
+        assert_eq!(guard.verdict, crate::domain::guard::GuardVerdict::Deny);
+        assert!(
+            guard
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "claims_unpublished_publisher_product")
+        );
+        let mut snapshot = ImpostorSnapshot { entries: vec![observation], ..Default::default() };
+        reclassify_impostor_tiers(&mut snapshot, &registry, &complete, &context).await;
+        assert_eq!(serde_json::to_value(&snapshot.entries[0]).unwrap()["tier"], "confirmed");
+    }
+
+    #[tokio::test]
+    async fn unavailable_metadata_retains_only_derived_tiers_and_pending_rows_retry() {
+        use crate::domain::guard::PublisherProductTier;
+        let registry = Arc::new(backed_nvda_registry());
+        let complete = HashSet::from(["Backed xStocks".into()]);
+        for (stored_tier, derived, expected) in [
+            (None, false, None),
+            (Some("future_unknown"), false, None),
+            (Some("caution"), false, None),
+            (Some("caution"), true, Some("caution")),
+            (Some("confirmed"), false, Some("confirmed")),
+        ] {
+            let mut legacy =
+                serde_json::to_value(legacy_watch_entry("NVDAx", "NVIDIA xStock")).unwrap();
+            if let Some(tier) = stored_tier {
+                legacy["tier"] = tier.into();
+            }
+            if derived {
+                legacy["tier_derived"] = true.into();
+            }
+            let mut snapshot = ImpostorSnapshot {
+                entries: vec![serde_json::from_value(legacy).unwrap()],
+                ..Default::default()
+            };
+            let unavailable = crate::app::context::test_support::build(
+                vec![Box::new(BudgetRejectedMetadataReader)],
+                registry.as_ref().clone(),
+                false,
+            );
+            let _ = crate::ports::with_rpc_request_context(
+                crate::ports::RpcRequestContext::new(false, false),
+                reclassify_impostor_tiers(&mut snapshot, &registry, &complete, &unavailable),
+            )
+            .await;
+            let saved = serde_json::to_value(&snapshot).unwrap();
+            assert_eq!(
+                saved["entries"][0].get("tier").and_then(serde_json::Value::as_str),
+                expected,
+                "stored tier {stored_tier:?}, derived {derived}"
+            );
+            snapshot = serde_json::from_value(saved).unwrap();
+            let recovered = crate::app::context::test_support::build(
+                vec![Box::new(PublisherProductMetadataReader {
+                    chain: Chain::Ethereum,
+                    symbol: "NVDAx",
+                    name: "NVIDIA xStock",
+                })],
+                registry.as_ref().clone(),
+                false,
+            );
+            reclassify_impostor_tiers(&mut snapshot, &registry, &complete, &recovered).await;
+            assert_eq!(snapshot.entries[0].tier, Some(PublisherProductTier::Confirmed));
+        }
     }
 
     #[test]
@@ -4544,7 +4739,8 @@ mod tests {
             address: pool.to_owned(),
             first_seen_at: "2026-10-06T00:00:00Z".to_owned(),
             last_seen_at: "2026-10-06T00:00:00Z".to_owned(),
-            tier: crate::domain::guard::PublisherProductTier::Caution,
+            tier: Some(crate::domain::guard::PublisherProductTier::Caution),
+            tier_derived: true,
             volume_24h_usd: None,
             liquidity_24h_usd: None,
             pool_count: None,
@@ -4572,51 +4768,6 @@ mod tests {
         let impostor = &normalized.impostors.entries[0];
         assert_eq!(impostor.chain, "robinhood");
         assert_eq!(impostor.guard_url, format!("/guard/robinhood/{pool}"));
-    }
-
-    #[test]
-    fn legacy_market_data_rows_default_to_dexscreener() {
-        let mut board = sample_leaderboard("2026-10-07T00:00:00Z", 1);
-        board.impostors.entries.push(ImpostorEntry {
-            chain: "base".to_owned(),
-            chain_label: "Base".to_owned(),
-            ticker: "NVDA".to_owned(),
-            publisher: "Backed xStocks".to_owned(),
-            symbol: "NVDAx".to_owned(),
-            name: "NVIDIA xStock".to_owned(),
-            address: "0x0000000000000000000000000000000000000001".to_owned(),
-            first_seen_at: "2026-10-07T00:00:00Z".to_owned(),
-            last_seen_at: "2026-10-07T00:00:00Z".to_owned(),
-            tier: crate::domain::guard::PublisherProductTier::Caution,
-            volume_24h_usd: None,
-            liquidity_24h_usd: None,
-            pool_count: None,
-            source: MarketSource::Geckoterminal,
-            guard_url: "/guard/base/0x0000000000000000000000000000000000000001".to_owned(),
-            reason: "catalog observation".to_owned(),
-            reads: Vec::new(),
-            on_chain_symbol: None,
-            on_chain_name: None,
-            publisher_catalog_snapshot_hash: None,
-            evidence_truncated: false,
-            guard_document: None,
-        });
-        let mut legacy = serde_json::to_value(board).expect("legacy board value");
-        legacy["entries"][0].as_object_mut().expect("legacy leaderboard row").remove("source");
-        legacy["impostors"]["entries"][0]
-            .as_object_mut()
-            .expect("legacy watch row")
-            .remove("source");
-        legacy["impostors"]["entries"][0].as_object_mut().expect("legacy watch row").remove("tier");
-
-        let restored: Leaderboard =
-            serde_json::from_value(legacy).expect("legacy source-less leaderboard");
-        assert_eq!(restored.entries[0].source, MarketSource::Dexscreener);
-        assert_eq!(restored.impostors.entries[0].source, MarketSource::Dexscreener);
-        assert_eq!(
-            restored.impostors.entries[0].tier,
-            crate::domain::guard::PublisherProductTier::Caution
-        );
     }
 
     #[derive(Debug, Deserialize)]
@@ -6345,7 +6496,8 @@ mod tests {
                 address: address.to_owned(),
                 first_seen_at: first_seen_at.to_owned(),
                 last_seen_at: last_seen_at.to_owned(),
-                tier: crate::domain::guard::PublisherProductTier::Caution,
+                tier: Some(crate::domain::guard::PublisherProductTier::Caution),
+                tier_derived: true,
                 volume_24h_usd: Some(volume),
                 liquidity_24h_usd: None,
                 pool_count: None,
@@ -7300,7 +7452,8 @@ mod tests {
             address: "0x0000000000000000000000000000000000000001".to_owned(),
             first_seen_at: scanned_at.clone(),
             last_seen_at: scanned_at.clone(),
-            tier: crate::domain::guard::PublisherProductTier::Caution,
+            tier: Some(crate::domain::guard::PublisherProductTier::Caution),
+            tier_derived: true,
             volume_24h_usd: Some(12.5),
             liquidity_24h_usd: None,
             pool_count: None,

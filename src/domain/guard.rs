@@ -275,11 +275,10 @@ pub fn verify(document: &GuardDocument) -> Result<(), GuardVerifyError> {
     public_key.verify(&payload, &signature).map_err(|_| GuardVerifyError::SignatureInvalid)
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PublisherProductTier {
     Confirmed,
-    #[default]
     Caution,
 }
 

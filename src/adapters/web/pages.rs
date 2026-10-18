@@ -297,12 +297,21 @@ fn render_copies_page(
 ) -> Result<Html<String>, StatusCode> {
     use crate::domain::guard::PublisherProductTier as Tier;
 
-    let mut confirmed =
-        entries.iter().copied().filter(|entry| entry.tier == Tier::Confirmed).collect::<Vec<_>>();
+    let mut confirmed = entries
+        .iter()
+        .copied()
+        .filter(|entry| entry.tier == Some(Tier::Confirmed))
+        .collect::<Vec<_>>();
     confirmed.sort_by(|left, right| compare_copy_volume(left.volume_24h_usd, right.volume_24h_usd));
-    let mut caution =
-        entries.iter().copied().filter(|entry| entry.tier == Tier::Caution).collect::<Vec<_>>();
+    let mut caution = entries
+        .iter()
+        .copied()
+        .filter(|entry| entry.tier == Some(Tier::Caution))
+        .collect::<Vec<_>>();
     caution.sort_by(|left, right| compare_copy_volume(left.volume_24h_usd, right.volume_24h_usd));
+    let mut pending =
+        entries.iter().copied().filter(|entry| entry.tier.is_none()).collect::<Vec<_>>();
+    pending.sort_by(|left, right| compare_copy_volume(left.volume_24h_usd, right.volume_24h_usd));
 
     let mut chains = std::collections::BTreeMap::<String, (String, usize)>::new();
     for entry in &confirmed {
@@ -324,6 +333,15 @@ fn render_copies_page(
         })
         .collect::<Vec<_>>();
     let filtered_caution = caution
+        .iter()
+        .copied()
+        .filter(|entry| {
+            selected_chain.is_none_or(|chain| {
+                crate::domain::chain::Chain::from_network_name(&entry.chain) == Some(chain)
+            })
+        })
+        .collect::<Vec<_>>();
+    let filtered_pending = pending
         .iter()
         .copied()
         .filter(|entry| {
@@ -357,8 +375,16 @@ fn render_copies_page(
         },
         |entry| render_copy_hero(entry, registry),
     );
-    let table = render_copies_table(&filtered_confirmed, false);
-    let caution_table = render_copies_table(&filtered_caution, true);
+    let table = render_copies_table(&filtered_confirmed);
+    let caution_table = render_copies_table(&filtered_caution);
+    let pending_section = if filtered_pending.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<section aria-labelledby=\"copies-pending-title\"><h2 id=\"copies-pending-title\">Pending classification</h2><p>No current tier has been derived for these observations. QED retries publisher metadata at startup and hourly; pending is not Caution or Deny.</p>{}</section>",
+            render_copies_table(&filtered_pending)
+        )
+    };
     let total = reported_volume(&filtered_confirmed);
     let summary = format!(
         "{} confirmed copies · {} reported 24h volume",
@@ -376,6 +402,7 @@ fn render_copies_page(
 <nav class="copies-tabs" aria-label="Filter copies by chain">{tabs}</nav>
 {table_section}
 <details class="copies-near-matches"><summary>Near matches (caution)</summary>{caution_table}</details>
+{pending_section}
 <p class="copies-note">Reported volume comes from DexScreener/GeckoTerminal, not verified. First seen = QED watch time. See <a href="/stats">stats</a> and the <a href="/guide/verify-a-stock-token">verification guide</a>.</p>
 </section>"#
     );
@@ -503,10 +530,7 @@ fn flagged_copy_button() -> &'static str {
     "<span class=\"copy-disabled\" title=\"Caution: copy disabled for a flagged address\"><button class=\"copy-button\" type=\"button\" aria-disabled=\"true\" aria-label=\"Caution: copy disabled for a flagged address\" tabindex=\"-1\"><svg aria-hidden=\"true\" focusable=\"false\"><use href=\"/static/icons.svg#copy\"></use></svg></button></span>"
 }
 
-fn render_copies_table(
-    entries: &[&crate::adapters::discovery::ImpostorEntry],
-    caution: bool,
-) -> String {
+fn render_copies_table(entries: &[&crate::adapters::discovery::ImpostorEntry]) -> String {
     let rows = entries.iter().enumerate().map(|(index, entry)| {
         let name = html_escape(entry.on_chain_name.as_deref().unwrap_or(&entry.name));
         let symbol = html_escape(entry.on_chain_symbol.as_deref().unwrap_or(&entry.symbol));
@@ -521,10 +545,10 @@ fn render_copies_table(
         };
         let volume = entry.volume_24h_usd.filter(|value| value.is_finite() && *value >= 0.0)
             .map_or("—".to_owned(), format_reported_usd);
-        let verdict = if caution {
-            "<span class=\"caution-badge\">Unknown / Caution</span>".to_owned()
-        } else {
-            format!("<a class=\"deny-badge\" href=\"{guard_url}\" rel=\"nofollow\">Deny</a>")
+        let verdict = match entry.tier {
+            Some(crate::domain::guard::PublisherProductTier::Caution) => "<span class=\"caution-badge\">Unknown / Caution</span>".to_owned(),
+            Some(crate::domain::guard::PublisherProductTier::Confirmed) => format!("<a class=\"deny-badge\" href=\"{guard_url}\" rel=\"nofollow\">Deny</a>"),
+            None => "<span>Pending</span>".to_owned(),
         };
         format!(
             "<tr><td data-label=\"#\">{}</td><td data-label=\"Copies\"><strong>{} ({})</strong><small>{}</small></td><td data-label=\"Chain\">{}</td><td data-label=\"Address\"><span class=\"copies-address\">{} {}</span></td><td data-label=\"Reported 24h volume\">{}</td><td data-label=\"First seen\">{}</td><td data-label=\"Verdict\">{}</td></tr>",
@@ -584,13 +608,15 @@ pub(crate) fn render_stats_page(
     let confirmed_entries = recent_entries
         .iter()
         .copied()
-        .filter(|entry| entry.tier == crate::domain::guard::PublisherProductTier::Confirmed)
+        .filter(|entry| entry.tier == Some(crate::domain::guard::PublisherProductTier::Confirmed))
         .collect::<Vec<_>>();
     let caution_entries = recent_entries
         .iter()
         .copied()
-        .filter(|entry| entry.tier == crate::domain::guard::PublisherProductTier::Caution)
+        .filter(|entry| entry.tier == Some(crate::domain::guard::PublisherProductTier::Caution))
         .collect::<Vec<_>>();
+    let pending_entries =
+        recent_entries.iter().copied().filter(|entry| entry.tier.is_none()).collect::<Vec<_>>();
     let confirmed_volume = reported_volume(&confirmed_entries);
     let caution_volume = reported_volume(&caution_entries);
     let total_volume_line = format!(
@@ -600,16 +626,24 @@ pub(crate) fn render_stats_page(
     let copies_link = "<p><a href=\"/copies\">See all copies by chain → /copies</a></p>";
     let confirmed_table = render_flagged_table(
         &confirmed_entries,
-        crate::domain::guard::PublisherProductTier::Confirmed,
+        Some(crate::domain::guard::PublisherProductTier::Confirmed),
         registry,
         &board.entries,
     );
     let caution_table = render_flagged_table(
         &caution_entries,
-        crate::domain::guard::PublisherProductTier::Caution,
+        Some(crate::domain::guard::PublisherProductTier::Caution),
         registry,
         &board.entries,
     );
+    let pending_section = if pending_entries.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<h3>Pending classification</h3><p class=\"stats-evidence-note\">No tier has been derived from current publisher metadata. QED retries at startup and hourly; pending is not Caution or Deny.</p>{}",
+            render_flagged_table(&pending_entries, None, registry, &board.entries)
+        )
+    };
     let last_scanned_at = if watch.last_scanned_at.is_empty() {
         "Not yet scanned".to_owned()
     } else {
@@ -660,6 +694,7 @@ pub(crate) fn render_stats_page(
   <h3>Caution — near matches</h3>
   <p class="stats-evidence-note">Similar to an issuer product, but QED could not confirm a mismatch.</p>
   {caution_table}
+  {pending_section}
 </section>
 <details class="stats-details">
   <summary>Method, counts and downloads</summary>
@@ -729,7 +764,7 @@ fn reported_volume(entries: &[&crate::adapters::discovery::ImpostorEntry]) -> f6
 
 fn render_flagged_table(
     entries: &[&crate::adapters::discovery::ImpostorEntry],
-    tier: crate::domain::guard::PublisherProductTier,
+    tier: Option<crate::domain::guard::PublisherProductTier>,
     registry: &[crate::domain::registry::Entry],
     leaderboard: &[crate::adapters::discovery::LeaderboardEntry],
 ) -> String {
@@ -738,8 +773,9 @@ fn render_flagged_table(
         visible.map(|entry| render_flagged_row(entry, registry, leaderboard)).collect::<String>();
     let rows = if rows.is_empty() {
         let label = match tier {
-            crate::domain::guard::PublisherProductTier::Confirmed => "confirmed mismatches",
-            crate::domain::guard::PublisherProductTier::Caution => "caution near matches",
+            Some(crate::domain::guard::PublisherProductTier::Confirmed) => "confirmed mismatches",
+            Some(crate::domain::guard::PublisherProductTier::Caution) => "caution near matches",
+            None => "pending classifications",
         };
         format!("<tr><td colspan=\"5\">No {label} are currently shown.</td></tr>")
     } else {
@@ -787,8 +823,8 @@ fn render_flagged_row(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let reason = match (entry.on_chain_symbol.as_deref(), entry.on_chain_name.as_deref()) {
-        (Some(symbol), Some(name))
+    let reason = match (entry.tier, entry.on_chain_symbol.as_deref(), entry.on_chain_name.as_deref()) {
+        (Some(tier), Some(symbol), Some(name))
             if !symbol.is_empty()
                 && !name.is_empty()
                 && !entry.ticker.is_empty()
@@ -800,7 +836,7 @@ fn render_flagged_row(
                 html_escape(symbol),
                 html_escape(name),
             );
-            match entry.tier {
+            match tier {
                 crate::domain::guard::PublisherProductTier::Confirmed => format!(
                     "The {identity} exactly match the {} product published by {}. The publisher catalog lists official deployments on {}; this address is absent from those deployments.",
                     html_escape(&entry.ticker),
@@ -814,16 +850,18 @@ fn render_flagged_row(
                 ),
             }
         }
+        (None, _, _) => "Current classification is pending publisher metadata. QED retries at startup and hourly; no Caution or Deny tier has been derived.".to_owned(),
         _ => html_escape(&display_catalog_reason(&entry.reason)),
     };
     let (row_class, status_mark) = match entry.tier {
-        crate::domain::guard::PublisherProductTier::Confirmed => (
+        Some(crate::domain::guard::PublisherProductTier::Confirmed) => (
             "stats-token-row--deny",
             "<span class=\"deny-icon\" role=\"img\" aria-label=\"Deny — claims a product its publisher does not list\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M12 2.5 21.5 21H2.5L12 2.5Z\"/><path d=\"M12 8v6m0 3h.01\"/></svg></span>",
         ),
-        crate::domain::guard::PublisherProductTier::Caution => {
+        Some(crate::domain::guard::PublisherProductTier::Caution) => {
             ("stats-token-row--caution", "<span class=\"caution-badge\">Caution</span>")
         }
+        None => ("", "<span>Pending</span>"),
     };
     let listed_name = html_escape(&entry.name);
     let listed_symbol = html_escape(&entry.symbol);
@@ -2920,7 +2958,8 @@ mod tests {
             address: "0x0000000000000000000000000000000000000001".to_owned(),
             first_seen_at: "2026-10-06T01:02:00Z".to_owned(),
             last_seen_at: "2026-10-07T03:04:00Z".to_owned(),
-            tier: crate::domain::guard::PublisherProductTier::Confirmed,
+            tier: Some(crate::domain::guard::PublisherProductTier::Confirmed),
+            tier_derived: true,
             volume_24h_usd: Some(1234.5),
             liquidity_24h_usd: Some(456.78),
             pool_count: Some(2),
@@ -4234,7 +4273,8 @@ mod copies_page_tests {
             address: format!("address-{name}"),
             first_seen_at: "2026-10-06T01:02:00Z".to_owned(),
             last_seen_at: "2026-10-07T03:04:00Z".to_owned(),
-            tier,
+            tier: Some(tier),
+            tier_derived: true,
             volume_24h_usd: volume,
             liquidity_24h_usd: None,
             pool_count: None,

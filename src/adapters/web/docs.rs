@@ -1682,7 +1682,7 @@ mod openapi {
       "CatalogAbsentToken": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["chain", "chain_label", "ticker", "publisher", "source", "symbol", "name", "address", "first_seen_at", "last_seen_at", "tier", "volume_24h_usd", "guard_url", "reason", "reads", "evidence_truncated"],
+        "required": ["chain", "chain_label", "ticker", "publisher", "source", "symbol", "name", "address", "first_seen_at", "last_seen_at", "volume_24h_usd", "guard_url", "reason", "reads", "evidence_truncated"],
         "properties": {
           "chain": { "type": "string", "maxLength": 32 },
           "chain_label": { "type": "string", "maxLength": 64 },
@@ -1693,7 +1693,8 @@ mod openapi {
           "name": { "type": "string", "maxLength": 64, "description": "Reported by the source named in source." },
           "address": { "type": "string", "maxLength": 128 },
           "first_seen_at": { "type": "string", "format": "date-time", "maxLength": 64 },
-          "tier": { "type": "string", "enum": ["confirmed", "caution"], "description": "confirmed requires byte-exact on-chain symbol/name identity and a complete publisher catalog; caution is a normalized near match or an incomplete catalog and never denies." },
+          "tier": { "type": "string", "enum": ["confirmed", "caution"], "description": "Derived by the same publisher-product classifier as Guard. confirmed requires byte-exact on-chain symbol/name identity and a complete publisher catalog; caution is a normalized near match or an incomplete catalog and never denies. Absent when classification is pending; unavailable metadata retains only a previously derived tier. Retried at startup and hourly." },
+          "tier_derived": { "type": "boolean", "description": "True when tier was derived from Guard or current publisher metadata, distinguishing it from legacy implicit Caution defaults. Absent on legacy records." },
           "last_seen_at": { "type": "string", "format": "date-time", "maxLength": 64 },
           "volume_24h_usd": { "type": ["number", "null"], "minimum": 0, "description": "Reported by the source named in source; not independently validated." },
           "liquidity_24h_usd": { "type": ["number", "null"], "minimum": 0, "description": "Reported by the source named in source; absent on legacy observations." },
