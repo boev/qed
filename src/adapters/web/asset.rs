@@ -50,11 +50,14 @@ pub(crate) struct AssetView {
     pub guard_url: String,
     pub proof_url: String,
     pub short_address: String,
+    pub flagged_address_html: String,
+    pub flagged_short_address_html: String,
     pub label: String,
     pub tone: &'static str,
     pub confirmed: String,
     pub next_check: String,
     pub misses: u32,
+    pub flagged: bool,
     pub facts: Vec<FactView>,
     pub controls: Vec<String>,
 }
@@ -77,7 +80,7 @@ pub(crate) struct PointView {
     pub time: String,
     pub human_time: String,
     observed_at: DateTime<Utc>,
-    pub asset: String,
+    pub asset_html: String,
     pub facet: &'static str,
     pub outcome: &'static str,
     pub reason: String,
@@ -93,7 +96,7 @@ pub(crate) struct PointView {
 }
 #[derive(Debug)]
 pub(crate) struct LaneView {
-    pub label: String,
+    pub label_html: String,
     pub y: usize,
     pub label_y: usize,
 }
@@ -158,6 +161,11 @@ pub(super) fn fill_pool_fallbacks(
         if let Some(asset) = history.assets.iter_mut().find(|asset| asset.path == path) {
             asset.summary = fallback_summary(entry);
             asset.label = fallback_label(&entry.verdict, &entry.read_status).into();
+            asset.flagged |= matches!(asset.label.as_str(), "Mismatch" | "No match")
+                || context
+                    .history
+                    .state(&key, Facet::Guard)
+                    .is_some_and(|state| state.label() == "Deny");
             asset.confirmed = entry
                 .checked_at
                 .as_deref()
@@ -172,6 +180,34 @@ pub(super) fn fill_pool_fallbacks(
                 .as_ref()
                 .map(|id| format!("/v/{id}/verify"))
                 .unwrap_or_default();
+        }
+    }
+}
+pub(crate) fn finalize(history: &mut HistoryView) {
+    for asset in &mut history.assets {
+        if asset.flagged {
+            asset.flagged_address_html = super::pages::flagged_address_html(&asset.address);
+            asset.flagged_short_address_html =
+                super::pages::flagged_address_html(&asset.short_address);
+        } else {
+            asset.flagged_address_html.clear();
+            asset.flagged_short_address_html.clear();
+        }
+    }
+    for asset in history.assets.iter().filter(|asset| asset.flagged) {
+        let plain_label = crate::adapters::content::html_escape(&format!(
+            "{} · {} · {}",
+            asset.chain, asset.kind, asset.short_address
+        ));
+        let prefix =
+            crate::adapters::content::html_escape(&format!("{} · {} · ", asset.chain, asset.kind));
+        let address = crate::adapters::content::html_escape(&asset.short_address);
+        for lane in &mut history.lanes {
+            if lane.label_html == plain_label {
+                lane.label_html = format!(
+                    "{prefix}<tspan class=\"history-lane-warning\" role=\"img\" aria-label=\"Danger - copying explicitly disabled!\" title=\"Danger - copying explicitly disabled!\">⚠</tspan><tspan class=\"history-lane-danger-label\"> Danger</tspan><tspan class=\"history-lane-flagged-address\"> {address}</tspan>"
+                );
+            }
         }
     }
 }
@@ -225,6 +261,7 @@ pub(crate) async fn prepare(
     assets: Vec<AssetKey>,
     path: String,
     query: &HistoryQuery,
+    watch_entries: &[&super::super::discovery::ImpostorEntry],
 ) -> HistoryView {
     let now = context.clock.now();
     let mut inventories = std::collections::HashMap::new();
@@ -256,6 +293,16 @@ pub(crate) async fn prepare(
         let state = context.history.state(key, facet);
         let label = state.as_ref().map_or("Not read yet", AssetState::label).to_owned();
         let misses = state.as_ref().map_or(0, |state| state.consecutive_misses);
+        let flagged = matches!(label.as_str(), "Mismatch" | "No match")
+            || context
+                .history
+                .state(key, Facet::Guard)
+                .is_some_and(|state| state.label() == "Deny")
+            || watch_entries.iter().any(|entry| {
+                entry.tier.is_some()
+                    && Chain::from_network_name(&entry.chain) == Some(key.chain)
+                    && crate::domain::check::same_contract(&entry.address, &key.address, key.chain)
+            });
         let confirmed_at = state
             .as_ref()
             .and_then(|state| state.last_confirmed.as_ref())
@@ -278,17 +325,24 @@ pub(crate) async fn prepare(
         ];
         view.assets.push(AssetView {
             path: key.path(),
+            flagged,
             address: key.address.clone(),
             short_address: short_address(&key.address),
             chain: key.chain.to_string(),
             kind: if key.kind == SubjectKind::Pool { "pool" } else { "token" },
+            flagged_address_html: String::new(),
+            flagged_short_address_html: String::new(),
             summary: summary(state.as_ref()),
             label: if (1..3).contains(&misses) {
                 format!("Retrying {misses}/3")
             } else {
                 label.clone()
             },
-            tone: if matches!(label.as_str(), "Mismatch" | "Deny") { "deny" } else { "unknown" },
+            tone: if matches!(label.as_str(), "Mismatch" | "No match" | "Deny") {
+                "deny"
+            } else {
+                "unknown"
+            },
             confirmed: confirmed_at.map(human_time).unwrap_or_else(|| "No completed read".into()),
             next_check: next
                 .map(|time| if time <= now { "due now".into() } else { human_time(time) })
@@ -346,14 +400,27 @@ pub(crate) async fn prepare(
                     short_address(&key.address)
                 )
             };
-            view.lanes.push(LaneView { label, y, label_y: y - 16 });
+            let label_html = if flagged && !exact {
+                format!(
+                    "{}<tspan class=\"history-lane-warning\" role=\"img\" aria-label=\"Danger - copying explicitly disabled!\" title=\"Danger - copying explicitly disabled!\">⚠</tspan><tspan class=\"history-lane-danger-label\"> Danger</tspan><tspan class=\"history-lane-flagged-address\"> {}</tspan>",
+                    crate::adapters::content::html_escape(&format!(
+                        "{} · {} · ",
+                        key.chain,
+                        if key.kind == SubjectKind::Pool { "pool" } else { "token" }
+                    )),
+                    crate::adapters::content::html_escape(&short_address(&key.address))
+                )
+            } else {
+                crate::adapters::content::html_escape(&label)
+            };
+            view.lanes.push(LaneView { label_html, y, label_y: y - 16 });
             for event in lane {
                 let x = 280
                     + ((event.observed_at - since).num_seconds().clamp(0, i64::from(days) * 86400)
                         as u64
                         * 590
                         / (u64::from(days) * 86400)) as usize;
-                let row = point(event, x, y);
+                let row = point(event, x, y, flagged);
                 // Merge crowded points on the same horizontal lane, never invent vertical time.
                 if let Some(previous) =
                     view.points.last_mut().filter(|point| point.y == y && x < point.x + 14)
@@ -535,8 +602,20 @@ pub(crate) fn fill_facts(
         }
     }
 }
-fn point(event: &Observation, x: usize, y: usize) -> PointView {
+fn point(event: &Observation, x: usize, y: usize, asset_flagged: bool) -> PointView {
     let reason = event.miss_reason.clone().unwrap_or_default();
+    let flagged = asset_flagged
+        || matches!(event.outcome, Outcome::Mismatch | Outcome::NoMatch | Outcome::Deny);
+    let address = short_address(&event.asset.address);
+    let asset_html = if flagged {
+        format!(
+            "{} {}",
+            crate::adapters::content::html_escape(&event.asset.chain.to_string()),
+            super::pages::flagged_address_html(&address)
+        )
+    } else {
+        crate::adapters::content::html_escape(&format!("{} {address}", event.asset.chain))
+    };
     let position = event
         .block
         .map(|block| format!("block {block}"))
@@ -571,7 +650,7 @@ fn point(event: &Observation, x: usize, y: usize) -> PointView {
         time,
         human_time: human_time(event.observed_at),
         observed_at: event.observed_at,
-        asset: format!("{} {}", event.asset.chain, short_address(&event.asset.address)),
+        asset_html,
         facet: facet_label(event.facet),
         outcome: event.outcome.label(),
         reason,
@@ -621,6 +700,8 @@ pub(crate) async fn page(
             contract: key.address.clone(),
             explorer_url: super::views::explorer_link(key.chain, &key.address),
             source_url: String::new(),
+            flagged: false,
+            flagged_address_html: String::new(),
             powers: DirectoryPowersView::unavailable(),
         });
     }
@@ -671,8 +752,30 @@ pub(crate) async fn page(
         .into_iter()
         .collect::<Vec<_>>()
         .join(" · ");
-    let mut history = prepare(&state.app, vec![key], path, &query).await;
+    let recent_watch =
+        super::api::recent_catalog_entries(&board.impostors.entries, Utc::now().timestamp());
+    let mut history = prepare(&state.app, vec![key.clone()], path, &query, &recent_watch).await;
     fill_pool_fallbacks(&state.app, &board.entries, &mut history);
+    finalize(&mut history);
+    for asset in &history.assets {
+        if !asset.flagged {
+            continue;
+        }
+        for contract in &mut contracts {
+            if contract.chain_kind == key.chain
+                && crate::domain::check::same_contract(
+                    &contract.contract,
+                    &asset.address,
+                    key.chain,
+                )
+            {
+                contract.flagged = true;
+                contract.flagged_address_html =
+                    super::pages::flagged_address_html(&contract.contract);
+                contract.explorer_url.clear();
+            }
+        }
+    }
     fill_facts(&state.app, &registry, &contracts, &board.entries, &mut history);
     render_page(
         TokenTemplate {

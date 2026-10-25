@@ -114,7 +114,7 @@
             <td class="number-cell change-cell {{ row.change_class }}" data-label="24h change">{{ row.change }}</td>
             <td class="number-cell" data-label="24h volume">{{ row.volume }}</td>
             <td class="number-cell" data-label="Liquidity">{{ row.liquidity }}</td>
-            <td class="trade-cell" data-label="Market"><a class="market-link" href="{{ row.trade_url }}" title="External market page; QED checks contract match only." aria-label="Open market page for {{ row.base_symbol }} / {{ row.quote_symbol }}" target="_blank" rel="noopener noreferrer"><span class="market-label">Market</span><span class="market-icon" aria-hidden="true">↗</span></a></td>
+            <td class="trade-cell" data-label="Market">{% if row.trade_url.len() > 0 %}<a class="market-link" href="{{ row.trade_url }}" title="External market page; QED checks contract match only." aria-label="Open market page for {{ row.base_symbol }} / {{ row.quote_symbol }}" target="_blank" rel="noopener noreferrer"><span class="market-label">Market</span><span class="market-icon" aria-hidden="true">↗</span></a>{% endif %}</td>
           </tr>
         {% endfor %}
         {% if leaderboard.building %}

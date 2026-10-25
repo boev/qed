@@ -7121,7 +7121,6 @@ mod tests {
         assert_eq!(stored["address"], address.as_str());
         assert_eq!(stored["reason"].as_str().map(str::len), Some(MAX_IMPOSTOR_REASON_BYTES));
         assert_eq!(stored["evidence_truncated"], true);
-        assert!(String::from_utf8_lossy(&snapshot.html).contains(address.as_str()));
     }
 
     #[tokio::test]

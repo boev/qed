@@ -349,13 +349,14 @@ pub(crate) async fn copies_page(
         &board.impostors.entries,
         chrono::Utc::now().timestamp(),
     );
-    render_copies_page(&state, &entries, &registry, query.chain.as_deref())
+    render_copies_page(&state, &entries, &registry, &board.entries, query.chain.as_deref())
 }
 
 fn render_copies_page(
     state: &AppState,
     entries: &[&crate::adapters::discovery::ImpostorEntry],
     registry: &[Entry],
+    leaderboard: &[crate::adapters::discovery::LeaderboardEntry],
     requested_chain: Option<&str>,
 ) -> Result<Html<String>, StatusCode> {
     use crate::domain::guard::PublisherProductTier as Tier;
@@ -438,14 +439,14 @@ fn render_copies_page(
         },
         |entry| render_copy_hero(entry, registry),
     );
-    let table = render_copies_table(&filtered_confirmed);
-    let caution_table = render_copies_table(&filtered_caution);
+    let table = render_copies_table(&filtered_confirmed, registry, leaderboard);
+    let caution_table = render_copies_table(&filtered_caution, registry, leaderboard);
     let pending_section = if filtered_pending.is_empty() {
         String::new()
     } else {
         format!(
             "<section aria-labelledby=\"copies-pending-title\"><h2 id=\"copies-pending-title\">Pending classification</h2><p>No current tier has been derived for these observations. QED retries publisher metadata at startup and hourly; pending is not Caution or Deny.</p>{}</section>",
-            render_copies_table(&filtered_pending)
+            render_copies_table(&filtered_pending, registry, leaderboard)
         )
     };
     let total = reported_volume(&filtered_confirmed);
@@ -464,7 +465,7 @@ fn render_copies_page(
 {hero}
 <nav class="copies-tabs" aria-label="Filter copies by chain">{tabs}</nav>
 {table_section}
-<details class="copies-near-matches"><summary>Near matches (caution)</summary>{caution_table}</details>
+<details class="copies-near-matches" id="caution"><summary>Near matches (caution)</summary>{caution_table}</details>
 {pending_section}
 <p class="copies-note">Reported volume comes from DexScreener/GeckoTerminal, not verified. First seen = QED watch time. See <a href="/stats">stats</a> and the <a href="/guide/verify-a-stock-token">verification guide</a>.</p>
 </section>"#
@@ -515,35 +516,43 @@ fn render_copy_hero(
     });
     let symbol = entry.on_chain_symbol.as_deref().unwrap_or(&entry.symbol);
     let name = entry.on_chain_name.as_deref().unwrap_or(&entry.name);
-    let address = html_escape(&entry.address);
     let guard_url = html_escape(&entry.guard_url);
     let comparison = match official {
-        Some(official) => address_comparison_html(
+        Some(official) => address_comparison_html_with_flagged_observed(
             &entry.address,
             official,
-            &format!("Real · published by {}", entry.publisher),
-            "Copy · not in the issuer's catalog",
+            &format!("Published by {}", entry.publisher),
+            "Copy",
             chain.unwrap_or(crate::domain::chain::Chain::Ethereum),
+            true,
         ),
-
         None => format!(
-            "<div class=\"addr-compare\"><div class=\"addr-row addr-row--copy\"><span class=\"addr-label\">Copy · not in the issuer's catalog</span><code>{address}</code></div></div>"
+            "<div class=\"addr-compare\"><div class=\"addr-row addr-row--copy\"><span class=\"addr-label\">Copy</span>{}</div></div>",
+            flagged_address_html(&entry.address)
         ),
     };
     format!(
-        "<section class=\"copies-hero\" aria-labelledby=\"copies-hero-title\"><p class=\"eyebrow\">Largest confirmed copy by reported 24h volume</p><h2 id=\"copies-hero-title\">{} <span>({})</span></h2><p>Product published by {} · {} · {}</p>{}<p class=\"copies-hero-volume\">{}<small>reported 24h volume</small></p><a class=\"deny-badge\" href=\"{}\" rel=\"nofollow\">Deny · View Guard</a> {}</section>",
+        r#"<section class="copies-hero" aria-labelledby="copies-hero-title">
+  <div class="copies-hero-summary">
+    <p class="eyebrow">Largest confirmed copy by reported volume</p>
+    <h2 id="copies-hero-title">{} <span>({})</span></h2>
+    <p>Published by {} · {} · {}</p>
+    <p class="copies-hero-volume">{}<small>reported 24h volume</small></p>
+  </div>
+  <div class="copies-hero-addresses" role="group" aria-label="Published and observed addresses">{}</div>
+  <div class="copies-hero-actions"><span class="deny-badge">Deny</span><a class="copies-guard-link" href="{}" rel="nofollow">Open Guard review →</a></div>
+</section>"#,
         html_escape(name),
         html_escape(symbol),
         html_escape(&entry.publisher),
         html_escape(&entry.ticker),
         html_escape(&entry.chain_label),
-        comparison,
         entry
             .volume_24h_usd
             .filter(|value| value.is_finite() && *value >= 0.0)
             .map_or("—".to_owned(), format_card_reported_usd),
+        comparison,
         guard_url,
-        flagged_copy_button(),
     )
 }
 
@@ -559,14 +568,24 @@ fn push_escaped_char(output: &mut String, character: char) {
     }
 }
 
-/// Two addresses stacked in the same type size; only shared beginning and ending runs
-/// are highlighted, using the chain's address comparison rules.
-pub(crate) fn address_comparison_html(
+pub(crate) fn flagged_address_html(address: &str) -> String {
+    let escaped = html_escape(address);
+    flagged_address_content_html(&escaped)
+}
+
+fn flagged_address_content_html(rendered: &str) -> String {
+    format!(
+        "<span class=\"flagged-address\"><span class=\"flagged-address-marker\"><span class=\"danger-address-icon\" role=\"img\" aria-label=\"Danger - copying explicitly disabled!\" title=\"Danger - copying explicitly disabled!\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M12 2.5 21.5 21H2.5L12 2.5Z\"/><path d=\"M12 8v6m0 3h.01\"/></svg></span><span class=\"danger-address-label\">Danger</span></span><span class=\"visually-hidden\">Flagged address: </span><code class=\"flagged-address-value\">{rendered}</code></span>"
+    )
+}
+
+pub(super) fn address_comparison_html_with_flagged_observed(
     observed: &str,
     official: &str,
     official_label: &str,
     observed_label: &str,
     chain: crate::domain::chain::Chain,
+    flagged_observed: bool,
 ) -> String {
     let similarity = crate::domain::address_similarity::compare(observed, official, chain);
     let comparable_char_count = |address: &str| {
@@ -611,7 +630,17 @@ pub(crate) fn address_comparison_html(
         rendered
     };
     let official_html = format_address(official);
+    let explorer_url = html_escape(&super::views::explorer_link(chain, official));
+    let official_address = html_escape(official);
+    let official_html = format!(
+        "<span class=\"official-address-value\"><code>{official_html}</code><span class=\"official-address-actions\"><a href=\"{explorer_url}\" target=\"_blank\" rel=\"noopener noreferrer\" aria-label=\"Open issuer-published address in explorer\">↗</a><button class=\"copy-button\" type=\"button\" data-copy=\"{official_address}\" aria-label=\"Copy issuer-published address\" title=\"Copy issuer-published address\"><svg aria-hidden=\"true\" focusable=\"false\"><use href=\"/static/icons.svg#copy\"></use></svg></button></span></span>"
+    );
     let observed_html = format_address(observed);
+    let observed_html = if flagged_observed {
+        flagged_address_content_html(&observed_html)
+    } else {
+        format!("<code>{observed_html}</code>")
+    };
     let explanation = match (prefix, suffix) {
         (true, true) => format!(
             "<p class=\"addr-similarity\">Same first {} and last {} characters as the real address.</p>",
@@ -628,49 +657,58 @@ pub(crate) fn address_comparison_html(
         (false, false) => String::new(),
     };
     format!(
-        "<div class=\"addr-compare{}\"><div class=\"addr-row addr-row--real\"><span class=\"addr-label\">{}</span><code>{}</code></div><div class=\"addr-row addr-row--copy\"><span class=\"addr-label\">{}</span><code>{}</code></div>{}</div>",
+        "<div class=\"addr-compare{}\"><div class=\"addr-row addr-row--copy\"><span class=\"addr-label\">{}</span>{}</div><div class=\"addr-row addr-row--real\"><span class=\"addr-label\">{}</span>{}</div>{}</div>",
         if identical { " addr-compare--match" } else { "" },
-        html_escape(official_label),
-        official_html,
         html_escape(observed_label),
         observed_html,
+        html_escape(official_label),
+        official_html,
         explanation,
     )
 }
 
-/// Copy control for addresses QED flags: visibly disabled, never copies, and says why.
-fn flagged_copy_button() -> &'static str {
-    "<span class=\"copy-disabled\" title=\"Caution: copy disabled for a flagged address\"><button class=\"copy-button\" type=\"button\" aria-disabled=\"true\" aria-label=\"Caution: copy disabled for a flagged address\" tabindex=\"-1\"><svg aria-hidden=\"true\" focusable=\"false\"><use href=\"/static/icons.svg#copy\"></use></svg></button></span>"
-}
-
-fn render_copies_table(entries: &[&crate::adapters::discovery::ImpostorEntry]) -> String {
-    let rows = entries.iter().enumerate().map(|(index, entry)| {
-        let name = html_escape(entry.on_chain_name.as_deref().unwrap_or(&entry.name));
-        let symbol = html_escape(entry.on_chain_symbol.as_deref().unwrap_or(&entry.symbol));
-        let guard_url = html_escape(&entry.guard_url);
-        let explorer_url = crate::domain::chain::Chain::from_network_name(&entry.chain)
-            .map(|chain| super::views::explorer_link(chain, &entry.address))
-            .unwrap_or_default();
-        let address_link = if explorer_url.is_empty() {
-            format!("<code>{}</code>", html_escape(&short_address(&entry.address)))
-        } else {
-            format!("<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"><code>{}</code> ↗</a>", html_escape(&explorer_url), html_escape(&short_address(&entry.address)))
-        };
-        let volume = entry.volume_24h_usd.filter(|value| value.is_finite() && *value >= 0.0)
-            .map_or("—".to_owned(), format_reported_usd);
-        let verdict = match entry.tier {
-            Some(crate::domain::guard::PublisherProductTier::Caution) => "<span class=\"caution-badge\">Unknown / Caution</span>".to_owned(),
-            Some(crate::domain::guard::PublisherProductTier::Confirmed) => format!("<a class=\"deny-badge\" href=\"{guard_url}\" rel=\"nofollow\">Deny</a>"),
-            None => "<span>Pending</span>".to_owned(),
-        };
-        format!(
-            "<tr><td data-label=\"#\">{}</td><td data-label=\"Copies\"><strong>{} ({})</strong><small>{}</small></td><td data-label=\"Chain\">{}</td><td data-label=\"Address\"><span class=\"copies-address\">{} {}</span></td><td data-label=\"Reported 24h volume\">{}</td><td data-label=\"First seen\">{}</td><td data-label=\"Verdict\">{}</td></tr>",
-            index + 1, name, symbol, html_escape(&entry.publisher), html_escape(&entry.chain_label),
-            address_link, flagged_copy_button(), volume, human_utc_time(&entry.first_seen_at), verdict
-        )
-    }).collect::<String>();
+fn render_copies_table(
+    entries: &[&crate::adapters::discovery::ImpostorEntry],
+    registry: &[crate::domain::registry::Entry],
+    leaderboard: &[crate::adapters::discovery::LeaderboardEntry],
+) -> String {
+    let rows = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let name = html_escape(entry.on_chain_name.as_deref().unwrap_or(&entry.name));
+            let symbol = html_escape(entry.on_chain_symbol.as_deref().unwrap_or(&entry.symbol));
+            let flagged = entry.tier.is_some();
+            let address = if flagged {
+                flagged_address_html(&short_address(&entry.address))
+            } else {
+                format!("<code>{}</code>", html_escape(&short_address(&entry.address)))
+            };
+            let volume = entry
+                .volume_24h_usd
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .map_or("—".to_owned(), format_reported_usd);
+            let verdict = match entry.tier {
+                Some(crate::domain::guard::PublisherProductTier::Confirmed) => {
+                    "<span class=\"deny-badge\">Deny</span>"
+                }
+                Some(crate::domain::guard::PublisherProductTier::Caution) => {
+                    "<span class=\"caution-badge\">Caution</span>"
+                }
+                None => "<span>Pending</span>",
+            };
+            let details = flagged_entry_details_html(entry, registry, leaderboard);
+            format!(
+                "<tr><th scope=\"row\" colspan=\"7\"><details class=\"copies-row\"><summary class=\"copies-row-summary\"><span data-label=\"#\"><span class=\"visually-hidden\">Rank: </span>{}</span><span data-label=\"Copies\"><span class=\"visually-hidden\">Copies: </span><strong>{name} ({symbol})</strong><small>{}</small></span><span data-label=\"Chain\"><span class=\"visually-hidden\">Chain: </span>{}</span><span data-label=\"Address\"><span class=\"visually-hidden\">Address: </span>{address}</span><span data-label=\"Reported 24h volume\"><span class=\"visually-hidden\">Reported 24h volume: </span>{volume}</span><span data-label=\"First seen\"><span class=\"visually-hidden\">First seen: </span>{}</span><span data-label=\"Verdict\"><span class=\"visually-hidden\">Verdict: </span>{verdict}</span></summary>{details}</details></th></tr>",
+                index + 1,
+                html_escape(&entry.publisher),
+                html_escape(&entry.chain_label),
+                copies_table_time(&entry.first_seen_at)
+            )
+        })
+        .collect::<String>();
     format!(
-        "<div class=\"table-wrap copies-table-wrap\"><table class=\"stack-table copies-table\"><thead><tr><th scope=\"col\">#</th><th scope=\"col\">Copies</th><th scope=\"col\">Chain</th><th scope=\"col\">Address</th><th scope=\"col\">Reported 24h volume</th><th scope=\"col\">First seen</th><th scope=\"col\">Verdict</th></tr></thead><tbody>{rows}</tbody></table></div>"
+        "<div class=\"table-wrap copies-table-wrap\"><table class=\"stack-table copies-table\"><caption class=\"visually-hidden\">Recent publisher-watch copy observations and evidence</caption><colgroup><col><col><col><col><col><col><col></colgroup><thead><tr><th scope=\"col\">#</th><th scope=\"col\">Copies</th><th scope=\"col\">Chain</th><th scope=\"col\">Address</th><th scope=\"col\">Reported 24h volume</th><th scope=\"col\">First seen (UTC)</th><th scope=\"col\">Verdict</th></tr></thead><tbody>{rows}</tbody></table></div>"
     )
 }
 pub(crate) fn render_stats_page(
@@ -736,25 +774,13 @@ pub(crate) fn render_stats_page(
         "<p class=\"stats-flagged-total\">Reported 24h volume across all flagged tokens: {} (DexScreener/GeckoTerminal, not verified)</p>",
         format_reported_usd(reported_volume(recent_entries)),
     );
-    let copies_link = "<p><a href=\"/copies\">See all copies by chain → /copies</a></p>";
-    let confirmed_table = render_flagged_table(
-        &confirmed_entries,
-        Some(crate::domain::guard::PublisherProductTier::Confirmed),
-        registry,
-        &board.entries,
-    );
-    let caution_table = render_flagged_table(
-        &caution_entries,
-        Some(crate::domain::guard::PublisherProductTier::Caution),
-        registry,
-        &board.entries,
-    );
+    let copies_link = "<p class=\"stats-copies-link\"><a href=\"/copies\">See all copies →</a> · <a href=\"/copies#caution\">Near matches (caution)</a></p>";
     let pending_section = if pending_entries.is_empty() {
         String::new()
     } else {
         format!(
             "<h3>Pending classification</h3><p class=\"stats-evidence-note\">No tier has been derived from current publisher metadata. QED retries at startup and hourly; pending is not Caution or Deny.</p>{}",
-            render_flagged_table(&pending_entries, None, registry, &board.entries)
+            render_flagged_table(&pending_entries, registry, &board.entries)
         )
     };
     let last_scanned_at = if watch.last_scanned_at.is_empty() {
@@ -801,12 +827,6 @@ pub(crate) fn render_stats_page(
   <h2 id="stats-evidence-title">Currently flagged tokens</h2>
   {total_volume_line}
   {copies_link}
-  <h3>Confirmed mismatches</h3>
-  <p class="stats-evidence-note">On-chain symbol and name exactly match an issuer product; the address is absent from the issuer's catalog.</p>
-  {confirmed_table}
-  <h3>Caution — near matches</h3>
-  <p class="stats-evidence-note">Similar to an issuer product, but QED could not confirm a mismatch.</p>
-  {caution_table}
   {pending_section}
 </section>
 <details class="stats-details">
@@ -877,7 +897,6 @@ fn reported_volume(entries: &[&crate::adapters::discovery::ImpostorEntry]) -> f6
 
 fn render_flagged_table(
     entries: &[&crate::adapters::discovery::ImpostorEntry],
-    tier: Option<crate::domain::guard::PublisherProductTier>,
     registry: &[crate::domain::registry::Entry],
     leaderboard: &[crate::adapters::discovery::LeaderboardEntry],
 ) -> String {
@@ -885,12 +904,7 @@ fn render_flagged_table(
     let rows =
         visible.map(|entry| render_flagged_row(entry, registry, leaderboard)).collect::<String>();
     let rows = if rows.is_empty() {
-        let label = match tier {
-            Some(crate::domain::guard::PublisherProductTier::Confirmed) => "confirmed mismatches",
-            Some(crate::domain::guard::PublisherProductTier::Caution) => "caution near matches",
-            None => "pending classifications",
-        };
-        format!("<tr><td colspan=\"5\">No {label} are currently shown.</td></tr>")
+        "<tr><td colspan=\"5\">No pending classifications are currently shown.</td></tr>".to_owned()
     } else {
         rows
     };
@@ -917,7 +931,7 @@ fn display_catalog_reason(reason: &str) -> String {
     }
 }
 
-fn render_flagged_row(
+fn flagged_entry_details_html(
     entry: &crate::adapters::discovery::ImpostorEntry,
     registry: &[crate::domain::registry::Entry],
     leaderboard: &[crate::adapters::discovery::LeaderboardEntry],
@@ -926,12 +940,13 @@ fn render_flagged_row(
         crate::adapters::discovery::MarketSource::Dexscreener => "DexScreener",
         crate::adapters::discovery::MarketSource::Geckoterminal => "GeckoTerminal",
     };
-    let ticker_registry = registry.iter().filter(|candidate| {
-        crate::domain::registry::matchable(candidate)
-            && candidate.issuer.eq_ignore_ascii_case(&entry.publisher)
-            && candidate.ticker.eq_ignore_ascii_case(&entry.ticker)
-    });
-    let official_networks = ticker_registry
+    let official_networks = registry
+        .iter()
+        .filter(|candidate| {
+            crate::domain::registry::matchable(candidate)
+                && candidate.issuer.eq_ignore_ascii_case(&entry.publisher)
+                && candidate.ticker.eq_ignore_ascii_case(&entry.ticker)
+        })
         .flat_map(crate::domain::registry::official_networks)
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -966,6 +981,44 @@ fn render_flagged_row(
         (None, _, _) => "Current classification is pending publisher metadata. QED retries at startup and hourly; no Caution or Deny tier has been derived.".to_owned(),
         _ => html_escape(&display_catalog_reason(&entry.reason)),
     };
+    let on_chain_name = html_escape(entry.on_chain_name.as_deref().unwrap_or(&entry.name));
+    let on_chain_symbol = html_escape(entry.on_chain_symbol.as_deref().unwrap_or(&entry.symbol));
+    let listed_name = html_escape(&entry.name);
+    let listed_symbol = html_escape(&entry.symbol);
+    let address = if entry.tier.is_some() {
+        flagged_address_html(&entry.address)
+    } else {
+        format!("<code>{}</code>", html_escape(&entry.address))
+    };
+    let volume = entry.volume_24h_usd.filter(|value| value.is_finite() && *value >= 0.0);
+    let volume_value = volume.map_or("—".to_owned(), format_reported_usd);
+    let liquidity = entry
+        .liquidity_24h_usd
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| format!("{} reported by {source}", format_reported_usd(value)));
+    let pool_count = entry.pool_count.map(|count| format!("{count} reported in this observation"));
+    let metrics = match (liquidity, pool_count) {
+        (Some(liquidity), Some(pool_count)) => format!(
+            "<p><strong>Liquidity:</strong> {liquidity} · <strong>Pool count:</strong> {pool_count}</p>"
+        ),
+        (Some(liquidity), None) => format!("<p><strong>Liquidity:</strong> {liquidity}</p>"),
+        (None, Some(pool_count)) => format!("<p><strong>Pool count:</strong> {pool_count}</p>"),
+        (None, None) => String::new(),
+    };
+    let diagram = flagged_volume_diagram(volume, entry, leaderboard);
+    format!(
+        "<div class=\"copies-row-detail-content\"><p><strong>Why flagged:</strong> {reason}</p><p><strong>On-chain name and symbol:</strong> {on_chain_name} ({on_chain_symbol})</p><p><strong>Market listing name and symbol:</strong> {listed_name} ({listed_symbol})</p><p><strong>Full address:</strong> {address}</p><p><strong>First seen:</strong> {} · <strong>Last seen:</strong> {}</p><p><strong>Reported 24h volume:</strong> {volume_value} · reported by {source}</p>{metrics}{diagram}<p><a class=\"copies-guard-link\" href=\"{}\" rel=\"nofollow\">Open Guard review →</a></p></div>",
+        human_utc_time(&entry.first_seen_at),
+        human_utc_time(&entry.last_seen_at),
+        html_escape(&entry.guard_url),
+    )
+}
+
+fn render_flagged_row(
+    entry: &crate::adapters::discovery::ImpostorEntry,
+    registry: &[crate::domain::registry::Entry],
+    leaderboard: &[crate::adapters::discovery::LeaderboardEntry],
+) -> String {
     let (row_class, status_mark) = match entry.tier {
         Some(crate::domain::guard::PublisherProductTier::Confirmed) => (
             "stats-token-row--deny",
@@ -976,56 +1029,27 @@ fn render_flagged_row(
         }
         None => ("", "<span>Pending</span>"),
     };
-    let listed_name = html_escape(&entry.name);
-    let listed_symbol = html_escape(&entry.symbol);
-    let address = html_escape(&entry.address);
-    let short = html_escape(&short_address(&entry.address));
-    let volume = entry.volume_24h_usd.filter(|value| value.is_finite() && *value >= 0.0);
-    let volume_html = volume.map_or_else(
-        || format!("—<small>reported by {source}</small>"),
-        |value| format!("{}<small>reported by {source}</small>", format_reported_usd(value)),
-    );
-    let guard_url = html_escape(&entry.guard_url);
-    let explorer_url = crate::domain::chain::Chain::from_network_name(&entry.chain)
-        .map(|chain| super::views::explorer_link(chain, &entry.address))
-        .unwrap_or_default();
-    let explorer_html = if explorer_url.is_empty() {
-        format!("<code>{address}</code>")
+    let name = html_escape(&entry.name);
+    let symbol = html_escape(&entry.symbol);
+    let address = if entry.tier.is_some() {
+        flagged_address_html(&short_address(&entry.address))
     } else {
-        format!(
-            "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"><code>{address}</code><span aria-hidden=\"true\"> ↗</span></a>",
-            html_escape(&explorer_url)
-        )
+        format!("<code>{}</code>", html_escape(&short_address(&entry.address)))
     };
-    let first_seen = human_utc_time(&entry.first_seen_at);
-    let liquidity_html =
-        entry.liquidity_24h_usd.filter(|value| value.is_finite() && *value >= 0.0).map_or_else(
-            || "Not retained in this observation".to_owned(),
-            |value| format!("{} reported by {source}", format_reported_usd(value)),
+    let source = match entry.source {
+        crate::adapters::discovery::MarketSource::Dexscreener => "DexScreener",
+        crate::adapters::discovery::MarketSource::Geckoterminal => "GeckoTerminal",
+    };
+    let volume =
+        entry.volume_24h_usd.filter(|value| value.is_finite() && *value >= 0.0).map_or_else(
+            || format!("—<small>reported by {source}</small>"),
+            |value| format!("{}<small>reported by {source}</small>", format_reported_usd(value)),
         );
-    let pool_count_html = entry.pool_count.map_or_else(
-        || "Not retained in this observation".to_owned(),
-        |count| format!("{count} reported in this observation"),
-    );
-    let last_seen = human_utc_time(&entry.last_seen_at);
-
-    let volume_value = volume.map_or("—".to_owned(), format_reported_usd);
-    let diagram = flagged_volume_diagram(volume, entry, leaderboard);
+    let details = flagged_entry_details_html(entry, registry, leaderboard);
     format!(
-        "<tr class=\"stats-token-row {row_class}\"><td>{status_mark} {}</td><td><strong>Listed as {}</strong><small>{} · reported by {}</small></td><td class=\"stats-address\"><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"><code title=\"Full address: {address}\">{short}</code><span aria-hidden=\"true\"> ↗</span></a></td><td class=\"stats-market-value\">{volume_html}</td><td>{}</td></tr><tr class=\"stats-expansion-row\"><td colspan=\"5\"><details class=\"stats-row-details\"><summary>Details</summary><div class=\"stats-row-detail-content\"><p><strong>Why flagged:</strong> {reason}</p><p><strong>Full address:</strong> {explorer_html}</p><p><strong>First seen:</strong> {} · <strong>Last seen:</strong> {}</p><p><strong>Reported 24h volume:</strong> {} · reported by {}</p><p><strong>Liquidity:</strong> {} · <strong>Pool count:</strong> {}</p>{diagram}<p><a href=\"{}\">Open Guard</a></p></div></details></td></tr>",
+        "<tr class=\"stats-token-row {row_class}\"><td>{status_mark} {}</td><td><strong>Listed as {name}</strong><small>{symbol} · reported by {source}</small></td><td class=\"stats-address\">{address}</td><td class=\"stats-market-value\">{volume}</td><td>{}</td></tr><tr class=\"stats-expansion-row\"><td colspan=\"5\"><details class=\"stats-row-details\"><summary>Details</summary>{details}</details></td></tr>",
         html_escape(&entry.chain_label),
-        listed_name,
-        listed_symbol,
-        source,
-        html_escape(&explorer_url),
-        first_seen,
-        first_seen,
-        last_seen,
-        volume_value,
-        source,
-        liquidity_html,
-        pool_count_html,
-        guard_url,
+        human_utc_time(&entry.first_seen_at),
     )
 }
 
@@ -1089,6 +1113,14 @@ fn format_card_reported_usd(value: f64) -> String {
     } else {
         format_reported_usd(value)
     }
+}
+
+fn copies_table_time(value: &str) -> String {
+    let escaped = html_escape(value);
+    let display = chrono::DateTime::parse_from_rfc3339(value)
+        .map(|time| time.with_timezone(&chrono::Utc).format("%-d %b %Y, %H:%M").to_string())
+        .unwrap_or_else(|_| escaped.clone());
+    format!("<time datetime=\"{escaped}\">{display}</time>")
 }
 
 fn human_utc_time(value: &str) -> String {
@@ -1300,14 +1332,20 @@ pub(crate) async fn token_page(
             .then_with(|| left.address.cmp(&right.address))
     });
     assets.dedup();
+    let recent_watch = super::api::recent_catalog_entries(
+        &leaderboard.impostors.entries,
+        chrono::Utc::now().timestamp(),
+    );
     let mut history = super::asset::prepare(
         &state.app,
         assets,
         format!("/tokens/{canonical_ticker}"),
         &history_query,
+        &recent_watch,
     )
     .await;
     super::asset::fill_pool_fallbacks(&state.app, &leaderboard.entries, &mut history);
+    super::asset::finalize(&mut history);
     super::asset::fill_facts(&state.app, &registry, &contracts, &leaderboard.entries, &mut history);
     let name = registry
         .iter()
@@ -1492,6 +1530,8 @@ pub(super) fn contract_view(entry: &Entry) -> DirectoryContractView {
         contract: entry.contract.clone(),
         explorer_url: super::views::explorer_link(entry.chain, &entry.contract),
         source_url: entry.source_url.clone(),
+        flagged: false,
+        flagged_address_html: String::new(),
         powers: DirectoryPowersView::unavailable(),
     }
 }
@@ -1608,17 +1648,22 @@ pub(super) fn pool_view(entry: &crate::adapters::discovery::LeaderboardEntry) ->
         _ => "is-unknown",
     }
     .to_owned();
+    let is_mismatch = matches!(verdict.as_str(), "mismatch" | "nomatch");
     let verdict = super::asset::fallback_summary(entry);
-    let trade_url = super::views::parse_chain(&entry.chain)
-        .map(|chain| {
-            crate::adapters::discovery::canonical_market_url_for_source(
-                chain,
-                &entry.pool,
-                Some(&entry.trade_url),
-                entry.source,
-            )
-        })
-        .unwrap_or_default();
+    let trade_url = if is_mismatch {
+        String::new()
+    } else {
+        super::views::parse_chain(&entry.chain)
+            .map(|chain| {
+                crate::adapters::discovery::canonical_market_url_for_source(
+                    chain,
+                    &entry.pool,
+                    Some(&entry.trade_url),
+                    entry.source,
+                )
+            })
+            .unwrap_or_default()
+    };
     DirectoryPoolView {
         dex: entry.dex.clone(),
         pair: super::views::ordered_pair_label(
@@ -2224,22 +2269,26 @@ fn statement_request_from_form(
     })
 }
 
-const STATEMENT_PURPOSE: &str = "A signed, re-checkable record of what a wallet set holds in registry tokens at a block height — for audits, reporting and counterparties.";
+const STATEMENT_PURPOSE: &str = "A signed statement records the issuer-published token balances held by a set of wallets at a block, and anyone can verify it later.";
 
 pub(crate) async fn statements_page(
     State(state): State<AppState>,
 ) -> Result<Html<String>, StatusCode> {
-    let form = r#"<section class="lookup statement-form-card" aria-labelledby="statement-form-heading">
+    let form = r#"<ol class="statement-steps" aria-label="How it works">
+  <li><span aria-hidden="true">1</span>Add wallets</li>
+  <li><span aria-hidden="true">2</span>Choose chains</li>
+  <li><span aria-hidden="true">3</span>Create a signed record</li>
+</ol>
+<section class="lookup statement-form-card" aria-labelledby="statement-form-heading">
   <h2 id="statement-form-heading">Create a statement</h2>
-  <p class="lookup-note">QED records registry-token balances and chain positions at the observed height. Balances are on-chain facts, not proof of ownership.</p>
   <form class="statement-form" action="/statements" method="post" hx-boost="false">
-    <label for="statement-label">Label (optional)</label>
-    <input id="statement-label" name="label" type="text" maxlength="80" autocomplete="off" placeholder="e.g. Q3 holdings report">
-    <label for="statement-wallets">Wallet addresses, one per line</label>
-    <textarea id="statement-wallets" name="wallets" rows="5" maxlength="1439" aria-describedby="statement-wallets-hint" placeholder="Paste wallet addresses here" required></textarea>
-    <p id="statement-wallets-hint" class="lookup-note" aria-live="polite">Up to 32 EVM or Solana addresses; one per line.</p>
+    <div class="statement-field">
+      <label for="statement-wallets">Wallet addresses</label>
+      <textarea id="statement-wallets" name="wallets" rows="4" maxlength="1439" aria-describedby="statement-wallets-hint" placeholder="One wallet address per line" required></textarea>
+      <p id="statement-wallets-hint" class="lookup-note" aria-live="polite">Up to 32 EVM or Solana addresses; one per line.</p>
+    </div>
     <fieldset class="statement-chain-set">
-      <legend>Chains</legend>
+      <legend>Chains to check</legend>
       <div class="statement-chain-options">
         <label class="statement-chain-option"><input type="checkbox" name="chains" value="solana" checked><span>Solana</span></label>
         <label class="statement-chain-option"><input type="checkbox" name="chains" value="robinhood"><span>Robinhood Chain</span></label>
@@ -2248,25 +2297,24 @@ pub(crate) async fn statements_page(
         <label class="statement-chain-option"><input type="checkbox" name="chains" value="bnb"><span>BNB Chain</span></label>
       </div>
     </fieldset>
-    <p class="lookup-note">Select Solana for a Solana address, or the EVM chains where you want balances checked.</p>
-    <div class="statement-block-field">
-      <label for="statement-block">Optional block or slot</label>
-      <input id="statement-block" name="block" type="number" min="0" step="1">
-      <p class="lookup-note">An EVM block is exact; a Solana block value is a minimum context slot.</p>
-    </div>
-    <button class="button primary-button" type="submit">Sign statement <span aria-hidden="true">→</span></button>
+    <p class="lookup-note statement-chain-hint">Choose every chain you want checked for these wallets.</p>
+    <details class="statement-more-options">
+      <summary>More options</summary>
+      <div class="statement-optional-fields">
+        <div class="statement-field">
+          <label for="statement-label">Report label (optional)</label>
+          <input id="statement-label" name="label" type="text" maxlength="80" autocomplete="off" placeholder="e.g. Q3 holdings report">
+        </div>
+        <div class="statement-field statement-block-field">
+          <label for="statement-block">Block or slot (optional)</label>
+          <input id="statement-block" name="block" type="number" min="0" step="1">
+          <p class="lookup-note">An EVM block is exact; a Solana block value is a minimum context slot.</p>
+        </div>
+      </div>
+    </details>
+    <button class="button primary-button" type="submit">Create signed statement <span aria-hidden="true">→</span></button>
   </form>
-  <p class="lookup-note statement-nonclaims">QED does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Statement pages are public to anyone with their link.</p>
-</section>
-<section class="lookup lookup-secondary statement-example" aria-labelledby="statement-example-heading">
-  <h2 id="statement-example-heading">One-click public example</h2>
-  <p>Generate a read-only statement for a public Robinhood pool contract address.</p>
-  <form action="/statements" method="post" hx-boost="false">
-    <input type="hidden" name="label" value="Public SPY pool address example">
-    <input type="hidden" name="wallets" value="0xDDCBBa3666f578E3F09516f21Ff85BFee859AB5e">
-    <input type="hidden" name="chains" value="robinhood">
-    <button class="button secondary-button" type="submit">Create the public example statement</button>
-  </form>
+  <p class="lookup-note statement-nonclaims">Balances are on-chain facts, not proof of ownership. QED does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement. Statement pages are public to anyone with their link.</p>
 </section>"#;
     content_page(
         &state,
@@ -2275,7 +2323,7 @@ pub(crate) async fn statements_page(
             heading: "What did these wallets hold, provably?",
             eyebrow: "STATEMENT",
             intro: STATEMENT_PURPOSE,
-            meta_description: "Create a signed, re-checkable statement of registry-token balances for selected wallets.",
+            meta_description: "A signed record of issuer-published token balances held by selected wallets at a block.",
             canonical_path: "/statements",
         },
         form.to_owned(),
@@ -3044,7 +3092,7 @@ mod tests {
             - chrono::Duration::minutes(minutes)
     }
     #[test]
-    fn stats_flagged_rows_render_complete_fact_reason_totals_and_native_details() {
+    fn stats_aggregates_flagged_facts_and_links_to_copies() {
         let state = AppState::for_tests(Vec::new(), Vec::new(), true);
         let registry = vec![crate::domain::registry::Entry {
             issuer: "Backed xStocks".to_owned(),
@@ -3122,51 +3170,39 @@ mod tests {
             .expect("stats page renders");
         let rendered = String::from_utf8(rendered.to_vec()).expect("stats HTML is UTF-8");
 
-        assert!(rendered.contains("on-chain symbol “NVDA” and name “NVIDIA xStock”"));
-        assert!(rendered.contains("Listed as Wrong Market Listing"));
-        assert!(rendered.contains("WRONG-LISTING-SYMBOL · reported by GeckoTerminal"));
-        assert!(!rendered.contains("on-chain symbol “WRONG-LISTING-SYMBOL”"));
-        assert!(rendered.contains("exactly match the NVDA product published by Backed xStocks"));
-        assert!(rendered.contains("official deployments on Base"));
-        assert!(rendered.contains("<h3>Confirmed mismatches</h3>"));
-        assert!(rendered.contains("<h3>Caution — near matches</h3>"));
         assert_eq!(rendered.matches("class=\"stats-flagged-total\"").count(), 1);
-        assert!(rendered.contains(
-            "Reported 24h volume across all flagged tokens: $1,234.5 (DexScreener/GeckoTerminal, not verified)"
-        ));
-        assert!(rendered.contains(
-            "On-chain symbol and name exactly match an issuer product; the address is absent from the issuer's catalog."
-        ));
+        assert!(rendered.contains("href=\"/copies\""));
+        assert!(rendered.contains("href=\"/copies#caution\""));
+        assert!(!rendered.contains("class=\"stats-token-row"));
         assert!(
-            rendered
-                .contains("Similar to an issuer product, but QED could not confirm a mismatch.")
-        );
-        assert!(
-            rendered.contains(
-                "Total reported 24h volume (1 tokens): $1,234.5 (DexScreener/GeckoTerminal"
+            !rendered.contains(
+                "https://basescan.org/address/0x0000000000000000000000000000000000000001"
             )
         );
-        assert!(!rendered.contains("Total reported 24h volume (1 tokens): $1,234.5. "));
-        assert!(rendered.contains("$1.2k reported 24h volume"));
+        let row = render_flagged_row(&entry, &registry, &board.entries);
+        assert!(row.contains("on-chain symbol “NVDA” and name “NVIDIA xStock”"));
+        assert!(row.contains("Market listing name and symbol"));
+        assert!(row.contains("official deployments on Base"));
+        assert!(row.contains("First seen:"));
+        assert!(row.contains("Last seen:"));
+        assert!(row.contains("Liquidity:</strong> $456.78 reported by GeckoTerminal"));
+        assert!(row.contains("Pool count:</strong> 2 reported in this observation"));
+        assert!(row.contains("official publisher pool volume $300"));
+        assert!(row.contains("href=\"/guard/base/0x0000000000000000000000000000000000000001\""));
+        assert!(row.contains("Danger - copying explicitly disabled!"));
         assert!(
-            rendered.contains("<details class=\"stats-row-details\"><summary>Details</summary>")
+            !row.contains(
+                "https://basescan.org/address/0x0000000000000000000000000000000000000001"
+            )
         );
-        assert!(rendered.contains("0x0000000000000000000000000000000000000001</code>"));
-        assert!(rendered.contains("2026-10-06T01:02:00Z\">6 Oct 2026, 01:02 UTC"));
-        assert!(rendered.contains("2026-10-07T03:04:00Z\">7 Oct 2026, 03:04 UTC"));
-        assert!(rendered.contains(
-            "role=\"img\" aria-label=\"Deny — claims a product its publisher does not list\""
-        ));
-        assert!(rendered.contains("official publisher pool volume $300"));
-        assert!(rendered.contains("Liquidity:</strong> $456.78 reported by GeckoTerminal"));
-        assert!(rendered.contains("Pool count:</strong> 2 reported in this observation"));
-        assert!(!rendered.contains("same scan"));
+        assert!(!row.contains("data-copy=\"0x0000000000000000000000000000000000000001\""));
+        assert!(!row.contains("copy-button"));
         let mut no_metrics = entry.clone();
         no_metrics.liquidity_24h_usd = None;
         no_metrics.pool_count = None;
         let no_metrics_row = render_flagged_row(&no_metrics, &registry, &board.entries);
-        assert!(no_metrics_row.contains("Liquidity:</strong> Not retained in this observation"));
-        assert!(no_metrics_row.contains("Pool count:</strong> Not retained in this observation"));
+        assert!(!no_metrics_row.contains("Liquidity:</strong>"));
+        assert!(!no_metrics_row.contains("Pool count:</strong>"));
         let mut missing_facts = entry.clone();
         missing_facts.on_chain_symbol = None;
         missing_facts.on_chain_name = None;
@@ -3176,8 +3212,6 @@ mod tests {
             "Why flagged:</strong> {}…",
             "x".repeat(crate::adapters::discovery::MAX_IMPOSTOR_REASON_BYTES)
         )));
-        assert!(!rendered.contains("<details class=\"stats-row-details\" open"));
-        assert!(!rendered.contains("truncated reason"));
     }
 
     struct GatedPowerReader {
@@ -3417,6 +3451,9 @@ mod tests {
         assert!(body.contains("Can block"));
         assert!(body.contains("Source unavailable"));
         assert!(!body.contains("Signals unavailable (transient)"));
+        assert!(body.contains("copy-button--icon"));
+        assert!(body.contains("<use href=\"/static/icons.svg#copy\"></use>"));
+        assert!(!body.contains(">Copy</button>"));
     }
 
     #[tokio::test]
@@ -3869,6 +3906,8 @@ mod tests {
             contract: format!("0x{issuer}"),
             explorer_url: "https://explorer.example".to_owned(),
             source_url: "https://issuer.example".to_owned(),
+            flagged: false,
+            flagged_address_html: String::new(),
             powers: DirectoryPowersView::unavailable(),
         };
         let mut contracts = vec![
@@ -4374,7 +4413,8 @@ mod tests {
             attestation_id: None,
             checked_at: None,
         };
-        let certificate = super::super::views::CertificateView::from_attestation(attestation);
+        let certificate =
+            super::super::views::CertificateView::from_attestation(attestation.clone());
         let homepage = super::super::views::LeaderboardPageView::from_value(serde_json::json!({
             "entries": [serde_json::to_value(&board_entry).unwrap()],
             "refreshing": false,
@@ -4385,6 +4425,22 @@ mod tests {
         assert_eq!(homepage.rows[0].base_symbol, "NVDA");
         assert_eq!(homepage.rows[0].quote_symbol, "USDG");
         assert_eq!(pool_view(&board_entry).pair, "NVDA / USDG");
+        let mut mismatch = attestation;
+        mismatch.verdict = crate::domain::check::Verdict::Mismatch {
+            claimed: "NVDA".to_owned(),
+            actual: "USDG".to_owned(),
+        };
+        let mismatch = super::super::views::CertificateView::from_attestation(mismatch);
+        assert!(mismatch.is_mismatch);
+        assert!(mismatch.trade_links.is_empty());
+        assert!(mismatch.pool_address_html.contains("Danger"));
+        let pool_address = mismatch.pool_address.clone();
+        let html = super::super::views::CertificateResultTemplate { certificate: mismatch }
+            .render()
+            .unwrap();
+        assert!(!html.contains(&format!("data-copy=\"{pool_address}\"")));
+        assert!(!html.contains("app.uniswap.org"));
+        assert!(!html.contains("dexscreener.com"));
     }
 }
 
@@ -4432,7 +4488,7 @@ mod copies_page_tests {
     fn render(entries: &[ImpostorEntry], chain: Option<&str>) -> String {
         let state = AppState::for_tests(Vec::new(), Vec::new(), false);
         let refs = entries.iter().collect::<Vec<_>>();
-        render_copies_page(&state, &refs, &[], chain).expect("copies page").0
+        render_copies_page(&state, &refs, &[], &[], chain).expect("copies page").0
     }
 
     #[test]
@@ -4449,9 +4505,31 @@ mod copies_page_tests {
         let low = body.find("Lower (NVDA)").expect("lower row");
         let missing = body.find("No volume (NVDA)").expect("missing-volume row");
         assert!(high < low && low < missing);
-        assert!(body.contains("<td data-label=\"#\">1</td>"));
-        assert!(body.contains("<td data-label=\"#\">2</td>"));
-        assert!(body.contains("<td data-label=\"#\">3</td>"));
+        assert_eq!(body.matches("Rank: </span>").count(), 3);
+    }
+    #[test]
+    fn copies_rows_expand_with_guard_and_shared_flagged_details() {
+        let mut confirmed =
+            entry("ConfirmedCopy", "robinhood", Some(20.0), PublisherProductTier::Confirmed);
+        confirmed.liquidity_24h_usd = Some(456.78);
+        confirmed.pool_count = Some(2);
+        let caution = entry("CautionCopy", "solana", Some(10.0), PublisherProductTier::Caution);
+        let rows = [confirmed, caution];
+        let refs = rows.iter().collect::<Vec<_>>();
+        let html = render_copies_table(&refs, &[], &[]);
+        assert_eq!(html.matches("<details class=\"copies-row\">").count(), 2);
+        assert_eq!(html.matches("<summary class=\"copies-row-summary\">").count(), 2);
+        assert!(html.contains("href=\"/guard/robinhood/address-ConfirmedCopy\""));
+        assert!(html.contains("href=\"/guard/solana/address-CautionCopy\""));
+        assert!(!html.contains("data-copy=\"address-ConfirmedCopy\""));
+        assert!(!html.contains("data-copy=\"address-CautionCopy\""));
+        assert!(
+            !html.contains("https://robinhoodchain.blockscout.com/address/address-ConfirmedCopy")
+        );
+        assert!(html.contains("Danger - copying explicitly disabled!"));
+        assert!(html.contains("class=\"flagged-address-marker\""));
+        assert!(html.contains("<th scope=\"col\">First seen (UTC)</th>"));
+        assert!(html.contains(">6 Oct 2026, 01:02</time>"));
     }
 
     #[test]
@@ -4467,6 +4545,7 @@ mod copies_page_tests {
         assert!(filtered.contains("All <span>3</span>"));
         assert!(!filtered.contains("RobinhoodOne (NVDA)"));
         assert!(filtered.contains("SolanaOne (NVDA)"));
+        assert!(filtered.contains("SolanaNear (NVDA)"));
 
         let unknown = render(&entries, Some("unknown"));
         assert!(
@@ -4489,18 +4568,18 @@ mod copies_page_tests {
         let hero = body.find("id=\"copies-hero-title\">HeroMaximum").expect("maximum hero");
         let caution = body.find("CautionMaximum (NVDA)").expect("caution row");
         assert!(hero < caution);
-        assert!(body.contains("Largest confirmed copy by reported 24h volume"));
-        assert!(body.contains("Deny · View Guard"));
+        assert!(body.contains("class=\"copies-hero-volume\">$900"));
     }
 
     #[test]
     fn address_comparison_marks_shared_ends_and_explains_them() {
-        let html = address_comparison_html(
+        let html = address_comparison_html_with_flagged_observed(
             "0xd060f448de7bccb6e54b0cb8d5bc871c8d339eec",
             "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
             "Real",
             "Copy",
             crate::domain::chain::Chain::RobinhoodChain,
+            false,
         );
         assert_eq!(html.matches("class=\"addr-lookalike\"").count(), 4);
         assert!(html.contains("Same first 4 and last 4 characters as the real address."));
@@ -4510,12 +4589,13 @@ mod copies_page_tests {
 
     #[test]
     fn address_comparison_without_three_matching_characters_is_plain() {
-        let html = address_comparison_html(
+        let html = address_comparison_html_with_flagged_observed(
             "0x111222",
             "0x333444",
             "Real",
             "Copy",
             crate::domain::chain::Chain::Ethereum,
+            false,
         );
         assert!(!html.contains("addr-lookalike"));
         assert!(!html.contains("addr-similarity"));
@@ -4527,7 +4607,9 @@ mod copies_page_tests {
             ("0xAbC123", "0xabc123", crate::domain::chain::Chain::Ethereum),
             ("Abc123", "Abc123", crate::domain::chain::Chain::Solana),
         ] {
-            let html = address_comparison_html(observed, official, "Real", "Copy", chain);
+            let html = address_comparison_html_with_flagged_observed(
+                observed, official, "Real", "Copy", chain, false,
+            );
             assert!(html.contains("addr-compare--match"));
             assert!(!html.contains("addr-lookalike"));
             assert!(!html.contains("addr-similarity"));
@@ -4537,19 +4619,23 @@ mod copies_page_tests {
     #[test]
     fn address_comparison_mentions_only_matching_ends() {
         let chain = crate::domain::chain::Chain::Solana;
-        let prefix = address_comparison_html("abc111", "abc222", "Real", "Copy", chain);
+        let prefix = address_comparison_html_with_flagged_observed(
+            "abc111", "abc222", "Real", "Copy", chain, false,
+        );
         assert!(prefix.contains("Same first 3 characters as the real address."));
         assert!(!prefix.contains("last"));
         assert_eq!(prefix.matches("class=\"addr-lookalike\"").count(), 2);
 
-        let suffix = address_comparison_html("111abc", "222abc", "Real", "Copy", chain);
+        let suffix = address_comparison_html_with_flagged_observed(
+            "111abc", "222abc", "Real", "Copy", chain, false,
+        );
         assert!(suffix.contains("Same last 3 characters as the real address."));
         assert!(!suffix.contains("first"));
         assert_eq!(suffix.matches("class=\"addr-lookalike\"").count(), 2);
     }
 
     #[test]
-    fn copies_hero_uses_shared_end_comparison_and_keeps_copy_disabled() {
+    fn copies_hero_marks_flagged_address_and_keeps_official_controls() {
         let mut copy = entry("NVDA", "robinhood", Some(10.0), PublisherProductTier::Confirmed);
         copy.address = "0xd060f448de7bccb6e54b0cb8d5bc871c8d339eec".to_owned();
         let registry = [crate::domain::registry::Entry {
@@ -4574,7 +4660,120 @@ mod copies_page_tests {
         let html = render_copy_hero(&copy, &registry);
         assert_eq!(html.matches("class=\"addr-lookalike\"").count(), 4);
         assert!(html.contains("Same first 4 and last 4 characters as the real address."));
-        assert!(html.contains("aria-disabled=\"true\""));
+        assert!(
+            html.find("addr-row--copy").expect("flagged address row")
+                < html.find("addr-row--real").expect("official address row")
+        );
+        assert!(html.contains("Danger - copying explicitly disabled!"));
+        assert!(html.contains(
+            "</span><span class=\"visually-hidden\">Flagged address: </span><code class=\"flagged-address-value\">"
+        ));
+        assert!(html.contains(
+            "<button class=\"copy-button\" type=\"button\" data-copy=\"0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC\""
+        ));
+        assert!(html.contains("<use href=\"/static/icons.svg#copy\"></use>"));
+        assert!(!html.contains(">Copy</button>"));
+        assert!(!html.contains(">Explorer ↗</a>"));
+        assert!(!html.contains("data-copy=\"0xd060f448de7bccb6e54b0cb8d5bc871c8d339eec\""));
+        assert!(html.contains("data-copy=\"0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC\""));
+        assert!(html.contains(
+            "robinhoodchain.blockscout.com/address/0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC"
+        ));
+        assert!(html.contains("<span class=\"deny-badge\">Deny</span>"));
+        assert!(html.contains("Open Guard review →</a>"));
+    }
+    #[test]
+    fn copies_visual_fixture_renders_realistic_test_only_page() {
+        let mut entries = Vec::new();
+        for index in 0..12 {
+            let name = if index == 0 {
+                "NVIDIA • Robinhood Token".to_owned()
+            } else {
+                format!("NVIDIA • Robinhood Token Copy {index}")
+            };
+            let chain = if index % 2 == 0 { "robinhood" } else { "solana" };
+            let volume =
+                if index == 0 { 22_838_306.69 } else { 1_250_000.0 - index as f64 * 10_000.0 };
+            let mut copy = entry(&name, chain, Some(volume), PublisherProductTier::Confirmed);
+            copy.on_chain_name = Some(name);
+            copy.ticker = "NVDA".to_owned();
+            copy.symbol = "NVDA".to_owned();
+            copy.on_chain_symbol = Some("NVDA".to_owned());
+            copy.address = if chain == "solana" {
+                format!(
+                    "{}{}",
+                    "A".repeat(40),
+                    char::from(b'B' + index as u8).to_string().repeat(4)
+                )
+            } else {
+                format!("0x{:040x}", 0xd060_u64 + index as u64)
+            };
+            entries.push(copy);
+        }
+        for index in 0..3 {
+            let name = format!("NVIDIA • Robinhood Near Match {index}");
+            let mut copy = entry(
+                &name,
+                if index % 2 == 0 { "solana" } else { "robinhood" },
+                Some(125_000.0 - index as f64 * 10_000.0),
+                PublisherProductTier::Caution,
+            );
+            copy.on_chain_name = Some(name.clone());
+            copy.name = name;
+            copy.ticker = "NVDA".to_owned();
+            copy.symbol = "NVDA".to_owned();
+            copy.on_chain_symbol = Some("NVDA".to_owned());
+            copy.address = format!(
+                "{}{}",
+                "B".repeat(40),
+                char::from(b'R' + index as u8).to_string().repeat(4)
+            );
+            entries.push(copy);
+        }
+        let official = |network: &str, chain, address: String| crate::domain::registry::Entry {
+            issuer: "Robinhood".to_owned(),
+            ticker: "NVDA".to_owned(),
+            name: "NVIDIA".to_owned(),
+            chain,
+            contract: address.clone(),
+            decimals: Some(18),
+            source: "test".to_owned(),
+            source_url: "https://issuer.example".to_owned(),
+            last_checked: "2026-10-18T00:00:00Z".to_owned(),
+            removed_at: None,
+            stale_since: None,
+            official_deployments: vec![crate::domain::registry::OfficialDeployment {
+                network: network.to_owned(),
+                address,
+                wrapper_address: None,
+                wrapper_address_v2: None,
+            }],
+        };
+        let registry = [
+            official(
+                "Robinhood Chain",
+                crate::domain::chain::Chain::RobinhoodChain,
+                "0xd060000000000000000000000000000000000001".to_owned(),
+            ),
+            official("Solana", crate::domain::chain::Chain::Solana, "C".repeat(44)),
+        ];
+        let state = AppState::for_tests(Vec::new(), Vec::new(), false);
+        let refs = entries.iter().collect::<Vec<_>>();
+        let mut html = render_copies_page(&state, &refs, &registry, &[], None)
+            .expect("copies visual fixture")
+            .0;
+        assert!(html.contains("12 confirmed copies"));
+        assert!(html.contains("NVIDIA • Robinhood Token"));
+        assert!(html.contains("$22,838,306.69"));
+        assert_eq!(html.matches("class=\"copies-row\">").count(), 15);
+        if let Ok(path) = std::env::var("QED_COPIES_FIXTURE_OUTPUT") {
+            html = html.replacen(
+                "</body>",
+                "<script>const theme=new URLSearchParams(location.search).get('theme');if(theme)document.documentElement.dataset.theme=theme;document.querySelector('.copies-row').open=true;document.querySelector('#caution').open=true;</script></body>",
+                1,
+            );
+            std::fs::write(path, html).expect("write test-only visual fixture");
+        }
     }
 
     #[test]

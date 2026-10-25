@@ -52,7 +52,7 @@ pub(crate) struct GuardResultTemplate {
     pub(crate) public_url: String,
     pub(crate) result_url: String,
     pub(crate) chain: String,
-    pub(crate) address: String,
+    pub(crate) address_html: String,
     pub(crate) verdict_class: String,
     pub(crate) headline: String,
     pub(crate) identity_sentence: String,
@@ -292,7 +292,11 @@ impl GuardResultTemplate {
             public_url,
             result_url,
             chain: document.chain.to_string(),
-            address: document.address.clone(),
+            address_html: if document.verdict == GuardVerdict::Deny {
+                super::pages::flagged_address_html(&document.address)
+            } else {
+                format!("<code>{}</code>", crate::adapters::content::html_escape(&document.address))
+            },
             verdict_class: verdict.to_owned(),
             headline: headline.to_owned(),
             identity_sentence,
@@ -378,8 +382,8 @@ impl GuardResultTemplate {
     }
 }
 
-/// Issuer-published contract above the reviewed one, with shared end runs highlighted,
-/// when QED knows the published contract for this product on this chain. Empty otherwise.
+/// Reviewed address first and issuer-published contract below it, with shared end runs
+/// highlighted when QED knows the published contract for this product on this chain.
 fn guard_address_comparison(document: &crate::domain::guard::GuardDocument) -> String {
     use crate::domain::guard::IdentityStatus;
     let Some(official) = document.identity.matched_contract.as_deref() else {
@@ -392,12 +396,13 @@ fn guard_address_comparison(document: &crate::domain::guard::GuardDocument) -> S
         IdentityStatus::Mismatch => "This token · not in the issuer's catalog".to_owned(),
         _ => "This token".to_owned(),
     };
-    super::pages::address_comparison_html(
+    super::pages::address_comparison_html_with_flagged_observed(
         reviewed,
         official,
         &format!("Published by {publisher}"),
         &observed_label,
         document.chain,
+        document.verdict == crate::domain::guard::GuardVerdict::Deny,
     )
 }
 
@@ -740,16 +745,21 @@ impl LeaderboardRowView {
         } else {
             discovery::MarketSource::Dexscreener
         };
-        let trade_url = discovery::chain_from_dex_id(&chain)
-            .map(|chain| {
-                discovery::canonical_market_url_for_source(
-                    chain,
-                    &pool,
-                    (!source_url.is_empty()).then_some(source_url.as_str()),
-                    source,
-                )
-            })
-            .unwrap_or_default();
+        let is_mismatch = matches!(verdict.to_ascii_lowercase().as_str(), "mismatch" | "nomatch");
+        let trade_url = if is_mismatch {
+            String::new()
+        } else {
+            discovery::chain_from_dex_id(&chain)
+                .map(|chain| {
+                    discovery::canonical_market_url_for_source(
+                        chain,
+                        &pool,
+                        (!source_url.is_empty()).then_some(source_url.as_str()),
+                        source,
+                    )
+                })
+                .unwrap_or_default()
+        };
         let detail_url = discovery::chain_from_dex_id(&chain)
             .map(|chain| format!("/assets/{}/pool/{}", discovery::chain_slug(chain), pool))
             .unwrap_or_default();
@@ -1119,7 +1129,9 @@ pub(crate) struct DirectoryContractView {
     pub(crate) contract: String,
     pub(crate) explorer_url: String,
     pub(crate) source_url: String,
+    pub(crate) flagged: bool,
     pub(crate) powers: DirectoryPowersView,
+    pub(crate) flagged_address_html: String,
 }
 
 #[derive(Debug)]
@@ -1508,7 +1520,9 @@ pub(crate) struct CertificateView {
     pub(crate) ticker: String,
     pub(crate) dex: String,
     pub(crate) pool_address: String,
+    pub(crate) pool_address_html: String,
     pub(crate) trade_links: Vec<TradeLink>,
+    pub(crate) is_mismatch: bool,
     pub(crate) issuer_match: String,
     pub(crate) verdict_class: &'static str,
     pub(crate) seal_icon: &'static str,
@@ -1615,6 +1629,8 @@ impl CertificateView {
             })
             .to_string(),
         );
+        let is_mismatch =
+            matches!(&attestation.verdict, Verdict::Mismatch { .. } | Verdict::NoMatch);
         Self {
             id: id.clone(),
             id_short,
@@ -1626,10 +1642,20 @@ impl CertificateView {
             ticker: attestation.ticker.clone().unwrap_or_default(),
             dex: prettify_dex(&attestation.pool.dex),
             pool_address: subject.clone(),
-            trade_links: trade_links(
-                &attestation.pool,
-                Some(discovery::canonical_market_url(attestation.chain, &subject, None)),
-            ),
+            pool_address_html: if is_mismatch {
+                super::pages::flagged_address_html(&subject)
+            } else {
+                String::new()
+            },
+            trade_links: if is_mismatch {
+                Vec::new()
+            } else {
+                trade_links(
+                    &attestation.pool,
+                    Some(discovery::canonical_market_url(attestation.chain, &subject, None)),
+                )
+            },
+            is_mismatch,
             issuer_match,
             verdict_class,
             seal_icon: match &attestation.verdict {
@@ -2036,6 +2062,35 @@ mod tests {
         assert_eq!(
             mismatch_view.identity_sentence,
             "This token presents itself as NVDAx, but Backed xStocks publishes a different contract on Ethereum."
+        );
+    }
+    #[test]
+    fn guard_deny_disables_the_reviewed_address_but_keeps_publisher_controls() {
+        let mut document = guard_document();
+        document.verdict = GuardVerdict::Deny;
+        document.identity.status = IdentityStatus::Mismatch;
+        document.identity.matched_contract =
+            Some("0x0000000000000000000000000000000000000002".to_owned());
+        document.identity.deployments = vec![crate::domain::guard::GuardDeployment {
+            network: "Ethereum".to_owned(),
+            address: "0x0000000000000000000000000000000000000002".to_owned(),
+        }];
+        let html =
+            GuardResultTemplate::from_document(1, "https://qed.example".to_owned(), &document)
+                .render()
+                .expect("Guard result renders");
+        assert!(html.contains("Danger - copying explicitly disabled!"));
+        assert!(!html.contains("data-copy=\"0x0000000000000000000000000000000000000001\""));
+        assert!(html.contains("data-copy=\"0x0000000000000000000000000000000000000002\""));
+        assert!(
+            !html.contains(
+                "https://etherscan.io/address/0x0000000000000000000000000000000000000001"
+            )
+        );
+        assert!(
+            html.contains(
+                "https://etherscan.io/address/0x0000000000000000000000000000000000000002"
+            )
         );
     }
     #[test]

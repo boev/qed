@@ -1462,16 +1462,12 @@ mod tests {
                     "<h1 class=\"page-title\">What did these wallets hold, provably?</h1>"
                 ));
                 assert!(body.contains(
-                    "A signed, re-checkable record of what a wallet set holds in registry tokens at a block height — for audits, reporting and counterparties."
-                ));
-                assert!(body.contains(
                     "<form class=\"statement-form\" action=\"/statements\" method=\"post\""
                 ));
                 assert!(body.contains("<textarea id=\"statement-wallets\""));
                 assert!(body.contains("statement-chain-option"));
                 assert!(body.contains("statement-block"));
                 assert!(body.contains("class=\"button primary-button\""));
-                assert!(body.contains("Sign statement"));
             }
         }
         let legacy_check = app
@@ -1880,7 +1876,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("See all copies by chain → /copies"));
+        assert!(body.contains("href=\"/copies\""));
         assert_eq!(body.matches("<article class=\"stats-number-card").count(), 4);
         assert!(body.contains("0 of 0"));
         assert!(

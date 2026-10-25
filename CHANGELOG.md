@@ -2,6 +2,14 @@
 
 Notable QED changes, in reverse chronological order. Entries describe shipped releases and current unreleased work; QED does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.
 
+## [1.1.5] - 2026-10-24
+
+- **Copies and address safety** — Flagged addresses are clearly marked without copy, explorer, or trade controls across copies, Guard, asset, token, and mismatch-certificate views; Guard review links remain available.
+
+## [1.1.4] - 2026-10-24
+
+- **Pages** — Simplify Guard and wallet-statement forms, remove the one-click statement example, and refine copied-token information.
+
 ## [1.1.3] - 2026-10-21
 
 - **Docs** — Legal page updates.

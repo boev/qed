@@ -165,6 +165,149 @@ async fn seed_listings(state: &AppState) {
     });
 }
 #[tokio::test]
+async fn mismatch_and_nomatch_pools_have_no_home_or_chain_market_link() {
+    let (state, _, _) = state();
+    seed_listings(&state).await;
+    let home = body(&state, "/").await;
+    let chain = body(&state, "/chains/base").await;
+    assert!(home.contains("class=\"market-link\""));
+    assert!(chain.contains("Market page ↗"));
+
+    for verdict in ["mismatch", "nomatch"] {
+        state.leaderboard.write().await.entries[0].verdict = verdict.into();
+        let home = body(&state, "/").await;
+        let chain = body(&state, "/chains/base").await;
+        assert!(!home.contains("class=\"market-link\""), "home row for {verdict}");
+        assert!(!chain.contains("Market page ↗"), "chain row for {verdict}");
+    }
+}
+#[tokio::test]
+async fn flagged_catalog_token_page_disables_copy_and_explorer_controls() {
+    let (state, _, _) = state();
+    let address = "0x0000000000000000000000000000000000000044";
+    let now = Utc::now().to_rfc3339();
+    state.leaderboard.write().await.impostors.entries.push(
+        crate::adapters::discovery::ImpostorEntry {
+            chain: "robinhood".into(),
+            chain_label: "Robinhood Chain".into(),
+            ticker: "NVDA".into(),
+            publisher: "Synthetic issuer".into(),
+            symbol: "NVDA".into(),
+            name: "NVIDIA".into(),
+            address: address.into(),
+            first_seen_at: now.clone(),
+            last_seen_at: now,
+            tier: Some(crate::domain::guard::PublisherProductTier::Caution),
+            tier_derived: true,
+            volume_24h_usd: Some(100.0),
+            liquidity_24h_usd: None,
+            pool_count: None,
+            source: MarketSource::Dexscreener,
+            guard_url: format!("/guard/robinhood/{address}"),
+            reason: "synthetic copy".into(),
+            reads: Vec::new(),
+            on_chain_symbol: Some("NVDA".into()),
+            on_chain_name: Some("NVIDIA".into()),
+            publisher_catalog_snapshot_hash: None,
+            evidence_truncated: false,
+            guard_document: None,
+        },
+    );
+
+    let html = body(&state, &format!("/assets/robinhood/token/{address}")).await;
+
+    assert!(html.contains("Danger - copying explicitly disabled!"));
+    assert!(html.contains(address));
+    assert!(!html.contains(&format!("data-copy=\"{address}\"")));
+    assert!(!html.contains(&format!("https://robinhoodchain.blockscout.com/address/{address}")));
+}
+#[tokio::test]
+async fn flagged_pool_keeps_only_matched_side_token_copyable() {
+    let (state, _, _) = state();
+    let now = Utc::now();
+    let attestation_id = "flagged-pool-facts";
+    let attestation = crate::domain::attestation::Attestation {
+        id: attestation_id.into(),
+        version: 1,
+        chain: Chain::Base,
+        subject: POOL.into(),
+        verdict: crate::domain::check::Verdict::Verified {
+            issuer: "Synthetic issuer".into(),
+            ticker: "NVDA".into(),
+        },
+        issuer: Some("Synthetic issuer".into()),
+        ticker: Some("NVDA".into()),
+        pool: PoolInfo {
+            chain: Chain::Base,
+            pool: POOL.into(),
+            dex: "uniswap-v2".into(),
+            base: side(USD, "USDC"),
+            quote: side(TOKEN, "NVDA"),
+        },
+        quote_share_of_supply: None,
+        registry_entry: Some(entry()),
+        registry_hash: String::new(),
+        reads: Vec::new(),
+        block: Some(1),
+        slot: None,
+        checked_at: now.to_rfc3339(),
+        expires_at: (now + Duration::hours(1)).to_rfc3339(),
+        signer: String::new(),
+        signature: String::new(),
+        dev: true,
+    };
+    state
+        .app
+        .attestations
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(attestation_id.into(), attestation);
+    let key = AssetKey::new(Chain::Base, SubjectKind::Pool, POOL).unwrap();
+    let mut observation = crate::app::asset_history::event(
+        &state.app,
+        key,
+        Facet::ContractMatch,
+        Outcome::Verified,
+        now,
+        serde_json::json!({}),
+    );
+    observation.attestation_id = Some(attestation_id.into());
+    state.app.history.append(observation).await.unwrap();
+    state.leaderboard.write().await.impostors.entries.push(
+        crate::adapters::discovery::ImpostorEntry {
+            chain: "base".into(),
+            chain_label: "Base".into(),
+            ticker: "NVDA".into(),
+            publisher: "Synthetic issuer".into(),
+            symbol: "NVDA".into(),
+            name: "NVIDIA".into(),
+            address: POOL.into(),
+            first_seen_at: now.to_rfc3339(),
+            last_seen_at: now.to_rfc3339(),
+            tier: Some(crate::domain::guard::PublisherProductTier::Confirmed),
+            tier_derived: true,
+            volume_24h_usd: Some(100.0),
+            liquidity_24h_usd: None,
+            pool_count: None,
+            source: MarketSource::Dexscreener,
+            guard_url: format!("/guard/base/{POOL}"),
+            reason: "synthetic copy".into(),
+            reads: Vec::new(),
+            on_chain_symbol: Some("NVDA".into()),
+            on_chain_name: Some("NVIDIA".into()),
+            publisher_catalog_snapshot_hash: None,
+            evidence_truncated: false,
+            guard_document: None,
+        },
+    );
+
+    let html = body(&state, &format!("/assets/base/pool/{POOL}")).await;
+    assert!(!html.contains(&format!("data-copy=\"{USD}\"")));
+    assert!(html.contains(&format!("data-copy=\"{TOKEN}\"")));
+    assert!(!html.contains(&format!("data-copy=\"{POOL}\"")));
+    assert!(!html.contains(&format!("https://basescan.org/address/{POOL}")));
+}
+#[tokio::test]
 async fn executed_three_misses_and_recovery_agree_on_all_public_surfaces() {
     let (mut state, failing, _) = state();
     seed_listings(&state).await;
@@ -204,6 +347,69 @@ async fn executed_three_misses_and_recovery_agree_on_all_public_surfaces() {
             ticker.contains(&format!("data-label=\"Status\">{badge}</td>")),
             "ticker row status"
         );
+    }
+}
+#[tokio::test]
+async fn mismatch_fallback_marks_public_asset_address_without_controls() {
+    let (state, _, _) = state();
+    seed_listings(&state).await;
+    state.leaderboard.write().await.entries[0].verdict = "mismatch".into();
+
+    let html = body(&state, "/tokens/NVDA").await;
+
+    assert!(html.contains("Danger - copying explicitly disabled!"));
+    assert!(html.contains(&POOL[..10]));
+    assert!(!html.contains(&format!("data-copy=\"{POOL}\"")));
+    assert!(!html.contains(&format!("https://basescan.org/address/{POOL}")));
+}
+#[tokio::test]
+async fn mismatch_and_no_match_history_token_page_flag_all_observations() {
+    for outcome in [Outcome::Mismatch, Outcome::NoMatch] {
+        let (state, _, _) = state();
+        seed_listings(&state).await;
+        let now = state.app.clock.now();
+        let key = AssetKey::new(Chain::Base, SubjectKind::Pool, POOL).unwrap();
+        let verified = crate::app::asset_history::event(
+            &state.app,
+            key.clone(),
+            Facet::ContractMatch,
+            Outcome::Verified,
+            now - chrono::Duration::hours(1),
+            serde_json::json!({}),
+        );
+        state.app.history.append(verified).await.unwrap();
+        let flagged = crate::app::asset_history::event(
+            &state.app,
+            key,
+            Facet::ContractMatch,
+            outcome,
+            now,
+            serde_json::json!({}),
+        );
+        state.app.history.append(flagged).await.unwrap();
+
+        let html = body(&state, "/tokens/NVDA").await;
+        let address_cell = html
+            .split("data-label=\"Address\">")
+            .skip(1)
+            .map(|cell| cell.split("</td>").next().expect("closed Address cell"))
+            .find(|cell| cell.contains(&short_address(POOL)))
+            .expect("pool Address cell");
+        assert!(address_cell.contains("Danger - copying explicitly disabled!"));
+        assert!(address_cell.contains(&short_address(POOL)));
+        assert!(!address_cell.contains(&format!("data-copy=\"{POOL}\"")));
+        let history_rows =
+            html.split("<table class=\"history-table\">").nth(1).expect("history detail table");
+        let detail_rows = history_rows
+            .split("<tbody>")
+            .nth(1)
+            .expect("history detail body")
+            .split("</tbody>")
+            .next()
+            .expect("closed history detail body");
+        let observation_rows: Vec<_> = detail_rows.split("<tr id=\"observation-").skip(1).collect();
+        assert!(observation_rows.len() >= 2);
+        assert!(observation_rows.iter().all(|row| row.contains("class=\"flagged-address\"")));
     }
 }
 struct FixedClock(DateTime<Utc>);
@@ -334,7 +540,8 @@ async fn timeline_preserves_records_without_same_time_vertical_stacks() {
             state.app.history.append(event).await.unwrap();
         }
     }
-    let view = prepare(&state.app, vec![key.clone()], key.path(), &HistoryQuery::default()).await;
+    let view =
+        prepare(&state.app, vec![key.clone()], key.path(), &HistoryQuery::default(), &[]).await;
     assert_eq!(view.days, 1);
     assert_eq!(view.rows.len(), 8);
     assert_eq!(view.points.iter().map(|point| point.count).collect::<Vec<_>>(), [4, 4]);

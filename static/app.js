@@ -317,6 +317,7 @@
   });
   document.addEventListener('invalid', (event) => {
     if (event.target instanceof HTMLInputElement && event.target.hasAttribute('data-address-hint')) {
+      event.target.closest('details')?.setAttribute('open', '');
       updateAddressHint(event.target, true);
     }
   }, true);

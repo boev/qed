@@ -20,8 +20,8 @@
   <div class="guard-card-head"><h2 class="guard-verdict"><span class="guard-badge">{{ asset.label }}</span></h2><span class="miss-dots" aria-label="{{ asset.misses }} consecutive misses"><span {% if asset.misses > 0 %}class="miss-dot filled"{% else %}class="miss-dot"{% endif %}></span><span {% if asset.misses > 1 %}class="miss-dot filled"{% else %}class="miss-dot"{% endif %}></span><span {% if asset.misses > 2 %}class="miss-dot filled"{% else %}class="miss-dot"{% endif %}></span></span></div>
   <p class="asset-confirmed">Last confirmed {{ asset.confirmed }}<span>Next check ~{{ asset.next_check }}</span></p>
   <dl class="asset-facts">
-    {% for fact in asset.facts %}<div><dt>{{ fact.label }}</dt><dd>{{ fact.value }}{% if fact.matched %} <span class="registry-tick" title="Matches issuer registry" aria-label="Matches issuer registry">✓</span>{% endif %}{% if fact.address.len() > 0 %} <button class="copy-button" type="button" data-copy="{{ fact.address }}" aria-label="Copy {{ fact.label }} address">Copy</button>{% endif %}</dd></div>{% endfor %}
-    <div class="asset-address-fact"><dt>Address</dt><dd><code class="asset-full-address">{{ asset.address }}</code><code class="asset-short-address" title="{{ asset.address }}">{{ asset.short_address }}</code><button class="copy-button" type="button" data-copy="{{ asset.address }}" aria-label="Copy address">Copy</button></dd></div>
+    {% for fact in asset.facts %}<div><dt>{{ fact.label }}</dt><dd>{{ fact.value }}{% if fact.matched %} <span class="registry-tick" title="Matches issuer registry" aria-label="Matches issuer registry">✓</span>{% endif %}{% if fact.address.len() > 0 && (!asset.flagged || fact.matched) %} <button class="copy-button copy-button--icon" type="button" data-copy="{{ fact.address }}" aria-label="Copy {{ fact.label }} address"><svg aria-hidden="true" focusable="false"><use href="/static/icons.svg#copy"></use></svg></button>{% endif %}</dd></div>{% endfor %}
+    <div class="asset-address-fact"><dt>Address</dt><dd>{% if asset.flagged %}<span class="asset-full-address">{{ asset.flagged_address_html|safe }}</span><span class="asset-short-address">{{ asset.flagged_short_address_html|safe }}</span>{% else %}<code class="asset-full-address">{{ asset.address }}</code><code class="asset-short-address" title="{{ asset.address }}">{{ asset.short_address }}</code><button class="copy-button copy-button--icon" type="button" data-copy="{{ asset.address }}" aria-label="Copy address"><svg aria-hidden="true" focusable="false"><use href="/static/icons.svg#copy"></use></svg></button>{% endif %}</dd></div>
   </dl>
   <div class="history-actions"><a class="button primary-button" href="{{ asset.guard_url }}">Guard this address</a>{% if asset.proof_url.len() > 0 %}<a class="button secondary-button" href="{{ asset.proof_url }}">Verify latest record</a>{% else %}<button class="button secondary-button" type="button" disabled title="No signed record captured yet">Verify latest record</button>{% endif %}<a class="button secondary-button" href="{{ asset.path }}/history.csv">CSV</a><a class="button secondary-button" href="{{ asset.path }}/history.json">JSON</a></div>
   <p class="lookup-note">Last-confirmed read status, not a safety rating. Next check is approximate; normal cadence is unchanged.</p>
@@ -34,7 +34,7 @@
 {% if !history.exact %}
 <section class="directory-section" aria-labelledby="asset-directory-title">
   <h2 id="asset-directory-title">Contracts &amp; pools</h2>
-  <table class="asset-directory"><thead><tr><th>Chain</th><th>Type</th><th>Address</th><th>Status</th><th>Last confirmed</th><th>Controls</th><th>Details</th></tr></thead><tbody>{% for asset in history.assets %}<tr><td data-label="Chain">{{ asset.chain }}</td><td data-label="Type">{{ asset.kind }}</td><td data-label="Address"><code title="{{ asset.address }}">{{ asset.short_address }}</code><button class="copy-button" type="button" data-copy="{{ asset.address }}" aria-label="Copy {{ asset.chain }} {{ asset.kind }} address">Copy</button></td><td data-label="Status">{{ asset.label }}</td><td data-label="Last confirmed">{{ asset.confirmed }}</td><td data-label="Controls"><div class="powers-summary">{% for badge in asset.controls %}<span class="count-badge">{{ badge }}</span>{% endfor %}{% if asset.controls.len() == 0 %}—{% endif %}</div></td><td><a href="{{ asset.path }}">Asset page ↗</a></td></tr>{% endfor %}</tbody></table>
+  <table class="asset-directory"><thead><tr><th>Chain</th><th>Type</th><th>Address</th><th>Status</th><th>Last confirmed</th><th>Controls</th><th>Details</th></tr></thead><tbody>{% for asset in history.assets %}<tr><td data-label="Chain">{{ asset.chain }}</td><td data-label="Type">{{ asset.kind }}</td><td data-label="Address">{% if asset.flagged %}{{ asset.flagged_short_address_html|safe }}{% else %}<code title="{{ asset.address }}">{{ asset.short_address }}</code><button class="copy-button copy-button--icon" type="button" data-copy="{{ asset.address }}" aria-label="Copy {{ asset.chain }} {{ asset.kind }} address"><svg aria-hidden="true" focusable="false"><use href="/static/icons.svg#copy"></use></svg></button>{% endif %}</td><td data-label="Status">{{ asset.label }}</td><td data-label="Last confirmed">{{ asset.confirmed }}</td><td data-label="Controls"><div class="powers-summary">{% for badge in asset.controls %}<span class="count-badge">{{ badge }}</span>{% endfor %}{% if asset.controls.len() == 0 %}—{% endif %}</div></td><td><a href="{{ asset.path }}">Asset page ↗</a></td></tr>{% endfor %}</tbody></table>
 </section>
 {% endif %}
 {% if history.exact %}
@@ -56,13 +56,14 @@
       </div>
       <div class="contract-address">
         <span class="contract-card-label">Contract address</span>
-        <code>{{ contract.contract }}</code>
-        <button class="copy-button" type="button" data-copy="{{ contract.contract }}" aria-label="Copy {{ contract.chain }} contract address" title="Copy {{ contract.chain }} contract address"><svg aria-hidden="true" focusable="false"><use href="/static/icons.svg#copy"></use></svg></button>
+        {% if contract.flagged %}{{ contract.flagged_address_html|safe }}{% else %}<code>{{ contract.contract }}</code><button class="copy-button copy-button--icon" type="button" data-copy="{{ contract.contract }}" aria-label="Copy {{ contract.chain }} contract address" title="Copy {{ contract.chain }} contract address"><svg aria-hidden="true" focusable="false"><use href="/static/icons.svg#copy"></use></svg></button>{% endif %}
       </div>
+      {% if !contract.flagged %}
       <div class="contract-actions" aria-label="{{ contract.chain }} contract links">
         <a class="button secondary-button" href="{{ contract.explorer_url }}" target="_blank" rel="noopener noreferrer">Explorer <span aria-hidden="true">↗</span></a>
         {% if contract.source_url.len() > 0 %}<a class="button secondary-button" href="{{ contract.source_url }}" target="_blank" rel="noopener noreferrer">Issuer source <span aria-hidden="true">↗</span></a>{% endif %}
       </div>
+      {% endif %}
       <div class="powers-summary" role="group" aria-label="Token control signals">
         {% for badge in contract.powers.summary_badges %}<span class="count-badge">{{ badge }}</span>{% endfor %}
         <span class="count-badge">{{ contract.powers.source_badge }}</span>

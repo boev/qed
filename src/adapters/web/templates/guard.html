@@ -13,41 +13,44 @@
   <h1 class="page-title">Does this token or pool match its issuer-published contract?</h1>
   <p>Is this token what it claims to be, and what can its issuer do to it? A pool is where two tokens trade; the registry lists each issuer's published contracts.</p>
 </section>
-<section class="lookup lookup-secondary" aria-label="Try a public Guard example">
-  <h2>Try a public example</h2>
-  <p><a href="/guard/robinhood/0x6444a8e0b267406a15db74ca00c4a24bdfa81ed3180f5b6d0851f8ed6f4f29c5" rel="nofollow">Review a published NVDA pool</a> · <a href="/guard/robinhood/0x9D70341316BE25ca3732A6351d443fcc8527910e" rel="nofollow">Review a token claiming unpublished NVDA</a></p>
-</section>
-<section class="lookup" aria-labelledby="guard-form-title">
+<section class="lookup guard-form-card" aria-labelledby="guard-form-title">
   <h2 id="guard-form-title">Run a Guard review</h2>
   <form class="guard-form" action="/guard" method="post">
     {% if !error.is_empty() %}<p class="guard-form-error" role="alert">{{ error }}</p>{% endif %}
-    <div class="guard-field">
-      <label for="guard-address">Token contract or supported pool address</label>
-      <input id="guard-address" name="address" type="text" inputmode="text" autocomplete="off" spellcheck="false" maxlength="68" pattern="\s*(?:0x[0-9a-fA-F]{40}|0x[0-9a-fA-F]{64}|[1-9A-HJ-NP-Za-km-z]{32,44})\s*" data-address-hint="guard-address-hint" data-validation-hint="Enter a 20-byte EVM address, a 32-byte pool ID, or a Solana address." data-validation-error="Enter a valid EVM, pool-ID, or Solana address." aria-describedby="guard-address-hint" placeholder="Paste a contract or pool address" value="{{ address }}" required>
-      <p id="guard-address-hint" class="lookup-note" aria-live="polite">Enter a 20-byte EVM address, a 32-byte pool ID, or a Solana address.</p>
+    <div class="guard-primary-fields">
+      <div class="guard-field">
+        <label for="guard-address">Token or pool address</label>
+        <input id="guard-address" name="address" type="text" inputmode="text" autocomplete="off" spellcheck="false" maxlength="68" pattern="\s*(?:0x[0-9a-fA-F]{40}|0x[0-9a-fA-F]{64}|[1-9A-HJ-NP-Za-km-z]{32,44})\s*" data-address-hint="guard-address-hint" data-validation-hint="Enter a 20-byte EVM address, a 32-byte pool ID, or a Solana address." data-validation-error="Enter a valid EVM, pool-ID, or Solana address." aria-describedby="guard-address-hint" placeholder="Paste a contract or pool address" value="{{ address }}" required>
+        <p id="guard-address-hint" class="lookup-note" aria-live="polite">Enter a 20-byte EVM address, a 32-byte pool ID, or a Solana address.</p>
+        <div class="guard-example-chips" role="group" aria-label="Try an example">
+          <span>Try:</span>
+          <a href="/guard/robinhood/0x6444a8e0b267406a15db74ca00c4a24bdfa81ed3180f5b6d0851f8ed6f4f29c5" rel="nofollow">Published NVDA pool</a>
+          <a href="/guard/robinhood/0x9D70341316BE25ca3732A6351d443fcc8527910e" rel="nofollow">NVDA copy</a>
+        </div>
+      </div>
+      <div class="guard-field">
+        <label for="guard-chain">Chain</label>
+        <select id="guard-chain" name="chain" required>
+          <option value="" {% if chain.is_empty() %}selected{% endif %} disabled>Select a chain</option>
+          <option value="solana" {% if chain == "solana" %}selected{% endif %}>Solana</option>
+          <option value="robinhood" {% if chain == "robinhood" %}selected{% endif %}>Robinhood Chain</option>
+          <option value="base" {% if chain == "base" %}selected{% endif %}>Base</option>
+          <option value="ethereum" {% if chain == "ethereum" %}selected{% endif %}>Ethereum</option>
+          <option value="bnb" {% if chain == "bnb" %}selected{% endif %}>BNB Chain</option>
+        </select>
+      </div>
     </div>
-    <div class="guard-field">
-      <label for="guard-chain">Chain</label>
-      <select id="guard-chain" name="chain" required>
-        <option value="" {% if chain.is_empty() %}selected{% endif %} disabled>Select a chain</option>
-        <option value="solana" {% if chain == "solana" %}selected{% endif %}>Solana</option>
-        <option value="robinhood" {% if chain == "robinhood" %}selected{% endif %}>Robinhood Chain</option>
-        <option value="base" {% if chain == "base" %}selected{% endif %}>Base</option>
-        <option value="ethereum" {% if chain == "ethereum" %}selected{% endif %}>Ethereum</option>
-        <option value="bnb" {% if chain == "bnb" %}selected{% endif %}>BNB Chain</option>
-      </select>
-    </div>
-    <div class="guard-field">
-      <label for="guard-wallet">Optional wallet address</label>
-      <input id="guard-wallet" name="wallet" type="text" inputmode="text" autocomplete="off" spellcheck="false" maxlength="46" pattern="\s*(?:0x[0-9a-fA-F]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})?\s*" data-address-hint="guard-wallet-hint" data-validation-hint="Enter an EVM or Solana wallet matching the selected chain, or leave blank." data-validation-error="Enter a valid EVM or Solana wallet address." aria-describedby="guard-wallet-hint" placeholder="Leave blank to omit wallet-specific checks" value="{{ wallet }}">
-      <p id="guard-wallet-hint" class="lookup-note" aria-live="polite">Enter an EVM or Solana wallet matching the selected chain, or leave blank.</p>
-    </div>
-    <button class="button primary-button" type="submit">Review <span aria-hidden="true">→</span></button>
+    <details class="guard-more-options"{% if !wallet.is_empty() %} open{% endif %}>
+      <summary>More options</summary>
+      <div class="guard-field">
+        <label for="guard-wallet">Optional wallet address</label>
+        <input id="guard-wallet" name="wallet" type="text" inputmode="text" autocomplete="off" spellcheck="false" maxlength="46" pattern="\s*(?:0x[0-9a-fA-F]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})?\s*" data-address-hint="guard-wallet-hint" data-validation-hint="Enter an EVM or Solana wallet matching the selected chain, or leave blank." data-validation-error="Enter a valid EVM or Solana wallet address." aria-describedby="guard-wallet-hint" placeholder="Leave blank to omit wallet-specific checks" value="{{ wallet }}">
+        <p id="guard-wallet-hint" class="lookup-note" aria-live="polite">Enter an EVM or Solana wallet matching the selected chain, or leave blank.</p>
+      </div>
+    </details>
+    <button class="button primary-button" type="submit">Run Guard review <span aria-hidden="true">→</span></button>
   </form>
 </section>
 <p class="guard-info-note">A signed, read-only review for traders, app builders, and compliance teams. QED is read-only by design: it never holds keys, never submits transactions, and never recommends. It does not prove backing, custody, reserves, solvency, safety, price, liquidity, or endorsement.</p>
-<section class="lookup lookup-secondary">
-  <h2>Use the API or an agent</h2>
-  <p>Call <code>GET /api/guard/{address}?chain={chain}</code>, or prefer <code>POST /api/guard</code> with the wallet in a JSON body to keep it out of the URL. MCP agents can use <code>qed_check</code> to compare a pool or token with its issuer-published contract. The signed document can be checked with <code>POST /verify</code>.</p>
-</section>
+<p class="guard-developer-strip"><strong>For integrations:</strong> read the <a href="/api">API reference</a> or <a href="/docs/llm">MCP guide</a>. Send wallets with <code>POST /api/guard</code>, not in the URL; verify signed documents with <code>POST /verify</code>.</p>
 {% endblock %}
